@@ -134,13 +134,16 @@ RTT shown by `info`/`ping` is measured here.
 ## 7. Session stream
 
 One stream per session; message mode in both directions. Both PTY and
-non-PTY (exec) sessions share it; stderr is only used without a PTY.
+non-PTY (exec) sessions share it; stderr is only used without a PTY. A
+connection may have many sessions open at once (the client's `shell`
+command); session ids are unique per connection and never reused.
 
 ```rust
 struct SessionRequest {
     kind: SessionKind,
     env: Vec<(String, String)>,        // filtered by the server (02-security.md)
     pty: Option<PtyRequest>,
+    cwd: Option<String>,               // start directory; `~/` expanded, relative to home; unusable → home
 }
 enum SessionKind { Shell, Exec { argv: Vec<String> } }
 struct PtyRequest { term: String, size: WinSize }
@@ -157,7 +160,7 @@ enum Signal { Int, Term, Hup, Kill, Quit, Usr1, Usr2, Winch }
 
 // server → client
 enum SessionOut {
-    Started { session: u32, pid: u32 },
+    Started { session: u32, pid: u32, cwd_fallback: bool },  // cwd_fallback: requested cwd was unusable, started in home
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),          // exec without pty only
     Exited(ExitStatus),       // last message; server then closes its write side
@@ -173,9 +176,9 @@ ignored.
 Why one message-mode stream instead of a control stream plus a raw data
 stream: a single stream keeps control and data ordered, avoids cross-stream
 id matching, and the per-message overhead (≤ 5 bytes on a 64 KiB chunk) is
-negligible. Backpressure comes from the yamux window: if the client stops
-reading, the server stops reading the pty, and the remote process blocks in
-`write()` — exactly the behaviour wanted when the meta shell pauses output.
+negligible. Backpressure comes from the yamux window: a client that reads
+slowly throttles the remote process instead of growing buffers on either
+side.
 
 The `session` id in `Started` is referenced by `Open::Cwd`.
 
@@ -255,6 +258,7 @@ pid, then `None` (04-sessions.md). Used by the meta shell so that
 | control/stream message        | 256 KiB  |
 | session data chunk            | 64 KiB   |
 | open streams per connection   | 512      |
+| sessions per connection       | 32       |
 | remote listeners per connection | 32     |
 | handshake deadline            | 5 s      |
 | open-reply deadline           | 10 s     |

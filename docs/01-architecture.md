@@ -13,8 +13,9 @@ not an SSH implementation and does not aim at multi-tenant hosts.
 - Reuse of existing OpenSSH ed25519 keys, `authorized_keys`, and
   `known_hosts` where that is cheap and sound.
 - Interactive PTY sessions that track the client terminal size.
-- A **meta shell** inside a session for file transfer, port forwarding, and
-  connection introspection, plus the same commands as CLI subcommands.
+- A **meta shell** inside a session for file transfer, port forwarding,
+  connection introspection, and additional shells on the same connection,
+  plus the same commands as CLI subcommands.
 - One static binary per platform: Linux (musl), macOS, Android. Client and
   server are the same binary.
 - Small enough to read in an afternoon. Boring dependencies.
@@ -113,7 +114,8 @@ src/
   client/
     mod.rs         connect: dial, preamble, handshake, trust check, yamux
     terminal.rs    raw mode, SIGWINCH/SIGTSTP, escape-char state machine
-    session.rs     pty/exec session driver, exit code mapping
+    session.rs     pty/exec session driver, session stack (foreground/background,
+                   ring replay), exit code mapping
     meta.rs        meta shell: tokenizer, dispatcher, commands
     forward.rs     -L/-R/-D listeners, SOCKS5
     files.rs       put/get/ls with progress

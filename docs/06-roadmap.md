@@ -36,7 +36,11 @@ Workspace, lints, CI, this spec.
 
 ### M3 — meta shell, files, forwards
 
-- Meta shell frontends (escape + CLI subcommands), tokenizer, `help`.
+- Meta shell frontends (escape + CLI subcommands + `mysh meta`), tokenizer,
+  `help`.
+- Session stack: `shell` (login shell or `CMD` under a PTY, in the invoking
+  session's cwd), `sessions`, `fg`; background ring buffers with replay;
+  exit/return rules; `-N` stays stdin-free.
 - `put`/`get`/`ls`/`cwd`/`lcd` with progress, resume, recursion, atomic
   writes; cwd probe integration.
 - `-L`/`-R`/`-D`, runtime `forward` management, `-N`.
@@ -44,7 +48,10 @@ Workspace, lints, CI, this spec.
 - Config aliases.
 - Tests: file round-trips (empty, 1 byte, > window size, resume at offset,
   mode/mtime), directory recursion with symlinks, forward echo through
-  `-L`/`-R`/SOCKS5, escape sequences.
+  `-L`/`-R`/SOCKS5, escape sequences; session stack: push via `shell`,
+  background output lands in the ring and is replayed on `fg`, drop
+  accounting past 1 MiB, exit of nested vs primary session, client exit
+  code follows the primary, `cwd` honoured and `cwd_fallback` reported.
 
 ### M4 — hardening and release
 
@@ -88,6 +95,8 @@ later.
 | 9 | config dir `~/.config/mysh` on every platform        | `~/Library/…` on macOS           | one path to remember, same as `~/.ssh`                                 |
 | 10 | dual MIT/Apache-2.0                                 | MIT only                         | Rust ecosystem default                                                 |
 | 11 | no rekey in v1                                      | rekey from day one               | nonce space is not reachable in practice; M4                            |
+| 12 | `shell` stacks sessions on one connection; background output buffered in a 1 MiB ring and replayed | pause via backpressure; full terminal emulation (tmux) | never stalls remote work, bounded memory, no emulator; stale terminal modes when switching full-screen apps are an accepted limitation |
+| 13 | `-N` reads no stdin; meta-only mode is the explicit `mysh meta` | `-N` opens the meta prompt on a tty | reading the tty would `SIGTTIN`-stop a backgrounded `mysh -N … &` |
 
 ## Testing strategy
 

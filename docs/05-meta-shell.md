@@ -34,11 +34,12 @@ byte.
 ## Meta shell session
 
 - Prompt `mysh> ` printed on the same terminal; the terminal is switched to
-  cooked mode for native line editing; remote output is paused via
-  backpressure (not dropped, not buffered client-side).
-- Enter on an empty line, `exit`, or `Ctrl-D` returns to the session, which
-  resumes exactly where it was; a `Resize` is sent on return in case the
-  window changed.
+  cooked mode for native line editing. The session that was foreground keeps
+  running: its output is captured in its ring buffer and replayed when you
+  return (see "Session stack").
+- Enter on an empty line, `exit`, or `Ctrl-D` returns to the foreground
+  session, replaying what it printed meanwhile; a `Resize` is sent on return
+  in case the window changed. With no session left, `exit` disconnects.
 - `Ctrl-C` cancels the running meta command (e.g. a `put`), not the remote
   shell.
 - Tokenizer: POSIX-like quoting via `shlex` (`put "my file.txt"`). Local
@@ -54,6 +55,9 @@ byte.
 | command     | synopsis                                                        | notes                                                                 |
 | ----------- | --------------------------------------------------------------- | --------------------------------------------------------------------- |
 | `help`      | `help [CMD]`                                                    |                                                                       |
+| `shell`     | `shell [--home] [CMD...]`                                       | start a new interactive PTY session on this connection and bring it to the foreground: the server's login shell (`--shell` → `$SHELL` → passwd → `/bin/sh`), or `CMD` under a PTY (`shell htop`, `shell bash --norc`). Starts in the invoking session's cwd unless `--home`. See "Session stack" |
+| `sessions`  | `sessions`                                                      | list sessions: id, pid, kind, foreground/background, buffered bytes; `*` marks the one `exit` returns to |
+| `fg`        | `fg ID`                                                         | bring session ID to the foreground, replaying its buffered output     |
 | `put`       | `put [-r] [-c] [-p] [-L] LOCAL... [REMOTE]`                     | default REMOTE = session cwd (probe) → `~`; progress bar               |
 | `get`       | `get [-r] [-c] [-p] REMOTE... [LOCAL]`                          | default LOCAL = client cwd                                             |
 | `ls`        | `ls [-l] [-a] [REMOTE]`                                         | remote listing; default = session cwd                                  |
@@ -61,16 +65,70 @@ byte.
 | `lcd`       | `lcd [DIR]`                                                     | change the client's working directory used by the meta shell           |
 | `forward`   | `forward -L SPEC` · `-R SPEC` · `-D SPEC` · `forward ls` · `forward rm ID` | same SPEC grammar as the CLI flags; ids are stable per connection |
 | `exec`      | `exec CMD...`                                                   | run a non-PTY exec session; stream output into the meta shell; prints exit code. For quick checks without disturbing the interactive shell |
-| `info`      | `info`                                                          | server name, address, protocol version, peer fingerprint + how it was trusted, cipher, uptime, bytes in/out, RTT, session pid, pty size, active forwards |
+| `info`      | `info`                                                          | server name, address, protocol version, peer fingerprint + how it was trusted, cipher, uptime, bytes in/out, RTT, sessions (id, pid, pty size), active forwards |
 | `ping`      | `ping [-c N]`                                                   | control-stream pings, RTT min/avg/max                                  |
 | `resize`    | `resize`                                                        | re-send the current terminal size                                      |
-| `log`       | `log FILE` · `log off`                                          | tee raw remote output to FILE from now on (`script`-like)              |
+| `log`       | `log FILE` · `log off`                                          | tee everything written to the terminal (whichever session is foreground, replays included) to FILE from now on (`script`-like) |
 | `authorize` | `authorize [PUBKEY_FILE]`                                       | append the client's public key (default: the identity in use) to the server's `~/.config/mysh/authorized_keys` via `File` ops; creates the dir `0700`; skips if already present. Equivalent of `ssh-copy-id` |
 | `disconnect`| `disconnect`                                                    | same as `~.`                                                           |
-| `exit`      | `exit` / empty line / `Ctrl-D`                                  | back to the session                                                    |
+| `exit`      | `exit` / empty line / `Ctrl-D`                                  | back to the foreground session; disconnects if there is none          |
 
 Output formats are plain text, one record per line, suitable for eyes; there
 is no machine-readable mode in v1.
+
+## Session stack
+
+A connection carries any number of PTY sessions (03-protocol.md §7); the
+client keeps them in a most-recently-used list and gives the terminal to
+exactly one at a time, the **foreground** session. The session started by
+the CLI is the **primary** session. `shell` pushes a new one.
+
+- `shell [--home] [CMD...]` opens `Open::Session` with `pty` set from the
+  current `TERM` and window size, `cwd` = the probed cwd of the session the
+  meta shell was opened from (none → server home; `--home` forces home), and
+  `kind: Shell` (server shell resolution, 04-sessions.md; login shell) or
+  `Exec { argv: CMD }` under a PTY — a single argument goes through
+  `$SHELL -c` exactly like a remote command on the CLI. On `Started` the new
+  session becomes foreground. Fails with a message if `--deny pty` is set
+  or stdin is not a terminal.
+- **Background sessions keep running.** Every session has its own reader
+  task. Foreground output goes to the terminal; background output goes into
+  a per-session 1 MiB ring buffer (oldest bytes dropped). Remote processes
+  are never stalled by where the client's focus is.
+- **Switching** to a session (`fg ID`, returning from the meta shell, or a
+  pop after an exit) replays the ring to the terminal, prints a one-line
+  notice if bytes were dropped, then sends `Resize` with the current size so
+  full-screen programs redraw.
+- Stdin and `SIGWINCH` go to the foreground session only; a background
+  session learns the current size when it next comes to the foreground.
+- Escapes work in every foreground session, so `shell` nests: `~:` from a
+  nested shell opens the same meta shell over the same stack. `~.` tears
+  down the whole connection.
+- **When a session exits:**
+  - foreground, other sessions remain → `[mysh: session N exited: STATUS]`
+    and the meta prompt; Enter returns to the most recently used survivor;
+  - foreground, last session → the client exits (ssh behaviour; forwards are
+    torn down), except in `mysh meta` mode where it returns to the prompt;
+  - background → removed from the list; the notice is printed at the next
+    prompt or switch.
+- The client's exit code is the **primary** session's status, remembered if
+  it exited before the others (04-sessions.md); `mysh meta` exits 0 unless
+  the connection was lost.
+
+`sessions` output:
+
+```
+  ID  PID    KIND            STATE       BUFFERED
+* 1   4242   shell           foreground  -
+  2   4310   exec: htop      background  12.3 KiB
+```
+
+mysh is not a terminal multiplexer: it does not emulate the terminal, so
+switching between two full-screen programs can leave the terminal in the
+mode of the previous one (alternate screen, mouse reporting, bracketed
+paste). The `Resize` redraw covers the common cases; `Ctrl-L` or `reset`
+covers the rest. Sessions live exactly as long as the connection (reattach
+is roadmap M5).
 
 ## CLI
 
@@ -83,6 +141,7 @@ mysh fingerprint [FILE]                 key file (private or public, either form
 mysh put    [OPTIONS] HOST LOCAL... [REMOTE]
 mysh get    [OPTIONS] HOST REMOTE... [LOCAL]
 mysh forward [OPTIONS] HOST (-L|-R|-D SPEC)...     = connect -N with forwards
+mysh meta    [OPTIONS] HOST                 connect with no session, start at the meta prompt; `shell` opens one on demand
 mysh authorize [OPTIONS] HOST [PUBKEY_FILE]
 ```
 
@@ -98,7 +157,7 @@ Connection options (shared by every HOST-taking command):
 | `--pin KEY`           | expected server key or fingerprint                        |
 | `--accept-new` / `--strict` | TOFU policy                                         |
 | `-t` / `-T`           | force / forbid PTY                                        |
-| `-N`                  | no session (forwards only)                                |
+| `-N`                  | no session and no stdin; forwards only (safe to run with `&`) |
 | `-L/-R/-D SPEC`       | forwards, repeatable                                      |
 | `-e CHAR|none`        | escape character                                          |
 | `--env NAME[=VALUE]`  | send an environment variable (server must accept it)      |

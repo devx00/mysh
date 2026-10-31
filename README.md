@@ -9,7 +9,8 @@ and Android.
   binary for zero-config devices.
 - Interactive PTY sessions that follow your terminal size.
 - A meta shell inside the session (`~:`) for `put`, `get`, `forward`,
-  `info`, and friends; the same commands as CLI subcommands.
+  `shell` (a second shell on the same connection), `info`, and friends; the
+  same commands as CLI subcommands.
 
 **Status:** scaffold. The design is in [`docs/`](docs/); nothing connects yet.
 

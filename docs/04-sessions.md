@@ -2,7 +2,10 @@
 
 ## PTY session (server)
 
-Implemented in `mysh-pty` (platform calls) and `mysh::server::session`.
+Implemented in `mysh-pty` (platform calls) and `mysh::server::session`. A
+connection may carry several sessions at once (the client's `shell` command,
+05-meta-shell.md); the server treats them identically and independently,
+up to the per-connection quota in 03-protocol.md §12.
 
 1. **Open the pair.** `rustix::pty::openpt(O_RDWR | O_NOCTTY)`, `grantpt`,
    `unlockpt`, `ptsname`, then open the slave `O_RDWR | O_NOCTTY`. No
@@ -18,7 +21,10 @@ Implemented in `mysh-pty` (platform calls) and `mysh::server::session`.
    - `env_clear()`, then `HOME`, `USER`, `LOGNAME`, `PATH`, `SHELL`,
      `MYSH_CONNECTION="<client ip> <client port> <server ip> <server port>"`,
      `MYSH_SESSION=<id>`, plus allow-listed client env (02-security.md);
-   - `current_dir(home)`;
+   - `current_dir`: `SessionRequest.cwd` if present and a directory (relative
+     to home, `~/` expanded), else home. A missing or unusable `cwd` is not
+     an error: the session starts in home and the client is told via
+     `Started { cwd_fallback: true }`;
    - stdin/stdout/stderr = the slave (dup'd by `Stdio::from(OwnedFd)`);
    - `pre_exec`: `setsid()`, `ioctl(0, TIOCSCTTY, 0)`. The master is
      `CLOEXEC` and does not leak into the child.
@@ -86,29 +92,42 @@ Failure → `None`; the meta shell falls back to the server home and says so.
 - Raw mode: `cfmakeraw` on stdin's termios (input and output flags, as ssh
   does); restored by a guard on normal exit, on panic (hook), and before
   suspend. `OPOST` is left off; the remote tty does output processing.
-- `SIGWINCH` → `SessionIn::Resize` with the fresh size. Coalesced: at most
-  one in flight, latest wins.
+- `SIGWINCH` → `SessionIn::Resize` on the **foreground** session with the
+  fresh size. Coalesced: at most one in flight, latest wins. Background
+  sessions get a `Resize` when they come to the foreground.
 - Suspend (`~^Z`): restore termios, `kill(0, SIGTSTP)`; on `SIGCONT`
   re-enter raw mode and send a `Resize` (the size may have changed while
   suspended).
 - Escape sequences are processed by a small state machine on the stdin
   path (05-meta-shell.md); everything else is forwarded verbatim.
-- stdout writes are the hot path: a single writer task, `write_all` on a
-  `tokio::io::Stdout` with no extra buffering beyond the message chunk.
-- Output is **paused** (reader task stops consuming `SessionOut`) while the
-  meta shell owns the terminal; backpressure holds the remote process
-  rather than buffering unboundedly on the client.
+- Terminal writes are the hot path: a single writer task, `write_all` on a
+  `tokio::io::Stdout` with no extra buffering beyond the message chunk. The
+  `log` tee hangs off this writer.
+- **Session stack** (05-meta-shell.md). Each session has its own reader
+  task consuming `SessionOut`. The foreground session's reader feeds the
+  terminal writer; every other session's reader feeds a per-session
+  1 MiB ring buffer, so remote processes are never throttled by client
+  focus and client memory stays bounded (`bytes dropped` is counted and
+  reported). Bringing a session to the foreground = flush its ring to the
+  writer, report drops, send `Resize`. The meta shell is simply a state in
+  which no session is foreground.
 - Non-PTY mode: stdin is read and sent as `Stdin` until EOF (`StdinEof`);
   `Stdout`/`Stderr` are written to the local fds unmodified.
 
 ### Exit codes
 
-| event                          | client exit |
-| ------------------------------ | ----------- |
-| `Exited(Code(n))`              | `n`         |
-| `Exited(Signal{signal})`       | `128 + signal` |
-| connection lost / ping timeout | 255         |
-| local usage / auth / trust error | 2         |
+The client's exit code comes from the **primary** session (the one the CLI
+started); statuses of sessions opened with `shell` are reported in the meta
+shell only. The primary's status is remembered if it exits while other
+sessions are still open.
+
+| event                                   | client exit    |
+| --------------------------------------- | -------------- |
+| primary `Exited(Code(n))`               | `n`            |
+| primary `Exited(Signal{signal})`        | `128 + signal` |
+| `mysh meta` / `-N`, clean disconnect    | 0              |
+| connection lost / ping timeout          | 255            |
+| local usage / auth / trust error        | 2              |
 
 ## Port forwarding
 
