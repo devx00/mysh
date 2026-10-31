@@ -1,77 +1,95 @@
 # 05 — Meta shell and CLI
 
-The meta shell is the client-side command interpreter that drives everything
-a session can do besides typing into the remote shell. It has three
-frontends over one dispatcher (`mysh::client::meta`):
+The meta shell is where a mysh connection starts and where it returns to.
+`mysh HOST` connects and shows the `mysh HOST> ` prompt; `shell` drops into
+a real remote shell; the **meta key** (`Ctrl-]`) brings you back to the
+prompt at any time without touching the connection or the shell you left.
 
-1. the in-session escape (`~:`), interactive;
-2. CLI subcommands (`mysh put HOST …`) that open a connection, run one
-   command, exit;
-3. (roadmap) a control socket so a second terminal can reuse a live
-   connection.
+```mermaid
+stateDiagram-v2
+  [*] --> Meta: mysh HOST
+  Meta --> Session: shell · fg · send
+  Session --> Meta: Ctrl-] (meta key)
+  Session --> Meta: remote shell exits
+  Meta --> [*]: exit · disconnect · Ctrl-D
+```
 
-## Escape sequences
+One dispatcher (`mysh::client::meta`) serves three frontends: the
+interactive prompt; CLI subcommands (`mysh put HOST …`) that connect, run one
+command and exit; and, later, a control socket so another terminal can reuse
+a live connection (roadmap).
 
-Modelled on ssh: the escape character (default `~`) is recognised only at the
-start of a line (after Enter, or at session start). The `~` is held until the
-next key; if that key is not a command the client sends both bytes.
+## Meta key
 
-| keys     | action                                           |
-| -------- | ------------------------------------------------ |
-| `~~`     | send a literal `~`                               |
-| `~.`     | disconnect immediately (exit 255 if a session was live, else 0) |
-| `~^Z`    | suspend the client (04-sessions.md)              |
-| `~:`     | open the meta shell                              |
-| `~?`     | print this table                                 |
-| `~i`     | print one-line connection info, stay in session  |
+While a session is in the foreground the client intercepts exactly one byte,
+the meta key, default `Ctrl-]` (0x1D, the telnet convention). Everything
+else — including `~`, `Ctrl-C`, `Ctrl-Z`, `Ctrl-D` — goes to the remote
+verbatim. Pressing the meta key moves the session to the background and
+shows the meta prompt; nothing is sent to the remote.
 
-`-e CHAR` changes the character, `-e none` disables escapes (for nested
-sessions or binary protocols over stdin). The state machine lives in
-`client::terminal` and is unit-tested against: start-of-session, after
-`\r`, after `\n`, mid-line (`~` forwarded), double escape, unknown second
-byte.
+- `-e KEY` changes it: a single character or caret notation (`-e '^^'`,
+  `-e '^\'`); `-e none` disables interception entirely (binary protocols,
+  or when you want the remote to see every byte; `exit`ing the remote shell
+  is then the only way back to the prompt).
+- To deliver a literal meta key to the remote (vim's `Ctrl-]` tag jump),
+  use `send '^]'` from the prompt, or rebind.
+- At the prompt the same key is bound to `fg`, so `Ctrl-]` toggles between
+  the prompt and the most recently used session.
+- No timers, no line-start rule, no second byte: the interception is a
+  single-byte match, implemented in `client::terminal` and unit-tested
+  against split reads (the byte arriving alone or inside a larger chunk).
 
-## Meta shell session
+The old ssh-style `~` sequences do not exist; `~.` is `disconnect`, `~^Z`
+is `Ctrl-Z` at the prompt, `~?` is `help`.
 
-- Prompt `mysh> ` printed on the same terminal; the terminal is switched to
-  cooked mode for native line editing. The session that was foreground keeps
-  running: its output is captured in its ring buffer and replayed when you
-  return (see "Session stack").
-- Enter on an empty line, `exit`, or `Ctrl-D` returns to the foreground
-  session, replaying what it printed meanwhile; a `Resize` is sent on return
-  in case the window changed. With no session left, `exit` disconnects.
-- `Ctrl-C` cancels the running meta command (e.g. a `put`), not the remote
-  shell.
+## The prompt
+
+- `mysh HOST> ` on the same terminal (HOST as typed, or the alias name). A
+  readline-style line editor with history (`~/.local/state/mysh/history`),
+  basic editing keys, and `Ctrl-R` search; local-path completion is roadmap.
+  The terminal stays in raw mode throughout, which is what makes the meta
+  key bindable here; the editor restores cooked-mode semantics itself.
+- On connect, one line: `connected to HOST (SHA256:…, trusted via
+  known_hosts); type "shell" for a shell, "help" for commands` — `-q`
+  silences it.
+- `Ctrl-C` cancels the running command (a `put`, an `exec`) or clears the
+  line; it never reaches a remote session from here.
+- `Ctrl-Z` suspends the client (04-sessions.md); on `SIGCONT` the prompt is
+  redrawn.
+- `Ctrl-D` on an empty line is `exit`.
 - Tokenizer: POSIX-like quoting via `shlex` (`put "my file.txt"`). Local
   paths get `~` expansion on the client; remote paths on the server.
-- Commands run on the live connection as new yamux streams; the session
-  stream is untouched.
-- Every command has `-h`; `help` lists them. Each command is a small
-  `clap` parser so CLI subcommands and in-session commands share one
-  definition.
+- Commands run on the live connection as new yamux streams; sessions are
+  never disturbed by them.
+- Every command has `-h`; `help` lists them. Each command is a small `clap`
+  parser so CLI subcommands and prompt commands share one definition.
+- Notices (a background session exited, a forward failed) are printed above
+  the prompt as they happen, prefixed `[mysh]`.
 
 ## Commands (v1)
 
-| command     | synopsis                                                        | notes                                                                 |
-| ----------- | --------------------------------------------------------------- | --------------------------------------------------------------------- |
-| `help`      | `help [CMD]`                                                    |                                                                       |
-| `shell`     | `shell [--home] [CMD...]`                                       | start a new interactive PTY session on this connection and bring it to the foreground: the server's login shell (`--shell` → `$SHELL` → passwd → `/bin/sh`), or `CMD` under a PTY (`shell htop`, `shell bash --norc`). Starts in the invoking session's cwd unless `--home`. See "Session stack" |
-| `sessions`  | `sessions`                                                      | list sessions: id, pid, kind, foreground/background, buffered bytes; `*` marks the one `exit` returns to |
-| `fg`        | `fg ID`                                                         | bring session ID to the foreground, replaying its buffered output     |
-| `put`       | `put [-r] [-c] [-p] [-L] LOCAL... [REMOTE]`                     | default REMOTE = session cwd (probe) → `~`; progress bar               |
-| `get`       | `get [-r] [-c] [-p] REMOTE... [LOCAL]`                          | default LOCAL = client cwd                                             |
-| `ls`        | `ls [-l] [-a] [REMOTE]`                                         | remote listing; default = session cwd                                  |
-| `cwd`       | `cwd`                                                           | print remote cwd (probe source: fg process / shell / fallback) and local cwd |
-| `lcd`       | `lcd [DIR]`                                                     | change the client's working directory used by the meta shell           |
-| `forward`   | `forward -L SPEC` · `-R SPEC` · `-D SPEC` · `forward ls` · `forward rm ID` | same SPEC grammar as the CLI flags; ids are stable per connection |
-| `exec`      | `exec CMD...`                                                   | run a non-PTY exec session; stream output into the meta shell; prints exit code. For quick checks without disturbing the interactive shell |
-| `info`      | `info`                                                          | server name, address, protocol version, peer fingerprint + how it was trusted, cipher, uptime, bytes in/out, RTT, sessions (id, pid, pty size), active forwards |
-| `ping`      | `ping [-c N]`                                                   | control-stream pings, RTT min/avg/max                                  |
-| `resize`    | `resize`                                                        | re-send the current terminal size                                      |
-| `log`       | `log FILE` · `log off`                                          | tee everything written to the terminal (whichever session is foreground, replays included) to FILE from now on (`script`-like) |
-| `authorize` | `authorize [PUBKEY_FILE]`                                       | append the client's public key (default: the identity in use) to the server's `~/.config/mysh/authorized_keys` via `File` ops; creates the dir `0700`; skips if already present. Equivalent of `ssh-copy-id` |
-| `disconnect`| `disconnect`                                                    | same as `~.`                                                           |
-| `exit`      | `exit` / empty line / `Ctrl-D`                                  | back to the foreground session; disconnects if there is none          |
+| command      | synopsis                                                        | notes                                                                 |
+| ------------ | --------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `help`       | `help [CMD]`                                                    |                                                                       |
+| `shell`      | `shell [--home] [CMD...]`                                       | start a new interactive PTY session and bring it to the foreground: the server's login shell (`--shell` → `$SHELL` → passwd → `/bin/sh`), or `CMD` under a PTY (`shell htop`, `shell bash --norc`). Starts in the cwd of the most recently used session, if any, unless `--home`. See "Session stack" |
+| `fg`         | `fg [ID]`                                                       | bring session ID (default: most recently used) to the foreground, replaying its buffered output. Also bound to the meta key at the prompt |
+| `sessions`   | `sessions`                                                      | list sessions: id, pid, kind, buffered bytes; `*` marks the most recently used |
+| `kill`       | `kill [-s SIG] ID`                                              | `SessionIn::Signal` to session ID (default `TERM`)                     |
+| `send`       | `send TEXT...`                                                  | write TEXT to the most recently used session and foreground it; caret notation (`^]`, `^C`) and `\xNN` are decoded |
+| `put`        | `put [-r] [-c] [-p] [-L] LOCAL... [REMOTE]`                     | default REMOTE = cwd of the MRU session (probe) → `~`; progress bar    |
+| `get`        | `get [-r] [-c] [-p] REMOTE... [LOCAL]`                          | default LOCAL = client cwd                                             |
+| `ls`         | `ls [-l] [-a] [REMOTE]`                                         | remote listing; default = MRU session cwd → `~`                        |
+| `cwd`        | `cwd`                                                           | print remote cwd (probe source: fg process / shell / home fallback) and local cwd |
+| `lcd`        | `lcd [DIR]`                                                     | change the client's working directory used by the prompt               |
+| `forward`    | `forward -L SPEC` · `-R SPEC` · `-D SPEC` · `forward ls` · `forward rm ID` | same SPEC grammar as the CLI flags; ids are stable per connection |
+| `exec`       | `exec CMD...`                                                   | run a non-PTY exec session; stream output into the prompt; print the exit code. Quick checks without opening a shell |
+| `info`       | `info`                                                          | server name, address, protocol version, peer fingerprint + how it was trusted, cipher, uptime, bytes in/out, RTT, sessions, active forwards |
+| `ping`       | `ping [-c N]`                                                   | control-stream pings, RTT min/avg/max                                  |
+| `resize`     | `resize`                                                        | re-send the current terminal size to the MRU session                   |
+| `log`        | `log FILE` · `log off`                                          | tee everything written to the terminal (whichever session is foreground, replays included) to FILE from now on (`script`-like) |
+| `authorize`  | `authorize [PUBKEY_FILE]`                                       | append the client's public key (default: the identity in use) to the server's `~/.config/mysh/authorized_keys` via `File` ops; creates the dir `0700`; skips if already present. Equivalent of `ssh-copy-id` |
+| `exit`       | `exit` / `Ctrl-D`                                               | close the connection if no session is running; otherwise refuse and list them (`fg`, or `disconnect` to end them) |
+| `disconnect` | `disconnect`                                                    | close the connection now; running sessions get `SIGHUP` from their pty  |
 
 Output formats are plain text, one record per line, suitable for eyes; there
 is no machine-readable mode in v1.
@@ -79,48 +97,42 @@ is no machine-readable mode in v1.
 ## Session stack
 
 A connection carries any number of PTY sessions (03-protocol.md §7); the
-client keeps them in a most-recently-used list and gives the terminal to
-exactly one at a time, the **foreground** session. The session started by
-the CLI is the **primary** session. `shell` pushes a new one.
+client keeps them in a most-recently-used (MRU) list and gives the terminal
+to at most one at a time, the **foreground** session. When none is
+foreground, the prompt is.
 
 - `shell [--home] [CMD...]` opens `Open::Session` with `pty` set from the
-  current `TERM` and window size, `cwd` = the probed cwd of the session the
-  meta shell was opened from (none → server home; `--home` forces home), and
-  `kind: Shell` (server shell resolution, 04-sessions.md; login shell) or
-  `Exec { argv: CMD }` under a PTY — a single argument goes through
-  `$SHELL -c` exactly like a remote command on the CLI. On `Started` the new
-  session becomes foreground. Fails with a message if `--deny pty` is set
-  or stdin is not a terminal.
+  current `TERM` and window size, `cwd` = the probed cwd of the MRU session
+  (none → server home; `--home` forces home), and `kind: Shell` (server
+  shell resolution, 04-sessions.md; login shell) or `Exec { argv: CMD }`
+  under a PTY — a single argument goes through `$SHELL -c` exactly like a
+  remote command on the CLI. On `Started` the new session becomes
+  foreground. Fails with a message if `--deny pty` is set or stdin is not a
+  terminal.
 - **Background sessions keep running.** Every session has its own reader
   task. Foreground output goes to the terminal; background output goes into
   a per-session 1 MiB ring buffer (oldest bytes dropped). Remote processes
   are never stalled by where the client's focus is.
-- **Switching** to a session (`fg ID`, returning from the meta shell, or a
-  pop after an exit) replays the ring to the terminal, prints a one-line
-  notice if bytes were dropped, then sends `Resize` with the current size so
-  full-screen programs redraw.
+- **Switching** to a session (`fg`, `send`, the meta key at the prompt)
+  replays the ring to the terminal, prints a notice if bytes were dropped,
+  then sends `Resize` with the current size so full-screen programs redraw.
 - Stdin and `SIGWINCH` go to the foreground session only; a background
   session learns the current size when it next comes to the foreground.
-- Escapes work in every foreground session, so `shell` nests: `~:` from a
-  nested shell opens the same meta shell over the same stack. `~.` tears
-  down the whole connection.
-- **When a session exits:**
-  - foreground, other sessions remain → `[mysh: session N exited: STATUS]`
-    and the meta prompt; Enter returns to the most recently used survivor;
-  - foreground, last session → the client exits (ssh behaviour; forwards are
-    torn down), except in `mysh meta` mode where it returns to the prompt;
-  - background → removed from the list; the notice is printed at the next
-    prompt or switch.
-- The client's exit code is the **primary** session's status, remembered if
-  it exited before the others (04-sessions.md); `mysh meta` exits 0 unless
-  the connection was lost.
+- The meta key works in every foreground session; `shell` from the prompt
+  always starts a new one, so you can hold several and `fg` between them.
+- **When a session exits:** `[mysh] session N exited: STATUS` is printed
+  and the session is removed. If it was foreground, the prompt returns (no
+  automatic switch to another session). In auto-exit mode (below) the client
+  exits instead when the list becomes empty.
+- Sessions are not re-foregrounded on `exit`; `exit` refuses while any
+  session is running so that a stray `Ctrl-D` cannot kill three shells.
 
 `sessions` output:
 
 ```
-  ID  PID    KIND            STATE       BUFFERED
-* 1   4242   shell           foreground  -
-  2   4310   exec: htop      background  12.3 KiB
+  ID  PID    KIND            BUFFERED
+* 1   4242   shell           -
+  2   4310   exec: htop      12.3 KiB
 ```
 
 mysh is not a terminal multiplexer: it does not emulate the terminal, so
@@ -130,18 +142,37 @@ paste). The `Resize` redraw covers the common cases; `Ctrl-L` or `reset`
 covers the rest. Sessions live exactly as long as the connection (reattach
 is roadmap M5).
 
+## Modes and exit
+
+| invocation                  | start state                              | client exits when                                   | exit code                      |
+| --------------------------- | ---------------------------------------- | --------------------------------------------------- | ------------------------------ |
+| `mysh HOST`                 | prompt                                   | `exit`/`Ctrl-D` with no sessions, or `disconnect`   | 0 (255 if the connection drops) |
+| `mysh -s HOST`              | `shell` run immediately (ssh feel)       | **auto-exit**: the session list becomes empty       | status of that first shell     |
+| `mysh HOST CMD...`          | exec session, no prompt (`-t` for a PTY) | the command exits                                   | its status                     |
+| `mysh -N HOST` / `mysh forward` | nothing; stdin untouched             | `Ctrl-C`/`SIGTERM`, or the connection drops         | 0 / 255                        |
+| `mysh HOST < script`        | prompt commands read from stdin, no prompt, stop at first failure | stdin EOF or a failing command | 0 / 1 (255 on drop)           |
+
+Auto-exit mode still has the prompt: the meta key works, `shell` can open
+more sessions, and the client exits once the last of them is gone. The
+primary session's status (the first `shell`, or `CMD`) is remembered for the
+exit code if other sessions outlive it (04-sessions.md).
+
+`mysh HOST CMD...` never shows the prompt and never reads the meta key unless
+`-t` is given; it is the scriptable path and behaves like `ssh HOST CMD`.
+
 ## CLI
 
 ```
-mysh [OPTIONS] HOST [--] [CMD ...]      connect (interactive if no CMD and stdin is a tty)
-mysh connect [OPTIONS] HOST [CMD ...]   same; escape hatch when HOST collides with a subcommand name
+mysh [OPTIONS] HOST                     connect, land at the prompt
+mysh [OPTIONS] -s HOST                  connect and `shell` immediately; exit when the last session ends
+mysh [OPTIONS] HOST [--] CMD ...        run CMD remotely (no prompt), exit with its status
+mysh connect [OPTIONS] HOST [CMD ...]   same as the above; escape hatch when HOST collides with a subcommand name
 mysh serve [OPTIONS]
 mysh keygen [-o PATH] [-C COMMENT]
 mysh fingerprint [FILE]                 key file (private or public, either format); `-` for stdin
 mysh put    [OPTIONS] HOST LOCAL... [REMOTE]
 mysh get    [OPTIONS] HOST REMOTE... [LOCAL]
 mysh forward [OPTIONS] HOST (-L|-R|-D SPEC)...     = connect -N with forwards
-mysh meta    [OPTIONS] HOST                 connect with no session, start at the meta prompt; `shell` opens one on demand
 mysh authorize [OPTIONS] HOST [PUBKEY_FILE]
 ```
 
@@ -156,10 +187,12 @@ Connection options (shared by every HOST-taking command):
 | `-i PATH`             | identity file (02-security.md order)                      |
 | `--pin KEY`           | expected server key or fingerprint                        |
 | `--accept-new` / `--strict` | TOFU policy                                         |
-| `-t` / `-T`           | force / forbid PTY                                        |
+| `-s`                  | run `shell` on connect; auto-exit when the last session ends |
+| `-t` / `-T`           | force / forbid a PTY for `CMD`                            |
 | `-N`                  | no session and no stdin; forwards only (safe to run with `&`) |
 | `-L/-R/-D SPEC`       | forwards, repeatable                                      |
-| `-e CHAR|none`        | escape character                                          |
+| `-e KEY|none`         | meta key (default `^]`)                                   |
+| `-q`                  | no connect banner                                         |
 | `--env NAME[=VALUE]`  | send an environment variable (server must accept it)      |
 | `--baked-only`        | ignore files on disk                                      |
 | `-v`                  | repeatable; `-vv` includes handshake and stream events    |
@@ -187,9 +220,13 @@ connection anyway).
 
 ## Config file (v1, minimal)
 
-`~/.config/mysh/config.toml`, optional, aliases only:
+`~/.config/mysh/config.toml`, optional:
 
 ```toml
+[defaults]
+escape = "^]"          # meta key
+shell = false          # true = behave like `-s` everywhere
+
 [hosts.pi]
 host = "pi.lan"
 port = 7722
@@ -197,10 +234,11 @@ identity = "~/.ssh/id_ed25519"
 pin = "SHA256:…"
 forward = ["-L 8080:localhost:80"]
 env = ["LANG"]
+shell = true           # `mysh pi` goes straight to a shell
 ```
 
-Flags override the alias; the alias overrides defaults. No `Match` blocks,
-no includes.
+Flags override the alias; the alias overrides `[defaults]`; `[defaults]`
+overrides built-ins. No `Match` blocks, no includes.
 
 ## Control socket (roadmap, designed now)
 

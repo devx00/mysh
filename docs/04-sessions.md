@@ -86,20 +86,24 @@ Failure → `None`; the meta shell falls back to the server home and says so.
 
 `mysh::client::terminal` + `mysh::client::session`.
 
-- PTY is requested when stdin is a terminal and no command is given, or with
-  `-t`; `-T` forces none. `TERM` and the current `winsize` go in
-  `PtyRequest`.
-- Raw mode: `cfmakeraw` on stdin's termios (input and output flags, as ssh
-  does); restored by a guard on normal exit, on panic (hook), and before
+- The terminal is in raw mode (`cfmakeraw` on stdin's termios, input and
+  output flags, as ssh does) for the whole interactive run — at the prompt
+  and in sessions alike; the prompt's line editor handles echo and editing
+  itself. Restored by a guard on normal exit, on panic (hook), and before
   suspend. `OPOST` is left off; the remote tty does output processing.
+- Sessions opened with `shell` (and `-s`, and `CMD` with `-t`) request a PTY
+  with `TERM` and the current `winsize` in `PtyRequest`. `mysh HOST CMD`
+  without `-t` requests none and leaves the local terminal alone.
+- Stdin bytes go to the foreground session verbatim except the **meta key**
+  (05-meta-shell.md): a single-byte match in the stdin path that
+  backgrounds the session and hands the terminal to the prompt. With no
+  session foreground, stdin feeds the line editor.
 - `SIGWINCH` → `SessionIn::Resize` on the **foreground** session with the
   fresh size. Coalesced: at most one in flight, latest wins. Background
   sessions get a `Resize` when they come to the foreground.
-- Suspend (`~^Z`): restore termios, `kill(0, SIGTSTP)`; on `SIGCONT`
-  re-enter raw mode and send a `Resize` (the size may have changed while
-  suspended).
-- Escape sequences are processed by a small state machine on the stdin
-  path (05-meta-shell.md); everything else is forwarded verbatim.
+- Suspend (`Ctrl-Z` at the prompt; in a session the byte goes to the
+  remote): restore termios, `kill(0, SIGTSTP)`; on `SIGCONT` re-enter raw
+  mode, redraw the prompt.
 - Terminal writes are the hot path: a single writer task, `write_all` on a
   `tokio::io::Stdout` with no extra buffering beyond the message chunk. The
   `log` tee hangs off this writer.
@@ -116,18 +120,19 @@ Failure → `None`; the meta shell falls back to the server home and says so.
 
 ### Exit codes
 
-The client's exit code comes from the **primary** session (the one the CLI
-started); statuses of sessions opened with `shell` are reported in the meta
-shell only. The primary's status is remembered if it exits while other
-sessions are still open.
+The **primary** session is the one the CLI started (`CMD`, or the first
+`shell` under `-s`); plain `mysh HOST` has none. Statuses of sessions opened
+from the prompt are reported there only. The primary's status is remembered
+if it exits while other sessions are still open.
 
-| event                                   | client exit    |
-| --------------------------------------- | -------------- |
-| primary `Exited(Code(n))`               | `n`            |
-| primary `Exited(Signal{signal})`        | `128 + signal` |
-| `mysh meta` / `-N`, clean disconnect    | 0              |
-| connection lost / ping timeout          | 255            |
-| local usage / auth / trust error        | 2              |
+| event                                                | client exit    |
+| ---------------------------------------------------- | -------------- |
+| primary `Exited(Code(n))`                            | `n`            |
+| primary `Exited(Signal{signal})`                     | `128 + signal` |
+| `exit`/`disconnect` at the prompt, `-N` stopped by signal | 0         |
+| scripted stdin (`mysh HOST < file`): a command failed | 1             |
+| connection lost / ping timeout                       | 255            |
+| local usage / auth / trust error                     | 2              |
 
 ## Port forwarding
 

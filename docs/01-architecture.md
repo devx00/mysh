@@ -13,9 +13,10 @@ not an SSH implementation and does not aim at multi-tenant hosts.
 - Reuse of existing OpenSSH ed25519 keys, `authorized_keys`, and
   `known_hosts` where that is cheap and sound.
 - Interactive PTY sessions that track the client terminal size.
-- A **meta shell** inside a session for file transfer, port forwarding,
-  connection introspection, and additional shells on the same connection,
-  plus the same commands as CLI subcommands.
+- A **meta shell** as the home screen of every connection: file transfer,
+  port forwarding, connection introspection, and any number of real remote
+  shells (`shell`), with one key (`Ctrl-]`) to get back to it. The same
+  commands exist as CLI subcommands.
 - One static binary per platform: Linux (musl), macOS, Android. Client and
   server are the same binary.
 - Small enough to read in an afternoon. Boring dependencies.
@@ -113,10 +114,10 @@ src/
   config.rs        paths, HOST parsing, identity/trust resolution order
   client/
     mod.rs         connect: dial, preamble, handshake, trust check, yamux
-    terminal.rs    raw mode, SIGWINCH/SIGTSTP, escape-char state machine
+    terminal.rs    raw mode, SIGWINCH/SIGTSTP, meta-key interception
     session.rs     pty/exec session driver, session stack (foreground/background,
                    ring replay), exit code mapping
-    meta.rs        meta shell: tokenizer, dispatcher, commands
+    meta.rs        meta shell: line editor, tokenizer, dispatcher, commands
     forward.rs     -L/-R/-D listeners, SOCKS5
     files.rs       put/get/ls with progress
   server/
@@ -140,6 +141,7 @@ src/
 | `libc` (macOS only)            | `proc_pidinfo` for cwd probe           |                                                            |
 | `clap`                         | CLI                                    | derive                                                     |
 | `shlex`                        | meta shell tokenizer                   |                                                            |
+| `rustyline` (M3)               | prompt line editing, history           | must coexist with our raw mode and tokio; a small built-in editor is the fallback |
 | `indicatif`                    | transfer progress bars                 |                                                            |
 | `rpassword`                    | passphrase and TOFU prompts            |                                                            |
 | `dirs`                         | XDG / platform directories             |                                                            |

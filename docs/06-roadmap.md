@@ -26,7 +26,7 @@ Workspace, lints, CI, this spec.
 
 - `mysh-pty`: pty pair, controlling-tty spawn, winsize, cwd probe, raw mode
   guard, signal plumbing (all three platforms).
-- Session stream: `Shell`, `Resize`, suspend/resume, escape state machine,
+- Session stream: `Shell`, `Resize`, suspend/resume, meta-key interception,
   exit status including signals, `Exited` ordering after EOF.
 - Shell/home/env resolution per platform table.
 - Android smoke: `cross build`, `adb push`, serve from `adb shell`, connect
@@ -36,11 +36,12 @@ Workspace, lints, CI, this spec.
 
 ### M3 — meta shell, files, forwards
 
-- Meta shell frontends (escape + CLI subcommands + `mysh meta`), tokenizer,
-  `help`.
-- Session stack: `shell` (login shell or `CMD` under a PTY, in the invoking
-  session's cwd), `sessions`, `fg`; background ring buffers with replay;
-  exit/return rules; `-N` stays stdin-free.
+- The prompt as home: line editor with history, connect banner, scripted
+  stdin mode, `-s`, auto-exit rules; CLI subcommands over the same
+  dispatcher.
+- Session stack: `shell` (login shell or `CMD` under a PTY, in the MRU
+  session's cwd), `fg`, `sessions`, `kill`, `send`; background ring buffers
+  with replay; `-N` stays stdin-free.
 - `put`/`get`/`ls`/`cwd`/`lcd` with progress, resume, recursion, atomic
   writes; cwd probe integration.
 - `-L`/`-R`/`-D`, runtime `forward` management, `-N`.
@@ -48,10 +49,11 @@ Workspace, lints, CI, this spec.
 - Config aliases.
 - Tests: file round-trips (empty, 1 byte, > window size, resume at offset,
   mode/mtime), directory recursion with symlinks, forward echo through
-  `-L`/`-R`/SOCKS5, escape sequences; session stack: push via `shell`,
-  background output lands in the ring and is replayed on `fg`, drop
-  accounting past 1 MiB, exit of nested vs primary session, client exit
-  code follows the primary, `cwd` honoured and `cwd_fallback` reported.
+  `-L`/`-R`/SOCKS5, meta key inside split reads; session stack: push via
+  `shell`, background output lands in the ring and is replayed on `fg`,
+  drop accounting past 1 MiB, exit of a prompt-opened session vs the
+  primary under `-s`, `exit` refused while sessions run, client exit code
+  follows the primary, `cwd` honoured and `cwd_fallback` reported.
 
 ### M4 — hardening and release
 
@@ -74,7 +76,7 @@ Workspace, lints, CI, this spec.
 - Signature authentication (`NN` + ed25519 signature over the handshake
   hash) enabling `ssh-agent`, `sk-*` keys, and keys that cannot be exported.
 - Background transfers (`put … &`, `jobs`), parallel recursive transfers.
-- Meta shell line editing with history and local path completion.
+- Local path completion at the prompt.
 - Post-quantum hybrid (X25519 + ML-KEM) if `snow` or a successor exposes it.
 
 ## Decisions log
@@ -96,12 +98,14 @@ later.
 | 10 | dual MIT/Apache-2.0                                 | MIT only                         | Rust ecosystem default                                                 |
 | 11 | no rekey in v1                                      | rekey from day one               | nonce space is not reachable in practice; M4                            |
 | 12 | `shell` stacks sessions on one connection; background output buffered in a 1 MiB ring and replayed | pause via backpressure; full terminal emulation (tmux) | never stalls remote work, bounded memory, no emulator; stale terminal modes when switching full-screen apps are an accepted limitation |
-| 13 | `-N` reads no stdin; meta-only mode is the explicit `mysh meta` | `-N` opens the meta prompt on a tty | reading the tty would `SIGTTIN`-stop a backgrounded `mysh -N … &` |
+| 13 | `-N` reads no stdin; everything else lands at the prompt | `-N` opens the prompt on a tty | reading the tty would `SIGTTIN`-stop a backgrounded `mysh -N … &` |
+| 14 | the prompt is the home state; `shell` opens a real shell; `-s` for ssh-like feel | ssh model (shell first, meta via escape) | the connection outlives any one shell; forwards, transfers and several shells are first-class, not escapes |
+| 15 | single-byte meta key `Ctrl-]`, interceptable anywhere; `send` for the literal | ssh `~` line-start sequences | one keystroke, no line-start rule, no held bytes or timers; telnet precedent; collides only with vim tag jump, rebindable |
 
 ## Testing strategy
 
 - Unit: parsers (key files, authorized_keys, known_hosts incl. hashed,
-  config), escape state machine, SOCKS5 request parsing, HOST parsing, exit
+  config), meta-key interception, SOCKS5 request parsing, HOST parsing, exit
   code mapping, env allow-list.
 - Integration (`crates/mysh/tests`): start a server on `127.0.0.1:0` with a
   temp config dir, connect with the library API, exercise handshake/auth,
