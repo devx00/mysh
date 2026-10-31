@@ -559,6 +559,14 @@ async fn dispatch(mut stream: Stream, ctx: ConnCtx) {
         }
         Open::File { op, cwd } => files::handle_file(stream, op, cwd, ctx).await,
         Open::Cwd { session } => session::handle_cwd(stream, session, ctx).await,
+        Open::Attach { .. } | Open::ListSessions => {
+            files::send_error(
+                &mut stream,
+                ErrorCode::Unsupported,
+                "session persistence is not enabled",
+            )
+            .await;
+        }
     }
 }
 
@@ -804,7 +812,9 @@ mod tests {
                 SessionOut::Stdout(chunk) => out.extend_from_slice(&chunk),
                 SessionOut::Stderr(chunk) => panic!("unexpected stderr {chunk:?}"),
                 SessionOut::Exited(status) => break status,
-                SessionOut::Started { .. } => panic!("second Started"),
+                other @ (SessionOut::Started { .. } | SessionOut::Attached { .. }) => {
+                    panic!("unexpected {other:?}")
+                }
             }
         };
         assert_eq!(out, b"hi\n");

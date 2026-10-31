@@ -25,6 +25,12 @@ pub enum Open {
     File { op: FileOp, cwd: Option<String> },
     /// Client → server; one `Msg<Option<String>>` then close.
     Cwd { session: u32 },
+    /// Client → server; reattach to a detached PTY session. On `Ok` the
+    /// stream becomes that session's stream: `SessionOut::Attached`, the
+    /// buffered output, then live traffic.
+    Attach { session: u32 },
+    /// Client → server; one `Msg<Vec<DetachedSession>>` then close.
+    ListSessions,
 }
 
 /// Kind tags for [`Open`].
@@ -38,6 +44,8 @@ pub enum OpenKind {
     ForwardedTcp = 4,
     File = 5,
     Cwd = 6,
+    Attach = 7,
+    ListSessions = 8,
 }
 
 impl OpenKind {
@@ -50,6 +58,8 @@ impl OpenKind {
             4 => Self::ForwardedTcp,
             5 => Self::File,
             6 => Self::Cwd,
+            7 => Self::Attach,
+            8 => Self::ListSessions,
             _ => return None,
         })
     }
@@ -76,6 +86,8 @@ impl Open {
             Self::ForwardedTcp { .. } => OpenKind::ForwardedTcp,
             Self::File { .. } => OpenKind::File,
             Self::Cwd { .. } => OpenKind::Cwd,
+            Self::Attach { .. } => OpenKind::Attach,
+            Self::ListSessions => OpenKind::ListSessions,
         }
     }
 
@@ -84,7 +96,7 @@ impl Open {
     pub fn encode_body(&self) -> Result<Vec<u8>, frame::Error> {
         let mut out = vec![self.kind() as u8];
         match self {
-            Self::Control => {}
+            Self::Control | Self::ListSessions => {}
             Self::Session(req) => {
                 postcard::to_io(req, &mut out)?;
             }
@@ -97,7 +109,7 @@ impl Open {
             Self::File { op, cwd } => {
                 postcard::to_io(&(op, cwd), &mut out)?;
             }
-            Self::Cwd { session } => {
+            Self::Cwd { session } | Self::Attach { session } => {
                 postcard::to_io(session, &mut out)?;
             }
         }
@@ -143,6 +155,10 @@ impl Open {
             OpenKind::Cwd => Self::Cwd {
                 session: frame::decode(rest)?,
             },
+            OpenKind::Attach => Self::Attach {
+                session: frame::decode(rest)?,
+            },
+            OpenKind::ListSessions => Self::ListSessions,
         })
     }
 }
@@ -229,6 +245,8 @@ mod tests {
                 cwd: None,
             },
             Open::Cwd { session: 9 },
+            Open::Attach { session: 4 },
+            Open::ListSessions,
         ];
         for open in cases {
             let frame = open.encode_frame().unwrap();

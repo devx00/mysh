@@ -99,7 +99,9 @@ async fn collect_until_exit(stream: &mut Stream) -> (Vec<u8>, ExitStatus) {
             SessionOut::Stdout(chunk) => out.extend_from_slice(&chunk),
             SessionOut::Stderr(chunk) => panic!("pty session sent Stderr: {chunk:?}"),
             SessionOut::Exited(status) => return (out, status),
-            SessionOut::Started { .. } => panic!("second Started"),
+            other @ (SessionOut::Started { .. } | SessionOut::Attached { .. }) => {
+                panic!("unexpected {other:?}")
+            }
         }
     }
 }

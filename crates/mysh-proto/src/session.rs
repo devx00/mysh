@@ -108,6 +108,31 @@ pub enum SessionOut {
     Stderr(Vec<u8>),
     /// Last message; the server then closes its write side.
     Exited(ExitStatus),
+    /// First message on an `Open::Attach` stream, in place of `Started`.
+    /// `buffered` bytes of output captured while detached follow as
+    /// `Stdout` before live traffic; `dropped` were lost to the ring cap.
+    Attached {
+        session: u32,
+        pid: u32,
+        buffered: u64,
+        dropped: u64,
+    },
+}
+
+/// One entry of the `Open::ListSessions` reply: a PTY session whose client
+/// went away and that the server is keeping for the detach grace window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetachedSession {
+    pub id: u32,
+    pub pid: u32,
+    /// `"shell"` or the exec command line.
+    pub kind: String,
+    /// Seconds since the Unix epoch.
+    pub started: i64,
+    /// Seconds since the Unix epoch; `None` while a client is attached.
+    pub detached: Option<i64>,
+    /// Output bytes buffered while detached.
+    pub buffered: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

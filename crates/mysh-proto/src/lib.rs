@@ -76,4 +76,25 @@ pub mod limits {
     pub const YAMUX_MAX_WINDOW: u32 = 4 * 1024 * 1024;
     /// Directory listing page size.
     pub const LIST_PAGE: usize = 1000;
+    /// Handshakes accepted per source IP per minute (token bucket, burst =
+    /// this value). Excess connections are closed before the handshake.
+    pub const HANDSHAKES_PER_MINUTE: u32 = 10;
+    /// Rekey after this many plaintext bytes in one direction …
+    pub const REKEY_BYTES: u64 = 1 << 30;
+    /// … or after this long since the last rekey, whichever comes first.
+    pub const REKEY_INTERVAL: Duration = Duration::from_secs(3600);
+    /// How long the server keeps a PTY session whose client went away.
+    pub const DETACH_GRACE: Duration = Duration::from_secs(600);
+    /// Output buffered per detached session; older bytes are dropped.
+    pub const DETACHED_RING: usize = 1024 * 1024;
+    /// Agent keys tried (one connection each) before giving up.
+    pub const MAX_AGENT_KEYS: usize = 5;
+}
+
+/// `ServerHello.caps` / `ClientHello.caps` bits. Zero means none.
+pub mod caps {
+    /// Server: accepts ed25519 signature proofs in `ClientHello.auth`.
+    pub const SIG_AUTH: u32 = 1;
+    /// Server: keeps detached PTY sessions (`Open::Attach`, `ListSessions`).
+    pub const PERSIST: u32 = 2;
 }

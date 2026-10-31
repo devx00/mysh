@@ -391,7 +391,9 @@ async fn reader(
                 let _ = events.send(Event::Exited { id, status });
                 return;
             }
-            Ok(SessionOut::Started { .. }) => debug!(id, "duplicate Started ignored"),
+            Ok(SessionOut::Started { .. } | SessionOut::Attached { .. }) => {
+                debug!(id, "duplicate start message ignored");
+            }
             Err(e) => {
                 debug!(id, error = %e, "session stream ended");
                 let _ = events.send(Event::Lost { id });
