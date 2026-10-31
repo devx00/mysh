@@ -126,10 +126,10 @@ Files are re-read on every connection; no reload signal needed. A server
 whose trusted set is empty refuses to start (fail closed).
 
 The check runs after the Noise handshake completes, on the authenticated
-remote static. An unauthorized client receives one transport-mode
-`Error { code: Unauthorized }` message and the connection is closed; the
-fingerprint is logged at `warn`. Authorization precedes every service: no
-stream is accepted from an unauthenticated peer.
+remote static. An unauthorized client receives
+`Verdict::Denied { code: Unauthorized }` as the first transport message and
+the connection is closed; the fingerprint is logged at `warn`. Authorization
+precedes every service: no stream is accepted from an unauthenticated peer.
 
 Per-key options (`command=`, `no-forward`, `from=`) are not in v1
 (06-roadmap.md).

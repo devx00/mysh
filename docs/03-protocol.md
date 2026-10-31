@@ -50,10 +50,11 @@ u16-BE ciphertext_len ‖ ciphertext         (ciphertext_len ≤ 65535, includes
 65519 plaintext bytes; reads surface one decrypted message at a time with
 internal buffering. A decryption failure is fatal for the connection.
 
-Before the mux starts, the server may send exactly one transport message
-`Error { code, message }` (used for `Unauthorized`) and close. The client
-treats any transport-level message other than yamux frames as fatal after
-that point.
+The first transport-mode message is always `Msg<Verdict>`, server → client:
+`Accepted`, after which yamux frames begin, or `Denied { code, message }`
+(`Unauthorized` for an untrusted client static) followed by close. The
+client reads it before starting the mux, so the two are never ambiguous on
+the wire.
 
 ## 4. Multiplexing
 
