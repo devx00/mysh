@@ -191,6 +191,53 @@ impl Stack {
                 "session {id}: requested cwd unusable, started in home"
             ));
         }
+        self.install(id, pid, kind_label, stream);
+        Ok(id)
+    }
+
+    /// Reattach the detached session `id` (`Open::Attach`), wait for
+    /// `Attached`, and install it like a fresh session. The server's replay
+    /// of output captured while detached arrives as ordinary `Stdout`, so
+    /// the usual foreground path shows it; bytes lost to the server ring
+    /// are reported. Returns the session id.
+    pub async fn open_attached(
+        &mut self,
+        conn: &Connection,
+        id: u32,
+        kind_label: &str,
+    ) -> Result<u32> {
+        let mut stream = conn
+            .open(&Open::Attach { session: id })
+            .await
+            .with_context(|| format!("attaching session {id}"))?;
+        let first: SessionOut = read_msg(&mut stream)
+            .await
+            .context("waiting for Attached")?;
+        let SessionOut::Attached {
+            session,
+            pid,
+            buffered,
+            dropped,
+        } = first
+        else {
+            bail!("attach stream: expected Attached, got {first:?}");
+        };
+        if session != id {
+            bail!("attach stream: asked for session {id}, server attached {session}");
+        }
+        if dropped > 0 {
+            self.console.notice(&format!(
+                "session {id}: {dropped} bytes of output were dropped while detached"
+            ));
+        }
+        self.install(id, pid, kind_label, stream);
+        debug!(id, pid, buffered, dropped, "session reattached");
+        Ok(id)
+    }
+
+    /// Spawn the reader and writer tasks for `stream` and insert the session
+    /// at the MRU head, not foregrounded.
+    fn install(&mut self, id: u32, pid: u32, kind_label: &str, stream: mysh_net::mux::Stream) {
         let out = Arc::new(Mutex::new(Output {
             ring: Ring::new(RING_CAP),
             foreground: false,
@@ -216,7 +263,20 @@ impl Stack {
             },
         );
         debug!(id, pid, kind = kind_label, "session started");
-        Ok(id)
+    }
+
+    /// Drop session `id` from the stack without signalling it: the writer
+    /// task half-closes the stream, which the server takes as a detach
+    /// (docs/04-sessions.md, "Client gone"). Buffered output is discarded;
+    /// the server replays what the session prints from now on.
+    pub fn detach(&mut self, id: u32) -> Result<()> {
+        let idx = self.index(id)?;
+        let session = self.sessions.remove(idx);
+        if self.fg == Some(id) {
+            self.fg = None;
+        }
+        debug!(id, pid = session.pid, "session detached");
+        Ok(())
     }
 
     fn index(&self, id: u32) -> Result<usize> {

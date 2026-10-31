@@ -22,12 +22,15 @@ use tracing::debug;
 use crate::{
     cli::{ForwardAction, MetaCommand, meta_help, parse_meta_line},
     client::{
+        attach,
         conn::Connection,
         console::{Console, human},
         editor::{Edit, LineEditor, format_columns},
         files,
-        forward::{ForwardInfo, ForwardKind, Forwards},
-        session::{Event, Stack},
+        forward::{ForwardInfo, ForwardKind},
+        jobs,
+        session::{Event, SessionInfo, Stack},
+        shared::Shared,
         terminal::{Input, Terminal},
     },
     config::{ForwardSpec, Target, decode_send_text, expand_tilde},
@@ -55,29 +58,114 @@ pub enum Flow {
     Disconnect,
 }
 
-/// Everything the dispatcher works on; owned by `client::run`.
+/// Everything the dispatcher works on. The prompt owns one; a background
+/// job or a control-socket request builds a detached one over the same
+/// [`Shared`] state ([`Ctx::detached`]).
 pub struct Ctx {
-    pub conn: Connection,
+    /// Connection, forwards, jobs, home: shared with jobs and the control
+    /// socket.
+    pub shared: Arc<Shared>,
     pub console: Console,
+    /// The prompt's session stack; a detached context has an empty private
+    /// one (used by `exec`) and reads `shared.sessions` instead.
     pub stack: Stack,
     pub events: mpsc::UnboundedReceiver<Event>,
-    pub forwards: Forwards,
     pub history: History,
     /// Client-side working directory for `put`/`get`/`lcd`.
     pub local_cwd: PathBuf,
-    pub home: PathBuf,
     /// `-s` / `CMD`: exit when the session list becomes empty.
     pub auto_exit: bool,
+    /// Not the prompt: session commands use the shared snapshot.
+    pub detached: bool,
 }
 
 impl std::fmt::Debug for Ctx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ctx")
-            .field("conn", &self.conn)
+            .field("conn", &self.shared.conn)
             .field("sessions", &self.stack.len())
             .field("local_cwd", &self.local_cwd)
             .field("auto_exit", &self.auto_exit)
+            .field("detached", &self.detached)
             .finish_non_exhaustive()
+    }
+}
+
+impl Ctx {
+    /// The prompt's context.
+    pub fn new(shared: Arc<Shared>, console: Console, local_cwd: PathBuf, auto_exit: bool) -> Self {
+        let (stack, events) = Stack::new(console.clone());
+        Self {
+            shared,
+            console,
+            stack,
+            events,
+            history: History::empty(),
+            local_cwd,
+            auto_exit,
+            detached: false,
+        }
+    }
+
+    /// A context for a job or a control request: its own console and an
+    /// empty private stack.
+    pub fn detached(shared: &Arc<Shared>, console: Console, local_cwd: PathBuf) -> Self {
+        let mut ctx = Self::new(Arc::clone(shared), console, local_cwd, false);
+        ctx.detached = true;
+        ctx
+    }
+
+    /// Publish the prompt's stack to `shared.sessions`; call after anything
+    /// that may have changed it.
+    pub fn sync_sessions(&self) {
+        if !self.detached {
+            self.shared.sessions.update(&self.stack);
+        }
+    }
+
+    /// Most recently used session id.
+    pub fn mru(&self) -> Option<u32> {
+        if self.detached {
+            self.shared.sessions.mru()
+        } else {
+            self.stack.mru()
+        }
+    }
+
+    fn session_rows(&self) -> Vec<SessionInfo> {
+        if self.detached {
+            self.shared.sessions.list()
+        } else {
+            self.stack.list()
+        }
+    }
+
+    fn session_count(&self) -> usize {
+        if self.detached {
+            self.shared.sessions.len()
+        } else {
+            self.stack.len()
+        }
+    }
+
+    fn signal(&self, id: u32, sig: Signal) -> Result<()> {
+        if self.detached {
+            self.shared.sessions.signal(id, sig)
+        } else {
+            self.stack.signal(id, sig)
+        }
+    }
+}
+
+impl Drop for Ctx {
+    /// A job or control request that is cancelled mid-`exec` leaves its
+    /// session in the private stack: ask the server to end it.
+    fn drop(&mut self) {
+        if self.detached {
+            for s in self.stack.list() {
+                let _ = self.stack.signal(s.id, Signal::Term);
+            }
+        }
     }
 }
 
@@ -132,8 +220,8 @@ pub fn session_request(
 
 /// The MRU session's cwd, if there is one and the probe succeeds.
 pub async fn mru_cwd(ctx: &Ctx) -> Option<String> {
-    let id = ctx.stack.mru()?;
-    ctx.conn.cwd_probe(id).await
+    let id = ctx.mru()?;
+    ctx.shared.conn.cwd_probe(id).await
 }
 
 /// Label for `sessions`: `shell` or `exec: CMD`.
@@ -182,7 +270,7 @@ async fn cancellable<T>(
 }
 
 fn resolve_local(ctx: &Ctx, path: &str) -> PathBuf {
-    let p = expand_tilde(path, &ctx.home);
+    let p = expand_tilde(path, &ctx.shared.home);
     if p.is_absolute() {
         p
     } else {
@@ -218,7 +306,7 @@ pub fn pubkey_line(
 
 fn format_sessions(ctx: &Ctx) -> String {
     let mut out = String::from("  ID   PID     KIND             BUFFERED\n");
-    for s in ctx.stack.list() {
+    for s in ctx.session_rows() {
         let mark = if s.mru { '*' } else { ' ' };
         let buffered = if s.buffered == 0 {
             "-".to_owned()
@@ -274,7 +362,9 @@ pub async fn execute(ctx: &mut Ctx, cmd: MetaCommand, term: Option<&mut Terminal
         MetaCommand::Help { cmd } => ctx.console.print(&meta_help(cmd.as_deref())),
         MetaCommand::Shell(_)
         | MetaCommand::Fg { .. }
-        | MetaCommand::Sessions
+        | MetaCommand::Sessions { .. }
+        | MetaCommand::Attach { .. }
+        | MetaCommand::Detach { .. }
         | MetaCommand::Kill { .. }
         | MetaCommand::Send { .. }
         | MetaCommand::Resize => return execute_session(ctx, cmd, term).await,
@@ -292,6 +382,7 @@ pub async fn execute(ctx: &mut Ctx, cmd: MetaCommand, term: Option<&mut Terminal
         MetaCommand::Info => cmd_info(ctx),
         MetaCommand::Ping { count } => cmd_ping(ctx, count.unwrap_or(4).max(1), term).await?,
         MetaCommand::Log { target } => cmd_log(ctx, &target)?,
+        MetaCommand::Jobs { wait, id } => cmd_jobs(ctx, wait, id).await?,
         MetaCommand::Exit => {
             if !ctx.stack.is_empty() {
                 bail!(
@@ -334,22 +425,36 @@ async fn execute_session(
             }
             Ok(Flow::Foreground(id))
         }
-        MetaCommand::Sessions => {
-            if ctx.stack.is_empty() {
+        MetaCommand::Sessions { all } => {
+            if ctx.session_count() == 0 {
                 ctx.console.println("no sessions");
             } else {
                 ctx.console.print(&format_sessions(ctx));
             }
+            if all {
+                ctx.console.println("server:");
+                attach::print_remote(&ctx.shared.conn, &ctx.console).await?;
+            }
+            Ok(Flow::Continue)
+        }
+        MetaCommand::Attach { id } => {
+            if term.is_none() || ctx.detached {
+                bail!("attach: stdin is not a terminal");
+            }
+            let id = attach::attach(&ctx.shared.conn, &mut ctx.stack, id)
+                .await
+                .context("attach")?;
+            Ok(Flow::Foreground(id))
+        }
+        MetaCommand::Detach { id } => {
+            if ctx.detached {
+                bail!("detach: only at the prompt");
+            }
+            attach::detach(&ctx.shared.conn, &ctx.console, &mut ctx.stack, id)?;
             Ok(Flow::Continue)
         }
         MetaCommand::Kill { signal, id } => {
-            let sig = match signal {
-                Some(s) => {
-                    Signal::parse(&s).ok_or_else(|| anyhow!("kill: unknown signal {s:?}"))?
-                }
-                None => Signal::Term,
-            };
-            ctx.stack.signal(id, sig)?;
+            cmd_kill(ctx, signal.as_deref(), &id)?;
             Ok(Flow::Continue)
         }
         MetaCommand::Send { text } => {
@@ -388,11 +493,12 @@ async fn execute_transfer(
     cmd: MetaCommand,
     term: Option<&mut Terminal>,
 ) -> Result<()> {
+    let conn = ctx.shared.conn.clone();
     let (name, done) = match cmd {
         MetaCommand::Put(args) => {
             let remote = mru_cwd(ctx).await;
             let fut = files::put(
-                &ctx.conn,
+                &conn,
                 &ctx.console,
                 &args,
                 remote.as_deref(),
@@ -403,7 +509,7 @@ async fn execute_transfer(
         MetaCommand::Get(args) => {
             let remote = mru_cwd(ctx).await;
             let fut = files::get(
-                &ctx.conn,
+                &conn,
                 &ctx.console,
                 &args,
                 remote.as_deref(),
@@ -413,12 +519,17 @@ async fn execute_transfer(
         }
         MetaCommand::Ls(args) => {
             let remote = mru_cwd(ctx).await;
-            let fut = files::ls(&ctx.conn, &ctx.console, &args, remote.as_deref());
+            let fut = files::ls(&conn, &ctx.console, &args, remote.as_deref());
             ("ls", cancellable(term, fut).await?.is_some())
         }
         MetaCommand::Authorize(args) => {
-            let line = pubkey_line(&ctx.conn, args.pubkey.as_deref(), &ctx.home, &ctx.local_cwd)?;
-            let fut = files::authorize(&ctx.conn, &ctx.console, &line);
+            let line = pubkey_line(
+                &conn,
+                args.pubkey.as_deref(),
+                &ctx.shared.home,
+                &ctx.local_cwd,
+            )?;
+            let fut = files::authorize(&conn, &ctx.console, &line);
             ("authorize", cancellable(term, fut).await?.is_some())
         }
         other => bail!("internal: {other:?} is not a transfer command"),
@@ -439,15 +550,66 @@ async fn cmd_shell(ctx: &mut Ctx, args: &crate::cli::ShellArgs, ws: WinSize) -> 
             argv: args.command.clone(),
         }
     };
-    let req = session_request(ctx.conn.target(), kind, Some(ws), cwd);
+    let req = session_request(ctx.shared.conn.target(), kind, Some(ws), cwd);
     ctx.stack
-        .open_session(&ctx.conn, req, &kind_label(&args.command))
+        .open_session(&ctx.shared.conn, req, &kind_label(&args.command))
         .await
 }
 
+/// `kill [-s SIG] ID` signals a session; `kill %ID` cancels a job.
+fn cmd_kill(ctx: &Ctx, signal: Option<&str>, id: &str) -> Result<()> {
+    if let Some(job) = id.strip_prefix('%') {
+        if signal.is_some() {
+            bail!("kill: jobs take no signal; `kill %ID` cancels");
+        }
+        let job: u32 = job
+            .parse()
+            .map_err(|_| anyhow!("kill: invalid job id {id:?}"))?;
+        ctx.shared.jobs.cancel(job)?;
+        ctx.console.println(&format!("job {job} cancelled"));
+        return Ok(());
+    }
+    let sig = match signal {
+        Some(s) => Signal::parse(s).ok_or_else(|| anyhow!("kill: unknown signal {s:?}"))?,
+        None => Signal::Term,
+    };
+    let id: u32 = id
+        .parse()
+        .map_err(|_| anyhow!("kill: invalid session id {id:?} (jobs are `%ID`)"))?;
+    ctx.signal(id, sig)
+}
+
+/// `jobs [-w] [ID]`: list jobs, show one job's state and output, or wait
+/// for it.
+async fn cmd_jobs(ctx: &Ctx, wait: bool, id: Option<u32>) -> Result<()> {
+    let jobs = &ctx.shared.jobs;
+    let Some(id) = id else {
+        if jobs.list().is_empty() {
+            ctx.console.println("no jobs");
+        } else {
+            ctx.console.print(&jobs.format_list());
+        }
+        return Ok(());
+    };
+    if wait {
+        jobs.wait(id)
+            .await
+            .ok_or_else(|| anyhow!("jobs: no job {id}"))?;
+    }
+    let (info, output) = jobs.get(id).ok_or_else(|| anyhow!("jobs: no job {id}"))?;
+    ctx.console
+        .println(&format!("job {id} {}: {}", info.state, info.summary()));
+    if !output.is_empty() {
+        let text = String::from_utf8_lossy(&output);
+        ctx.console.print(text.trim_end_matches('\n'));
+        ctx.console.print("\n");
+    }
+    Ok(())
+}
+
 async fn cmd_cwd(ctx: &Ctx) {
-    let remote = if let Some(id) = ctx.stack.mru() {
-        match ctx.conn.cwd_probe(id).await {
+    let remote = if let Some(id) = ctx.mru() {
+        match ctx.shared.conn.cwd_probe(id).await {
             Some(cwd) => format!("{cwd} (session {id})"),
             None => format!("~ (probe failed for session {id}; server home)"),
         }
@@ -462,7 +624,7 @@ async fn cmd_cwd(ctx: &Ctx) {
 fn cmd_lcd(ctx: &mut Ctx, dir: Option<&str>) -> Result<()> {
     let dir = match dir {
         Some(d) => resolve_local(ctx, d),
-        None => ctx.home.clone(),
+        None => ctx.shared.home.clone(),
     };
     let dir = dir
         .canonicalize()
@@ -479,22 +641,22 @@ async fn cmd_forward(ctx: &Ctx, args: &crate::cli::ForwardArgs) -> Result<()> {
         ForwardAction::Add => {
             for s in &args.local {
                 let spec = ForwardSpec::parse_local(s).map_err(|e| anyhow!(e))?;
-                let id = ctx.forwards.add_local(&spec).await?;
+                let id = ctx.shared.forwards.add_local(&spec).await?;
                 ctx.console.println(&format!("forward {id}: -L {s}"));
             }
             for s in &args.remote {
                 let spec = ForwardSpec::parse_local(s).map_err(|e| anyhow!(e))?;
-                let id = ctx.forwards.add_remote(&spec).await?;
+                let id = ctx.shared.forwards.add_remote(&spec).await?;
                 ctx.console.println(&format!("forward {id}: -R {s}"));
             }
             for s in &args.dynamic {
                 let spec = ForwardSpec::parse_dynamic(s).map_err(|e| anyhow!(e))?;
-                let id = ctx.forwards.add_dynamic(&spec).await?;
+                let id = ctx.shared.forwards.add_dynamic(&spec).await?;
                 ctx.console.println(&format!("forward {id}: -D {s}"));
             }
         }
         ForwardAction::List => {
-            let list = ctx.forwards.list();
+            let list = ctx.shared.forwards.list();
             if list.is_empty() {
                 ctx.console.println("no forwards");
             }
@@ -503,7 +665,7 @@ async fn cmd_forward(ctx: &Ctx, args: &crate::cli::ForwardArgs) -> Result<()> {
             }
         }
         ForwardAction::Remove(id) => {
-            if !ctx.forwards.remove(id).await {
+            if !ctx.shared.forwards.remove(id).await {
                 bail!("forward rm: no forward {id}");
             }
             ctx.console.println(&format!("forward {id} removed"));
@@ -513,7 +675,7 @@ async fn cmd_forward(ctx: &Ctx, args: &crate::cli::ForwardArgs) -> Result<()> {
 }
 
 fn cmd_info(ctx: &Ctx) {
-    let conn = &ctx.conn;
+    let conn = &ctx.shared.conn;
     let stats = conn.stats();
     let rtt = conn.last_rtt().map_or_else(|| "n/a".to_owned(), ms);
     let mut out = format!(
@@ -536,9 +698,9 @@ fn cmd_info(ctx: &Ctx) {
         format_duration(conn.connected_at().elapsed()),
         human(stats.bytes_in),
         human(stats.bytes_out),
-        ctx.stack.len(),
+        ctx.session_count(),
     );
-    let forwards = ctx.forwards.list();
+    let forwards = ctx.shared.forwards.list();
     let _ = writeln!(out, "forwards:  {}", forwards.len());
     for f in &forwards {
         let _ = writeln!(out, "  {}", format_forward(f));
@@ -547,7 +709,7 @@ fn cmd_info(ctx: &Ctx) {
 }
 
 async fn cmd_ping(ctx: &Ctx, count: u32, term: Option<&mut Terminal>) -> Result<()> {
-    let conn = ctx.conn.clone();
+    let conn = ctx.shared.conn.clone();
     let console = ctx.console.clone();
     let fut = async move {
         let mut rtts = Vec::new();
@@ -605,12 +767,15 @@ async fn exec_command(
     let cwd = mru_cwd(ctx).await;
     let label = kind_label(&command);
     let req = session_request(
-        ctx.conn.target(),
+        ctx.shared.conn.target(),
         SessionKind::Exec { argv: command },
         None,
         cwd,
     );
-    let id = ctx.stack.open_session(&ctx.conn, req, &label).await?;
+    let id = ctx
+        .stack
+        .open_session(&ctx.shared.conn, req, &label)
+        .await?;
     ctx.stack.foreground(id, None)?;
     ctx.stack.stdin_eof(id)?;
     loop {
@@ -632,7 +797,7 @@ async fn exec_command(
                         let _ = ctx.stack.signal(id, Signal::Int);
                     }
             }
-            () = ctx.conn.closed() => bail!("exec: connection lost"),
+            () = ctx.shared.conn.closed() => bail!("exec: connection lost"),
         }
     }
 }
@@ -672,13 +837,14 @@ fn draw(console: &Console, editor: &LineEditor, render: &Arc<Mutex<String>>) {
 /// Run the prompt until a session is foregrounded or the client should
 /// leave. The terminal must be interactive.
 pub async fn run_prompt(ctx: &mut Ctx, term: &mut Terminal) -> Outcome {
-    let prompt = format!("mysh {}> ", ctx.conn.target().display);
+    let prompt = format!("mysh {}> ", ctx.shared.conn.target().display);
     let mut editor = LineEditor::new(
         &prompt,
         ctx.history.entries().to_vec(),
-        ctx.home.clone(),
+        ctx.shared.home.clone(),
         ctx.local_cwd.clone(),
     );
+    ctx.sync_sessions();
     let render = Arc::new(Mutex::new(String::new()));
     install_hook(&ctx.console, &render);
     draw(&ctx.console, &editor, &render);
@@ -701,9 +867,10 @@ async fn prompt_loop(
                     && on_event(ctx, &ev) {
                         return Outcome::Exit;
                     }
+                ctx.sync_sessions();
                 continue;
             }
-            () = ctx.conn.closed() => return Outcome::Disconnect,
+            () = ctx.shared.conn.closed() => return Outcome::Disconnect,
         };
         match input {
             Some(Input::Bytes(bytes)) => {
@@ -715,6 +882,7 @@ async fn prompt_loop(
                             ctx.history.push(&line);
                             editor.push_history(&line);
                             let flow = handle_line(ctx, &line, term).await;
+                            ctx.sync_sessions();
                             editor.set_cwd(ctx.local_cwd.clone());
                             install_hook(&ctx.console, render);
                             match flow {
@@ -775,11 +943,19 @@ async fn prompt_loop(
     }
 }
 
-/// Parse and run one prompt line, reporting errors on the console.
+/// Parse and run one prompt line, reporting errors on the console. A
+/// trailing `&` starts a background job instead (`client::jobs`).
 async fn handle_line(ctx: &mut Ctx, line: &str, term: &mut Terminal) -> Flow {
     match parse_meta_line(line) {
         Ok(None) => Flow::Continue,
-        Ok(Some(cmd)) => handle_cmd(ctx, cmd, term).await,
+        Ok(Some((cmd, false))) => handle_cmd(ctx, cmd, term).await,
+        Ok(Some((cmd, true))) => {
+            match start_job(ctx, line, cmd) {
+                Ok(id) => ctx.console.println(&format!("[{id}] started")),
+                Err(e) => ctx.console.println(&format!("error: {e:#}")),
+            }
+            Flow::Continue
+        }
         Err(msg) => {
             ctx.console.print(&msg);
             if !msg.ends_with('\n') {
@@ -788,6 +964,15 @@ async fn handle_line(ctx: &mut Ctx, line: &str, term: &mut Terminal) -> Flow {
             Flow::Continue
         }
     }
+}
+
+/// `LINE &`: run `cmd` as a job; `line` is shown by `jobs` without the `&`.
+fn start_job(ctx: &Ctx, line: &str, cmd: MetaCommand) -> Result<u32> {
+    if !jobs::backgroundable(&cmd) {
+        bail!("only put, get, ls, exec and authorize can run in the background");
+    }
+    let line = line.trim_end().trim_end_matches('&').trim_end().to_owned();
+    Ok(jobs::spawn(&ctx.shared, ctx.local_cwd.clone(), &line, cmd))
 }
 
 async fn handle_cmd(ctx: &mut Ctx, cmd: MetaCommand, term: &mut Terminal) -> Flow {
@@ -804,18 +989,27 @@ async fn handle_cmd(ctx: &mut Ctx, cmd: MetaCommand, term: &mut Terminal) -> Flo
 // Scripted frontend
 
 /// `mysh HOST < script`: one command per stdin line, no prompt, stop at the
-/// first failure. Exit code per docs/04-sessions.md.
+/// first failure. Exit code per docs/04-sessions.md. A trailing `&` starts
+/// a job; at end of input the script waits for running jobs and fails if
+/// one of them did.
 pub async fn run_script(ctx: &mut Ctx) -> Result<i32> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
         tokio::select! {
             line = lines.next_line() => {
                 let Some(line) = line.context("reading stdin")? else {
-                    return Ok(0);
+                    return Ok(finish_script_jobs(ctx).await);
                 };
                 let cmd = match parse_meta_line(&line) {
                     Ok(None) => continue,
-                    Ok(Some(cmd)) => cmd,
+                    Ok(Some((cmd, false))) => cmd,
+                    Ok(Some((cmd, true))) => {
+                        if let Err(e) = start_job(ctx, &line, cmd) {
+                            ctx.console.println(&format!("error: {e:#}"));
+                            return Ok(1);
+                        }
+                        continue;
+                    }
                     Err(msg) => {
                         ctx.console.print(&msg);
                         return Ok(1);
@@ -838,9 +1032,10 @@ pub async fn run_script(ctx: &mut Ctx) -> Result<i32> {
             ev = ctx.events.recv() => {
                 if let Some(ev) = ev {
                     ctx.stack.apply(&ev, true);
+                    ctx.sync_sessions();
                 }
             }
-            () = ctx.conn.closed() => {
+            () = ctx.shared.conn.closed() => {
                 ctx.console.notice(&format!(
                     "connection lost ({})",
                     exit_status_hint(ctx.stack.primary_status())
@@ -849,6 +1044,22 @@ pub async fn run_script(ctx: &mut Ctx) -> Result<i32> {
             }
         }
     }
+}
+
+/// Wait for the script's background jobs; 1 if any failed, else 0.
+async fn finish_script_jobs(ctx: &Ctx) -> i32 {
+    let jobs = &ctx.shared.jobs;
+    if jobs.running() > 0 {
+        tokio::select! {
+            () = jobs.wait_all() => {}
+            () = ctx.shared.conn.closed() => return 255,
+        }
+    }
+    let failed = jobs
+        .list()
+        .iter()
+        .any(|j| !matches!(j.state, jobs::JobState::Done { code: 0 }));
+    i32::from(failed)
 }
 
 #[cfg(test)]

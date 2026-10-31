@@ -35,7 +35,7 @@ use mysh_net::{
     trust::KeyOptions,
 };
 use mysh_proto::{
-    DEFAULT_PORT,
+    DEFAULT_PORT, caps,
     control::ControlMsg,
     handshake::ServerHello,
     limits::{self, OPEN_REPLY_DEADLINE},
@@ -55,7 +55,7 @@ use crate::{
     config::Paths,
     identity::{TrustSource, baked, load_server_identity},
 };
-use session::Sessions;
+use session::{Registry, Sessions};
 
 /// Concurrent handshakes per server; further connections are closed at once
 /// (docs/02-security.md, "Limits and hardening").
@@ -260,6 +260,8 @@ struct Shared {
     handshakes: Arc<Semaphore>,
     /// `None` when `handshakes_per_minute` is 0.
     limiter: Option<Mutex<RateLimiter>>,
+    /// Session ids and detached PTY sessions, which outlive connections.
+    registry: Registry,
 }
 
 impl Shared {
@@ -328,6 +330,7 @@ impl Server {
                 policy: Arc::new(cfg.policy),
                 handshakes: Arc::new(Semaphore::new(MAX_HANDSHAKES)),
                 limiter,
+                registry: Registry::default(),
             }),
         })
     }
@@ -379,6 +382,8 @@ impl Server {
                 "connections still open after the shutdown grace period"
             );
         }
+        // Detached sessions belong to no connection: hang them up now.
+        let _ = timeout(SHUTDOWN_GRACE, self.shared.registry.close_detached()).await;
         Ok(())
     }
 }
@@ -525,7 +530,11 @@ async fn handle_connection(
     }
     let hello = ServerHello {
         name: shared.policy.name.clone(),
-        caps: 0,
+        caps: if shared.policy.detach_grace.is_zero() {
+            0
+        } else {
+            caps::PERSIST
+        },
     };
     let trust = shared.trust.load();
     let mut offered: Option<PublicKey> = None;
@@ -581,7 +590,14 @@ async fn handle_connection(
         return;
     };
     let idle = policy.idle_timeout;
-    let ctx = ConnCtx::new(policy, mux.clone(), peer, local, client_key);
+    let ctx = ConnCtx::new(
+        policy,
+        mux.clone(),
+        peer,
+        local,
+        client_key,
+        shared.registry.clone(),
+    );
     let control_task = tokio::spawn(control_loop(control, mux.clone(), shutdown, peer, idle));
 
     while let Some(stream) = incoming.accept().await {
@@ -730,14 +746,8 @@ async fn dispatch(mut stream: Stream, ctx: ConnCtx) {
         }
         Open::File { op, cwd } => files::handle_file(stream, op, cwd, ctx).await,
         Open::Cwd { session } => session::handle_cwd(stream, session, ctx).await,
-        Open::Attach { .. } | Open::ListSessions => {
-            files::send_error(
-                &mut stream,
-                ErrorCode::Unsupported,
-                "session persistence is not enabled",
-            )
-            .await;
-        }
+        Open::Attach { session } => session::handle_attach(stream, session, ctx).await,
+        Open::ListSessions => session::handle_list_sessions(stream, ctx).await,
     }
 }
 
@@ -751,6 +761,8 @@ pub struct ConnCtx {
     pub local: SocketAddr,
     pub client_key: PublicKey,
     pub sessions: Sessions,
+    /// Server-wide session ids and detached sessions.
+    pub registry: Registry,
     /// Live remote listeners, for `MAX_LISTENERS`.
     pub listeners: Arc<AtomicUsize>,
     next_listener: Arc<AtomicU32>,
@@ -763,6 +775,7 @@ impl ConnCtx {
         peer: SocketAddr,
         local: SocketAddr,
         client_key: PublicKey,
+        registry: Registry,
     ) -> Self {
         Self {
             policy,
@@ -770,7 +783,8 @@ impl ConnCtx {
             peer,
             local,
             client_key,
-            sessions: Sessions::new(),
+            sessions: Sessions::new(registry.clone()),
+            registry,
             listeners: Arc::new(AtomicUsize::new(0)),
             next_listener: Arc::new(AtomicU32::new(0)),
         }
@@ -785,7 +799,7 @@ impl ConnCtx {
         local: SocketAddr,
         client_key: PublicKey,
     ) -> Self {
-        Self::new(policy, mux, peer, local, client_key)
+        Self::new(policy, mux, peer, local, client_key, Registry::default())
     }
 
     /// Next listener id (starts at 1, never reused within a connection).

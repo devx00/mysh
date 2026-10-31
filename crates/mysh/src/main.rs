@@ -137,7 +137,9 @@ fn client_request(command: Option<Command>, bare: ConnectArgs) -> Result<ClientR
     }
 }
 
-/// Resolve `host` against the config and run the client command.
+/// Resolve `host` against the config and run the client command. File and
+/// forward subcommands first try the control socket of an interactive
+/// client for the same target (docs/05 "Control socket") unless `--no-ctl`.
 async fn client(
     host: &str,
     opts: &ConnectOpts,
@@ -154,9 +156,43 @@ async fn client(
         // `mysh forward` is `connect -N` with forwards.
         target.no_session = true;
     }
+    if !target.no_ctl
+        && let Some(argv) = ctl_argv(&cmd, opts)
+    {
+        let console = mysh::client::console::Console::new();
+        match mysh::client::ctl::request(&paths, &target, argv, &console).await {
+            Ok(Some(code)) => return ExitCode::from(u8::try_from(code).unwrap_or(255)),
+            Ok(None) => {}
+            Err(e) => return fail(&e.context("control socket request"), EXIT_SERVE),
+        }
+    }
     match mysh::client::run(target, cmd, paths, baked).await {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(255)),
         Err(e) => fail(&e, EXIT_USAGE),
+    }
+}
+
+/// The prompt words for a subcommand that can run over the control socket.
+fn ctl_argv(cmd: &ClientCommand, opts: &ConnectOpts) -> Option<Vec<String>> {
+    match cmd {
+        ClientCommand::Put(args) => Some(args.to_argv()),
+        ClientCommand::Get(args) => Some(args.to_argv()),
+        ClientCommand::Authorize(args) => Some(args.to_argv()),
+        ClientCommand::Forward(_) => {
+            let mut argv = vec!["forward".to_owned()];
+            for (flag, specs) in [
+                ("-L", &opts.local),
+                ("-R", &opts.remote),
+                ("-D", &opts.dynamic),
+            ] {
+                for s in specs {
+                    argv.push(flag.to_owned());
+                    argv.push(s.clone());
+                }
+            }
+            Some(argv)
+        }
+        ClientCommand::Connect { .. } => None,
     }
 }
 

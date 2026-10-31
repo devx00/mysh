@@ -52,6 +52,9 @@ pub struct Paths {
     pub config_file: PathBuf,
     /// Prompt history: `$XDG_STATE_HOME/mysh/history` → `~/.local/state/mysh/history`.
     pub history: PathBuf,
+    /// Control sockets (docs/05 "Control socket"): `$XDG_RUNTIME_DIR/mysh`
+    /// → `$XDG_CACHE_HOME/mysh` → `~/.cache/mysh`.
+    pub runtime_dir: PathBuf,
     /// `~/.ssh` when the home directory is known.
     pub ssh_dir: Option<PathBuf>,
 }
@@ -76,19 +79,33 @@ impl Paths {
                 || config_dir.join("history"),
                 |d| d.join("mysh").join("history"),
             );
+        let runtime_dir = env_path(env, "XDG_RUNTIME_DIR")
+            .or_else(|| env_path(env, "XDG_CACHE_HOME"))
+            .or_else(|| home.as_ref().map(|h| h.join(".cache")))
+            .map_or_else(|| config_dir.join("run"), |d| d.join("mysh"));
         let ssh_dir = home.map(|h| h.join(".ssh"));
-        Self::build(config_dir, history, ssh_dir)
+        Self::build(config_dir, history, runtime_dir, ssh_dir)
     }
 
-    /// Use an explicit config directory; history and `~/.ssh` still come
-    /// from the environment.
+    /// Use an explicit config directory; history, the runtime dir and
+    /// `~/.ssh` still come from the environment.
     #[must_use]
     pub fn with_config_dir(dir: PathBuf) -> Self {
         let env_paths = Self::from_env();
-        Self::build(dir, env_paths.history, env_paths.ssh_dir)
+        Self::build(
+            dir,
+            env_paths.history,
+            env_paths.runtime_dir,
+            env_paths.ssh_dir,
+        )
     }
 
-    fn build(config_dir: PathBuf, history: PathBuf, ssh_dir: Option<PathBuf>) -> Self {
+    fn build(
+        config_dir: PathBuf,
+        history: PathBuf,
+        runtime_dir: PathBuf,
+        ssh_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             identity: config_dir.join("id"),
             host_key: config_dir.join("host_key"),
@@ -97,6 +114,7 @@ impl Paths {
             config_file: config_dir.join("config.toml"),
             config_dir,
             history,
+            runtime_dir,
             ssh_dir,
         }
     }
@@ -498,6 +516,10 @@ pub struct Target {
     pub no_pty: bool,
     /// `-N`.
     pub no_session: bool,
+    /// `--attach[=ID]`: reattach a detached session instead of opening one.
+    pub attach: Option<Option<u32>>,
+    /// `--no-ctl`: do not serve or use the control socket.
+    pub no_ctl: bool,
 }
 
 fn parse_env_item(s: &str) -> (String, Option<String>) {
@@ -629,6 +651,8 @@ pub fn resolve_target(
         force_pty: opts.force_pty,
         no_pty: opts.no_pty,
         no_session: opts.no_session,
+        attach: opts.attach,
+        no_ctl: opts.no_ctl,
     })
 }
 
@@ -763,6 +787,7 @@ mod tests {
             p.history,
             PathBuf::from("/home/u/.local/state/mysh/history")
         );
+        assert_eq!(p.runtime_dir, PathBuf::from("/home/u/.cache/mysh"));
         assert_eq!(p.ssh_dir, Some(PathBuf::from("/home/u/.ssh")));
     }
 
@@ -771,11 +796,13 @@ mod tests {
         let env = env_from(&[
             ("XDG_CONFIG_HOME", "/xdg/cfg"),
             ("XDG_STATE_HOME", "/xdg/state"),
+            ("XDG_RUNTIME_DIR", "/run/user/1"),
             ("HOME", "/home/u"),
         ]);
         let p = Paths::from_env_with(&env);
         assert_eq!(p.config_dir, PathBuf::from("/xdg/cfg/mysh"));
         assert_eq!(p.history, PathBuf::from("/xdg/state/mysh/history"));
+        assert_eq!(p.runtime_dir, PathBuf::from("/run/user/1/mysh"));
 
         let env = env_from(&[("HOME", "/home/u"), ("XDG_CONFIG_HOME", "")]);
         let p = Paths::from_env_with(&env);
@@ -1183,6 +1210,7 @@ shell = true           # `mysh pi` goes straight to a shell
         let mut paths = Paths::build(
             PathBuf::from("/cfg"),
             PathBuf::from("/h"),
+            PathBuf::from("/run"),
             Some(PathBuf::from("/home/u/.ssh")),
         );
         let none = env_from(&[]);
@@ -1216,7 +1244,12 @@ shell = true           # `mysh pi` goes straight to a shell
 
     #[test]
     fn server_identity_order() {
-        let paths = Paths::build(PathBuf::from("/cfg"), PathBuf::from("/h"), None);
+        let paths = Paths::build(
+            PathBuf::from("/cfg"),
+            PathBuf::from("/h"),
+            PathBuf::from("/run"),
+            None,
+        );
         let none = env_from(&[]);
         assert_eq!(
             server_identity_candidates_with(None, &paths, false, false, &none),

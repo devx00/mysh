@@ -50,9 +50,24 @@ up to the per-connection quota in 03-protocol.md §12.
    most 2 s for master EOF, then closes the master (which `SIGHUP`s the
    session like a terminal going away) and sends `Exited`. Exit status is the
    child's.
-7. **Client gone.** If the stream closes first, the server closes the master;
-   the session gets `SIGHUP` via the controlling tty; processes that ignore
-   it (`nohup`) survive, as with ssh. The child is not force-killed.
+7. **Client gone → detach.** If the stream closes first (connection lost,
+   or the client half-closed it with `detach`) and the child is still
+   running, the server **detaches** the session instead of hanging it up:
+   the master and the `Child` move to the server-wide registry, a pump task
+   keeps reading the master into a 1 MiB ring (oldest bytes dropped, drop
+   count kept) so the process never blocks on a full pty buffer, and a
+   grace timer starts (`--detach-grace SECS`, default 600). The same client
+   key may `ListSessions`/`Attach` it from any connection (03-protocol.md
+   §10bis); the attach hands the new stream to the same pump the session
+   started with, after replaying the ring. If the child exits while
+   detached its status is recorded and the entry stays listable until the
+   window ends, so a reattach still sees `Exited`. When the window passes
+   without a reattach — or at server shutdown — the server closes the
+   master; the session gets `SIGHUP` via the controlling tty; processes
+   that ignore it (`nohup`) survive, as with ssh. The child is not
+   force-killed. `--detach-grace 0` disables persistence: the master is
+   closed as soon as the stream ends (ssh behaviour). Exec sessions never
+   persist.
 
 ### Exec session (no PTY)
 
@@ -164,8 +179,7 @@ if it exits while other sessions are still open.
 ## File transfer
 
 `mysh::client::files` drives the `File` streams (03-protocol.md §9). One
-stream per file; recursive operations issue them sequentially (parallel
-transfers are roadmap).
+stream per file; recursive operations run several at a time (`-j`, below).
 
 `put [-r] [-c] [-P] [-F] LOCAL... [REMOTE]` (`-P` preserve, `-F` follow
 symlinks; `-p`/`-L` are taken by the shared connection options):
@@ -187,6 +201,17 @@ symlinks; `-p`/`-L` are taken by the shared connection options):
 `ls [-l] [-a] [REMOTE]` → `List`, formatted like `ls -l` (mode string, size,
 mtime, name).
 
+Parallel recursive transfers (`-j N`, default 4): `put -r`/`get -r` walk
+the tree first — directories created pre-order in name order, regular
+files collected — then open up to `N` file streams at once (a `JoinSet`
+behind a semaphore), then apply directory attributes post-order (`-P`).
+Progress is one aggregate line, `NAME: n/m files  X/Y  P%`; the summary
+counts the whole tree. The first failing file aborts the remaining ones
+and the command returns its error (files already completed stay; `put`'s
+atomic rename means no partial file is ever visible). Top-level
+non-recursive arguments are still transferred one after another.
+
 Throughput note: a single stream is bounded by the yamux window ÷ RTT
 (4 MiB / 50 ms ≈ 80 MB/s) and by ChaCha20-Poly1305 (≫ 1 GB/s on these
-CPUs). Good enough; no parallel chunking in v1.
+CPUs). Good enough; no parallel chunking of one file — parallelism is per
+file (`-j`), which is where directory trees spend their time.

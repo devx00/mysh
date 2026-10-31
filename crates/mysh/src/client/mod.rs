@@ -3,16 +3,20 @@
 //! docs/05-meta-shell.md "Modes and exit" and docs/04-sessions.md "Exit
 //! codes".
 
+pub mod attach;
 pub mod conn;
 pub mod console;
+pub mod ctl;
 pub mod editor;
 pub mod files;
 pub mod forward;
+pub mod jobs;
 pub mod meta;
 pub mod session;
+pub mod shared;
 pub mod terminal;
 
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result};
 use mysh_proto::session::{ExitStatus, SessionKind};
@@ -28,9 +32,11 @@ use crate::{
 use self::{
     conn::{Connection, connect},
     console::Console,
+    ctl::CtlServer,
     forward::Forwards,
     meta::{Ctx, History, Outcome},
     session::{Event, Stack},
+    shared::Shared,
     terminal::{Input, Terminal},
 };
 
@@ -90,8 +96,31 @@ async fn dispatch(
             exec_mode(conn, console, target, paths, forwards.clone(), command).await?
         }
         ClientCommand::Connect { .. } if target.no_session => wait_mode(conn, console).await,
+        ClientCommand::Connect { .. } if target.attach.is_some() => {
+            if !(mysh_pty::terminal::is_terminal(std::io::stdin()) && console.is_tty()) {
+                anyhow::bail!("--attach needs a terminal");
+            }
+            if !attach::supported(conn) {
+                anyhow::bail!(
+                    "the server does not keep detached sessions (persistence is off); nothing to attach"
+                );
+            }
+            // Nothing (or too much) to attach is an ordinary failure (1), not
+            // a usage error: pick the session before entering the terminal.
+            let rows = attach::list(conn).await?;
+            match attach::choose(&rows, target.attach.flatten()) {
+                Ok(id) => {
+                    let initial = Some(Initial::Attach(id));
+                    interactive(conn, console, target, paths, forwards.clone(), initial).await?
+                }
+                Err(e) => {
+                    console.println(&format!("error: {e:#}"));
+                    1
+                }
+            }
+        }
         ClientCommand::Connect { .. } => {
-            let initial = target.shell.then_some(SessionKind::Shell);
+            let initial = target.shell.then_some(Initial::Session(SessionKind::Shell));
             interactive(conn, console, target, paths, forwards.clone(), initial).await?
         }
     };
@@ -192,8 +221,8 @@ async fn exec_mode(
     let tty = mysh_pty::terminal::is_terminal(std::io::stdin()) && console.is_tty();
     if target.force_pty && !target.no_pty {
         if tty {
-            let kind = SessionKind::Exec { argv: command };
-            return interactive(conn, console, target, paths, forwards, Some(kind)).await;
+            let initial = Initial::Session(SessionKind::Exec { argv: command });
+            return interactive(conn, console, target, paths, forwards, Some(initial)).await;
         }
         console.notice("pseudo-terminal will not be allocated because stdin is not a terminal");
     }
@@ -256,29 +285,29 @@ enum FgEnd {
     Lost,
 }
 
-/// Prompt mode (`mysh HOST`), `-s`, and `-t CMD`. Scripted when stdin is
-/// not a terminal.
+/// What `interactive` foregrounds before showing the prompt.
+#[derive(Debug, Clone)]
+enum Initial {
+    /// `-s` / `-t CMD`: open this session.
+    Session(SessionKind),
+    /// `--attach[=ID]`: reattach this detached session (already chosen).
+    Attach(u32),
+}
+
+/// Prompt mode (`mysh HOST`), `-s`, `-t CMD` and `--attach`. Scripted when
+/// stdin is not a terminal.
 async fn interactive(
     conn: &Connection,
     console: &Console,
     target: &Target,
     paths: &Paths,
     forwards: Forwards,
-    initial: Option<SessionKind>,
+    initial: Option<Initial>,
 ) -> Result<i32> {
     let stdin_tty = mysh_pty::terminal::is_terminal(std::io::stdin());
-    let (stack, events) = Stack::new(console.clone());
-    let mut ctx = Ctx {
-        conn: conn.clone(),
-        console: console.clone(),
-        stack,
-        events,
-        forwards,
-        history: History::empty(),
-        local_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        home: home_dir(),
-        auto_exit: initial.is_some(),
-    };
+    let shared = Shared::new(conn.clone(), console.clone(), forwards, home_dir());
+    let local_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut ctx = Ctx::new(shared, console.clone(), local_cwd, initial.is_some());
     if !(stdin_tty && console.is_tty()) {
         if initial.is_some() {
             console.notice("stdin is not a terminal; reading prompt commands from it");
@@ -291,6 +320,12 @@ async fn interactive(
     if !target.quiet {
         console.println(&banner(conn));
     }
+    // The control socket lives as long as the prompt; `Drop` removes it.
+    let ctl = if target.no_ctl {
+        None
+    } else {
+        CtlServer::start(paths, target, Arc::clone(&ctx.shared)).await
+    };
     // SIGTERM: end the connection so both loops unwind and the terminal is
     // restored by the `Terminal` guard.
     if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
@@ -302,10 +337,11 @@ async fn interactive(
         });
     }
     let state = match initial {
-        Some(kind) => open_initial(&mut ctx, &term, target, kind).await?,
+        Some(initial) => open_initial(&mut ctx, &term, target, initial).await?,
         None => State::Prompt,
     };
     let code = main_loop(&mut ctx, &mut term, state).await;
+    drop(ctl);
     console.set_prompt_hook(None);
     if let Err(e) = ctx.history.save() {
         debug!(error = %e, path = %paths.history.display(), "history not saved");
@@ -314,21 +350,37 @@ async fn interactive(
     Ok(code)
 }
 
-/// `-s` / `-t CMD`: the primary session, foregrounded before the loop.
+/// `-s` / `-t CMD` / `--attach`: the primary session, foregrounded before
+/// the loop. An attached session is foregrounded with the terminal size so
+/// the server gets `Resize` right after `Attached`.
 async fn open_initial(
     ctx: &mut Ctx,
     term: &Terminal,
     target: &Target,
-    kind: SessionKind,
+    initial: Initial,
 ) -> Result<State> {
-    let label = match &kind {
-        SessionKind::Shell => meta::kind_label(&[]),
-        SessionKind::Exec { argv } => meta::kind_label(argv),
+    let id = match initial {
+        Initial::Session(kind) => {
+            let label = match &kind {
+                SessionKind::Shell => meta::kind_label(&[]),
+                SessionKind::Exec { argv } => meta::kind_label(argv),
+            };
+            let req = meta::session_request(target, kind, Some(term.winsize()), None);
+            let id = ctx
+                .stack
+                .open_session(&ctx.shared.conn, req, &label)
+                .await?;
+            ctx.stack.set_primary(id);
+            ctx.stack.foreground(id, None)?;
+            id
+        }
+        Initial::Attach(id) => {
+            let id = attach::attach(&ctx.shared.conn, &mut ctx.stack, Some(id)).await?;
+            ctx.stack.set_primary(id);
+            ctx.stack.foreground(id, Some(term.winsize()))?;
+            id
+        }
     };
-    let req = meta::session_request(target, kind, Some(term.winsize()), None);
-    let id = ctx.stack.open_session(&ctx.conn, req, &label).await?;
-    ctx.stack.set_primary(id);
-    ctx.stack.foreground(id, None)?;
     Ok(State::Fg(id))
 }
 
@@ -336,7 +388,7 @@ async fn open_initial(
 /// client should exit; returns the exit code.
 async fn main_loop(ctx: &mut Ctx, term: &mut Terminal, mut state: State) -> i32 {
     loop {
-        if ctx.conn.is_closed() {
+        if ctx.shared.conn.is_closed() {
             return lost(ctx);
         }
         match state {
@@ -347,7 +399,7 @@ async fn main_loop(ctx: &mut Ctx, term: &mut Terminal, mut state: State) -> i32 
                 },
                 Outcome::Exit => return exit_code(ctx),
                 Outcome::Disconnect => {
-                    return if ctx.conn.is_closed() {
+                    return if ctx.shared.conn.is_closed() {
                         lost(ctx)
                     } else {
                         exit_code(ctx)
@@ -375,7 +427,7 @@ async fn main_loop(ctx: &mut Ctx, term: &mut Terminal, mut state: State) -> i32 
 fn lost(ctx: &Ctx) -> i32 {
     ctx.console.notice(&format!(
         "connection closed: {}",
-        ctx.conn.close_reason().unwrap_or_default()
+        ctx.shared.conn.close_reason().unwrap_or_default()
     ));
     EXIT_LOST
 }
@@ -411,11 +463,12 @@ async fn drive_foreground(ctx: &mut Ctx, term: &mut Terminal, id: u32) -> FgEnd 
                 let Some(ev) = ev else { return FgEnd::Lost };
                 let mine = matches!(ev, Event::Exited { id: eid, .. } | Event::Lost { id: eid } if eid == id);
                 ctx.stack.apply(&ev, true);
+                ctx.sync_sessions();
                 if mine {
                     return FgEnd::Exited;
                 }
             }
-            () = ctx.conn.closed() => return FgEnd::Lost,
+            () = ctx.shared.conn.closed() => return FgEnd::Lost,
         }
     }
 }

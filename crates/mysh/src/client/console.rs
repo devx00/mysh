@@ -31,16 +31,79 @@ enum Op {
     Flush(oneshot::Sender<()>),
 }
 
+/// What a capture console produced, in order. The receiving end of
+/// [`Console::capture`] yields these; `Done` follows the last event once
+/// every clone of the console is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureEvent {
+    /// Text or session bytes that would have gone to stdout.
+    Out(Vec<u8>),
+    /// Notices and stderr bytes.
+    Err(Vec<u8>),
+    /// A progress update (`progress` is never drawn in capture mode).
+    Progress {
+        label: String,
+        done: u64,
+        total: Option<u64>,
+    },
+    /// The console was dropped; nothing follows.
+    Done,
+}
+
+/// Receiving end of a capture console.
+#[derive(Debug)]
+pub struct CaptureRx {
+    rx: mpsc::UnboundedReceiver<CaptureEvent>,
+    done: bool,
+}
+
+impl CaptureRx {
+    /// Next event; `Done` exactly once after the console is dropped, then
+    /// `None`.
+    pub async fn recv(&mut self) -> Option<CaptureEvent> {
+        if self.done {
+            return None;
+        }
+        let ev = self.rx.recv().await;
+        if ev.is_none() {
+            self.done = true;
+            return Some(CaptureEvent::Done);
+        }
+        ev
+    }
+
+    /// Whatever is already queued, without waiting; `None` when the queue
+    /// is empty (or the console is gone — `recv` reports `Done` once).
+    pub fn try_recv(&mut self) -> Option<CaptureEvent> {
+        if self.done {
+            return None;
+        }
+        self.rx.try_recv().ok()
+    }
+}
+
+/// Where a console's output goes.
+enum Sink {
+    /// The writer task owning stdout/stderr.
+    Terminal(mpsc::UnboundedSender<Op>),
+    /// Structured events for a background job or control-socket request.
+    Capture(mpsc::UnboundedSender<CaptureEvent>),
+}
+
 type Hook = Arc<dyn Fn() + Send + Sync>;
 
 struct Progress {
     last_draw: Option<Instant>,
     line: String,
     active: bool,
+    /// Latest values, whether or not they were forwarded (capture mode
+    /// flushes them on `progress_done`).
+    latest: Option<CaptureEvent>,
+    forwarded: bool,
 }
 
 struct Inner {
-    tx: mpsc::UnboundedSender<Op>,
+    sink: Sink,
     raw: AtomicBool,
     tty: bool,
     hook: Mutex<Option<Hook>>,
@@ -67,16 +130,31 @@ impl Default for Console {
         Self::new()
     }
 }
-
 impl Console {
     /// Spawns the writer task on the current tokio runtime.
     pub fn new() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(writer(rx));
         let tty = mysh_pty::terminal::is_terminal(std::io::stdout());
+        Self::with_sink(Sink::Terminal(tx), tty)
+    }
+
+    /// A console that records instead of printing: every write becomes a
+    /// [`CaptureEvent`] on the returned receiver. `is_tty()` is false, so
+    /// notices arrive as `Err` and `progress` sends structured updates.
+    #[must_use]
+    pub fn capture() -> (Self, CaptureRx) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Self::with_sink(Sink::Capture(tx), false),
+            CaptureRx { rx, done: false },
+        )
+    }
+
+    fn with_sink(sink: Sink, tty: bool) -> Self {
         Self {
             inner: Arc::new(Inner {
-                tx,
+                sink,
                 raw: AtomicBool::new(false),
                 tty,
                 hook: Mutex::new(None),
@@ -84,9 +162,15 @@ impl Console {
                     last_draw: None,
                     line: String::new(),
                     active: false,
+                    latest: None,
+                    forwarded: false,
                 }),
             }),
         }
+    }
+
+    fn is_capture(&self) -> bool {
+        matches!(self.inner.sink, Sink::Capture(_))
     }
 
     /// Whether stdout is a terminal.
@@ -156,9 +240,10 @@ impl Console {
     }
 
     /// One `\r`-redrawn status line; no-op when stdout is not a terminal.
-    /// Finish with [`Console::progress_done`].
+    /// A capture console forwards every call as a `Progress` event instead
+    /// (throttled like the drawn line). Finish with [`Console::progress_done`].
     pub fn progress(&self, label: &str, done: u64, total: Option<u64>) {
-        if !self.inner.tty {
+        if !self.inner.tty && !self.is_capture() {
             return;
         }
         let Ok(mut p) = self.inner.progress.lock() else {
@@ -170,28 +255,59 @@ impl Console {
             .is_none_or(|t| now.duration_since(t) >= PROGRESS_INTERVAL);
         p.line = format_progress(label, done, total);
         p.active = true;
-        if due {
-            p.last_draw = Some(now);
-            self.send(Op::Out(format!("\r\x1b[K{}", p.line).into_bytes()));
+        match &self.inner.sink {
+            Sink::Terminal(_) => {
+                if due {
+                    p.last_draw = Some(now);
+                    self.send(Op::Out(format!("\r\x1b[K{}", p.line).into_bytes()));
+                }
+            }
+            Sink::Capture(tx) => {
+                let ev = CaptureEvent::Progress {
+                    label: label.to_owned(),
+                    done,
+                    total,
+                };
+                if due {
+                    p.last_draw = Some(now);
+                    let _ = tx.send(ev.clone());
+                }
+                p.forwarded = due;
+                p.latest = Some(ev);
+            }
         }
     }
 
-    /// Draw the final state of the progress line and move to a new line.
+    /// Draw the final state of the progress line and move to a new line. A
+    /// capture console forwards the last throttled update instead.
     pub fn progress_done(&self) {
-        if !self.inner.tty {
+        if !self.inner.tty && !self.is_capture() {
             return;
         }
         let Ok(mut p) = self.inner.progress.lock() else {
             return;
         };
         if p.active {
-            let mut bytes = format!("\r\x1b[K{}", p.line).into_bytes();
-            bytes.extend_from_slice(self.newline());
-            self.send(Op::Out(bytes));
+            match &self.inner.sink {
+                Sink::Terminal(_) => {
+                    let mut bytes = format!("\r\x1b[K{}", p.line).into_bytes();
+                    bytes.extend_from_slice(self.newline());
+                    self.send(Op::Out(bytes));
+                }
+                Sink::Capture(tx) => {
+                    if !p.forwarded
+                        && let Some(ev) = p.latest.take()
+                    {
+                        let _ = tx.send(ev);
+                    }
+                }
+            }
         }
         p.active = false;
         p.last_draw = None;
         p.line.clear();
+        p.latest = None;
+        p.forwarded = false;
     }
 
     /// Called by [`Console::notice`] after printing, so an active prompt can
@@ -204,6 +320,9 @@ impl Console {
 
     /// Resolves once everything queued so far has been written.
     pub async fn flush(&self) {
+        let Sink::Terminal(_) = &self.inner.sink else {
+            return;
+        };
         let (tx, rx) = oneshot::channel();
         self.send(Op::Flush(tx));
         let _ = rx.await;
@@ -212,7 +331,23 @@ impl Console {
     fn send(&self, op: Op) {
         // The writer only goes away when the runtime shuts down; dropping
         // output at that point is the correct behaviour.
-        let _ = self.inner.tx.send(op);
+        match &self.inner.sink {
+            Sink::Terminal(tx) => {
+                let _ = tx.send(op);
+            }
+            Sink::Capture(tx) => {
+                let ev = match op {
+                    Op::Out(b) => CaptureEvent::Out(b),
+                    Op::Err(b) => CaptureEvent::Err(b),
+                    Op::SetLog(_) => return,
+                    Op::Flush(done) => {
+                        let _ = done.send(());
+                        return;
+                    }
+                };
+                let _ = tx.send(ev);
+            }
+        }
     }
 
     fn newline(&self) -> &'static [u8] {
@@ -339,5 +474,47 @@ mod tests {
         assert_eq!(format_progress("x", 50, Some(200)), "x  50 B/200 B  25%");
         assert_eq!(format_progress("x", 50, None), "x  50 B");
         assert_eq!(format_progress("x", 5, Some(0)), "x  5 B");
+    }
+
+    #[tokio::test]
+    async fn capture_events_keep_order_and_end_with_done() {
+        let (console, mut rx) = Console::capture();
+        assert!(!console.is_tty());
+        console.println("hello");
+        console.notice("note");
+        console.progress("f", 10, Some(20));
+        // Throttled (within PROGRESS_INTERVAL) but flushed by progress_done.
+        console.progress("f", 20, Some(20));
+        console.progress_done();
+        console.write_stderr(b"e");
+        console.flush().await;
+        drop(console);
+        assert_eq!(
+            rx.recv().await,
+            Some(CaptureEvent::Out(b"hello\n".to_vec()))
+        );
+        assert_eq!(
+            rx.recv().await,
+            Some(CaptureEvent::Err(b"[mysh] note\n".to_vec()))
+        );
+        assert_eq!(
+            rx.recv().await,
+            Some(CaptureEvent::Progress {
+                label: "f".into(),
+                done: 10,
+                total: Some(20)
+            })
+        );
+        assert_eq!(
+            rx.recv().await,
+            Some(CaptureEvent::Progress {
+                label: "f".into(),
+                done: 20,
+                total: Some(20)
+            })
+        );
+        assert_eq!(rx.recv().await, Some(CaptureEvent::Err(b"e".to_vec())));
+        assert_eq!(rx.recv().await, Some(CaptureEvent::Done));
+        assert_eq!(rx.recv().await, None);
     }
 }

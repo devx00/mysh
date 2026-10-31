@@ -9,6 +9,10 @@ use std::{
     io::SeekFrom,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -21,7 +25,11 @@ use mysh_proto::{
     file::{Attrs, DirEntry, FileKind, FileOp, ListPage, PutDone},
     open::{ErrorCode, Open},
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
+    sync::Semaphore,
+    task::JoinSet,
+};
 
 use super::{
     conn::Connection,
@@ -31,6 +39,9 @@ use crate::{
     cli::{GetArgs, LsArgs, PutArgs},
     config::expand_tilde,
 };
+
+/// Progress callback: `(bytes so far, total)`.
+type ProgressFn<'a> = &'a mut (dyn FnMut(u64, u64) + Send);
 
 /// Bytes per read/write on the raw body of `Get`/`Put` streams.
 const CHUNK: usize = 64 * 1024;
@@ -156,7 +167,7 @@ async fn get_to<W: AsyncWrite + Unpin>(
     offset: u64,
     cwd: Option<&str>,
     local: &mut W,
-    progress: &mut dyn FnMut(u64, u64),
+    progress: ProgressFn<'_>,
 ) -> Result<(Attrs, u64)> {
     let op = FileOp::Get {
         path: remote.to_owned(),
@@ -198,7 +209,7 @@ async fn put_from<R: AsyncRead + Unpin>(
     cwd: Option<&str>,
     total: u64,
     local: &mut R,
-    progress: &mut dyn FnMut(u64, u64),
+    progress: ProgressFn<'_>,
 ) -> Result<u64> {
     let FileOp::Put { path, offset, .. } = &op else {
         bail!("put_from needs FileOp::Put");
@@ -363,6 +374,11 @@ impl Totals {
         self.bytes += bytes;
     }
 
+    fn add_many(&mut self, files: u64, bytes: u64) {
+        self.files += files;
+        self.bytes += bytes;
+    }
+
     fn summary(&self) -> String {
         let secs = self.started.map_or(0.0, |t| t.elapsed().as_secs_f64());
         let files = if self.files == 1 { "file" } else { "files" };
@@ -377,19 +393,113 @@ fn label_of(path: &Path) -> String {
     )
 }
 
+/// One progress line for a whole tree: `NAME: N/M files  X/Y  P%`.
+struct Aggregate {
+    console: Console,
+    label: String,
+    files_total: usize,
+    bytes_total: u64,
+    files_done: AtomicUsize,
+    bytes_done: AtomicU64,
+}
+
+impl Aggregate {
+    fn new(console: &Console, label: String, files_total: usize, bytes_total: u64) -> Arc<Self> {
+        Arc::new(Self {
+            console: console.clone(),
+            label,
+            files_total,
+            bytes_total,
+            files_done: AtomicUsize::new(0),
+            bytes_done: AtomicU64::new(0),
+        })
+    }
+
+    fn report(&self) {
+        let label = format!(
+            "{}: {}/{} files",
+            self.label,
+            self.files_done.load(Ordering::Relaxed),
+            self.files_total
+        );
+        self.console.progress(
+            &label,
+            self.bytes_done.load(Ordering::Relaxed),
+            Some(self.bytes_total),
+        );
+    }
+
+    /// A file reports `done` bytes so far; `last` is its previous report.
+    fn advance(&self, last: &mut u64, done: u64) {
+        let delta = done.saturating_sub(*last);
+        *last = done;
+        self.bytes_done.fetch_add(delta, Ordering::Relaxed);
+        self.report();
+    }
+
+    /// A file is complete (also when skipped): count its full size.
+    fn file_done(&self, last: u64, size: u64) {
+        self.bytes_done
+            .fetch_add(size.saturating_sub(last), Ordering::Relaxed);
+        self.files_done.fetch_add(1, Ordering::Relaxed);
+        self.report();
+    }
+}
+
+/// Run `tasks` with at most `jobs` in flight (`JoinSet` behind a
+/// semaphore). Returns the sum of their results; the first error aborts the
+/// rest and is returned.
+async fn run_parallel<F>(jobs: usize, tasks: Vec<F>) -> Result<u64>
+where
+    F: Future<Output = Result<u64>> + Send + 'static,
+{
+    let sem = Arc::new(Semaphore::new(jobs.max(1)));
+    let mut set: JoinSet<Result<u64>> = JoinSet::new();
+    let mut pending = tasks.into_iter().peekable();
+    let mut total = 0u64;
+    loop {
+        tokio::select! {
+            permit = Arc::clone(&sem).acquire_owned(), if pending.peek().is_some() => {
+                let permit = permit.context("transfer semaphore closed")?;
+                let Some(task) = pending.next() else { break };
+                set.spawn(async move {
+                    let _permit = permit;
+                    task.await
+                });
+            }
+            joined = set.join_next(), if !set.is_empty() => {
+                match joined {
+                    Some(Ok(Ok(n))) => total += n,
+                    Some(Ok(Err(e))) => {
+                        set.abort_all();
+                        return Err(e);
+                    }
+                    Some(Err(e)) => {
+                        set.abort_all();
+                        bail!("transfer task failed: {e}");
+                    }
+                    None => {}
+                }
+            }
+            else => break,
+        }
+    }
+    Ok(total)
+}
+
 // ---------------------------------------------------------------------------
 // put
 // ---------------------------------------------------------------------------
 
-struct PutCtx<'a> {
-    conn: &'a Connection,
-    console: &'a Console,
-    args: &'a PutArgs,
-    cwd: Option<&'a str>,
-    totals: Totals,
+/// Everything a `put` task needs; shared by the files of one tree.
+struct PutCtx {
+    conn: Connection,
+    console: Console,
+    args: PutArgs,
+    cwd: Option<String>,
 }
 
-/// `put [-r] [-c] [-P] [-F] LOCAL... [REMOTE]`.
+/// `put [-r] [-c] [-P] [-F] [-j N] LOCAL... [REMOTE]`.
 pub async fn put(
     conn: &Connection,
     console: &Console,
@@ -433,13 +543,13 @@ pub async fn put(
     let plan = plan_put(&resolved, remote_arg, default_remote, remote_is_dir)
         .map_err(|e| anyhow!("put: {e}"))?;
 
-    let mut ctx = PutCtx {
-        conn,
-        console,
-        args,
-        cwd: default_remote,
-        totals: Totals::new(),
-    };
+    let ctx = Arc::new(PutCtx {
+        conn: conn.clone(),
+        console: console.clone(),
+        args: args.clone(),
+        cwd: default_remote.map(str::to_owned),
+    });
+    let mut totals = Totals::new();
     // A single file onto an existing non-directory: honour "no atomic rename
     // onto devices/FIFOs" (docs/03-protocol.md §9).
     let dest_other = !remote_is_dir
@@ -474,35 +584,43 @@ pub async fn put(
             if !args.recursive {
                 bail!("{}: is a directory (use -r)", local.display());
             }
-            put_tree(&mut ctx, &local, &remote).await?;
+            put_tree(&ctx, &local, &remote, &mut totals).await?;
         } else if meta.is_file() {
-            put_file(&mut ctx, &local, &meta, &remote, !dest_other).await?;
+            let label = label_of(&local);
+            let c = console.clone();
+            let mut progress = move |done: u64, total: u64| c.progress(&label, done, Some(total));
+            let result = put_file(&ctx, &local, &meta, &remote, !dest_other, &mut progress).await;
+            console.progress_done();
+            totals.add(result?);
         } else {
             console.notice(&format!("skipping {}: not a regular file", local.display()));
         }
     }
-    console.println(&ctx.totals.summary());
+    console.println(&totals.summary());
     Ok(())
 }
 
-/// Upload one regular file. `allow_atomic` is false when the destination is
-/// known to be a device or FIFO.
+/// Upload one regular file; returns the bytes written (0 when skipped as
+/// already complete). `allow_atomic` is false when the destination is known
+/// to be a device or FIFO.
 async fn put_file(
-    ctx: &mut PutCtx<'_>,
+    ctx: &PutCtx,
     local: &Path,
     meta: &std::fs::Metadata,
     remote: &str,
     allow_atomic: bool,
-) -> Result<()> {
+    progress: ProgressFn<'_>,
+) -> Result<u64> {
     let size = meta.len();
     let mode = meta.mode() & 0o7777;
     let mtime = ctx.args.preserve.then(|| meta.mtime());
+    let cwd = ctx.cwd.as_deref();
 
     let mut offset = 0u64;
     let mut truncate = true;
     let mut atomic = allow_atomic;
     if ctx.args.continue_ {
-        match stat(ctx.conn, remote, ctx.cwd).await? {
+        match stat(&ctx.conn, remote, cwd).await? {
             Some(Attrs {
                 kind: FileKind::File,
                 size: have,
@@ -519,7 +637,7 @@ async fn put_file(
             }) if have == size => {
                 ctx.console
                     .notice(&format!("{remote}: already complete, skipped"));
-                return Ok(());
+                return Ok(0);
             }
             Some(Attrs {
                 kind: FileKind::Dir,
@@ -550,24 +668,29 @@ async fn put_file(
         truncate,
         atomic,
     };
-    let label = label_of(local);
-    let console = ctx.console;
-    let mut progress = |done: u64, total: u64| console.progress(&label, done, Some(total));
     progress(offset, size);
-    let result = put_from(ctx.conn, op, ctx.cwd, size, &mut file, &mut progress).await;
-    ctx.console.progress_done();
-    let written = result?;
-    ctx.totals.add(written);
-    Ok(())
+    put_from(&ctx.conn, op, cwd, size, &mut file, progress).await
 }
 
-/// Upload a directory tree (`-r`), depth-first, entries in name order.
-async fn put_tree(ctx: &mut PutCtx<'_>, root: &Path, remote_root: &str) -> Result<()> {
-    // Directories are visited pre-order and their attributes applied
-    // post-order (with -P) so that a read-only mode never blocks the
-    // children.
+/// A regular file found by the walk of a `put -r` tree.
+struct PutEntry {
+    local: PathBuf,
+    meta: std::fs::Metadata,
+    remote: String,
+}
+
+/// Walk a local tree for `put -r`: create each remote directory pre-order
+/// (name order) and collect the regular files. Returns the files and the
+/// directories created as `(remote, mode, mtime)` for `-P`.
+async fn put_walk(
+    ctx: &PutCtx,
+    root: &Path,
+    remote_root: &str,
+) -> Result<(Vec<PutEntry>, Vec<(String, u32, i64)>)> {
+    let cwd = ctx.cwd.as_deref();
     let mut stack: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), remote_root.to_owned())];
     let mut created: Vec<(String, u32, i64)> = Vec::new();
+    let mut files: Vec<PutEntry> = Vec::new();
     while let Some((dir, remote_dir)) = stack.pop() {
         let meta = tokio::fs::metadata(&dir)
             .await
@@ -577,7 +700,7 @@ async fn put_tree(ctx: &mut PutCtx<'_>, root: &Path, remote_root: &str) -> Resul
         } else {
             DEFAULT_DIR_MODE
         };
-        mkdir(ctx.conn, &remote_dir, dir_mode, ctx.cwd).await?;
+        mkdir(&ctx.conn, &remote_dir, dir_mode, cwd).await?;
         created.push((remote_dir.clone(), meta.mode() & 0o7777, meta.mtime()));
 
         let mut rd = tokio::fs::read_dir(&dir)
@@ -621,7 +744,11 @@ async fn put_tree(ctx: &mut PutCtx<'_>, root: &Path, remote_root: &str) -> Resul
             if meta.is_dir() {
                 subdirs.push((local, remote));
             } else if meta.is_file() {
-                put_file(ctx, &local, &meta, &remote, true).await?;
+                files.push(PutEntry {
+                    local,
+                    meta,
+                    remote,
+                });
             } else {
                 ctx.console
                     .notice(&format!("skipping {}: not a regular file", local.display()));
@@ -630,9 +757,61 @@ async fn put_tree(ctx: &mut PutCtx<'_>, root: &Path, remote_root: &str) -> Resul
         // Push in reverse so the stack pops them in name order.
         stack.extend(subdirs.into_iter().rev());
     }
+    Ok((files, created))
+}
+
+/// Upload a directory tree (`-r`): walk it first (directories created
+/// pre-order, in name order), then upload the files `-j` at a time, then
+/// apply directory attributes post-order (with `-P`) so that a read-only
+/// mode never blocks the children.
+async fn put_tree(
+    ctx: &Arc<PutCtx>,
+    root: &Path,
+    remote_root: &str,
+    totals: &mut Totals,
+) -> Result<()> {
+    let (files, created) = put_walk(ctx, root, remote_root).await?;
+    let bytes_total: u64 = files.iter().map(|f| f.meta.len()).sum();
+    let agg = Aggregate::new(&ctx.console, label_of(root), files.len(), bytes_total);
+    agg.report();
+    let tasks: Vec<_> = files
+        .into_iter()
+        .map(|entry| {
+            let ctx = Arc::clone(ctx);
+            let agg = Arc::clone(&agg);
+            async move {
+                let size = entry.meta.len();
+                let mut last = 0u64;
+                let mut progress = |done: u64, _total: u64| agg.advance(&mut last, done);
+                let written = put_file(
+                    &ctx,
+                    &entry.local,
+                    &entry.meta,
+                    &entry.remote,
+                    true,
+                    &mut progress,
+                )
+                .await?;
+                agg.file_done(last, size);
+                Ok(written)
+            }
+        })
+        .collect();
+    let files_count = tasks.len() as u64;
+    let result = run_parallel(ctx.args.concurrency(), tasks).await;
+    ctx.console.progress_done();
+    totals.add_many(files_count, result?);
+
     if ctx.args.preserve {
         for (remote_dir, mode, mtime) in created.into_iter().rev() {
-            set_attr(ctx.conn, &remote_dir, Some(mode), Some(mtime), ctx.cwd).await?;
+            set_attr(
+                &ctx.conn,
+                &remote_dir,
+                Some(mode),
+                Some(mtime),
+                ctx.cwd.as_deref(),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -642,15 +821,15 @@ async fn put_tree(ctx: &mut PutCtx<'_>, root: &Path, remote_root: &str) -> Resul
 // get
 // ---------------------------------------------------------------------------
 
-struct GetCtx<'a> {
-    conn: &'a Connection,
-    console: &'a Console,
-    args: &'a GetArgs,
-    cwd: Option<&'a str>,
-    totals: Totals,
+/// Everything a `get` task needs; shared by the files of one tree.
+struct GetCtx {
+    conn: Connection,
+    console: Console,
+    args: GetArgs,
+    cwd: Option<String>,
 }
 
-/// `get [-r] [-c] [-P] REMOTE... [LOCAL]`.
+/// `get [-r] [-c] [-P] [-j N] REMOTE... [LOCAL]`.
 pub async fn get(
     conn: &Connection,
     console: &Console,
@@ -689,25 +868,33 @@ pub async fn get(
     )
     .map_err(|e| anyhow!("get: {e}"))?;
 
-    let mut ctx = GetCtx {
-        conn,
-        console,
-        args,
-        cwd: default_remote,
-        totals: Totals::new(),
-    };
+    let ctx = Arc::new(GetCtx {
+        conn: conn.clone(),
+        console: console.clone(),
+        args: args.clone(),
+        cwd: default_remote.map(str::to_owned),
+    });
+    let mut totals = Totals::new();
     for (remote, local) in plan {
         let local = PathBuf::from(local);
         let attrs = stat(conn, &remote, default_remote)
             .await?
             .ok_or_else(|| anyhow!("{remote}: not found"))?;
         match attrs.kind {
-            FileKind::File => get_file(&mut ctx, &remote, &local).await?,
+            FileKind::File => {
+                let label = label_of(&local);
+                let c = console.clone();
+                let mut progress =
+                    move |done: u64, total: u64| c.progress(&label, done, Some(total));
+                let result = get_file(&ctx, &remote, &local, &mut progress).await;
+                console.progress_done();
+                totals.add(result?);
+            }
             FileKind::Dir => {
                 if !args.recursive {
                     bail!("{remote}: is a directory (use -r)");
                 }
-                get_tree(&mut ctx, &remote, &local).await?;
+                get_tree(&ctx, &remote, &local, &mut totals).await?;
             }
             FileKind::Symlink { target } => {
                 console.notice(&format!("skipping symlink {remote} -> {target}"));
@@ -715,13 +902,18 @@ pub async fn get(
             FileKind::Other => console.notice(&format!("skipping {remote}: not a regular file")),
         }
     }
-    console.println(&ctx.totals.summary());
+    console.println(&totals.summary());
     Ok(())
 }
 
 /// Download one regular file to `local` (temp file + rename, or append when
-/// resuming with `-c`).
-async fn get_file(ctx: &mut GetCtx<'_>, remote: &str, local: &Path) -> Result<()> {
+/// resuming with `-c`); returns the bytes received.
+async fn get_file(
+    ctx: &GetCtx,
+    remote: &str,
+    local: &Path,
+    progress: ProgressFn<'_>,
+) -> Result<u64> {
     let existing = if ctx.args.continue_ {
         tokio::fs::metadata(local)
             .await
@@ -746,11 +938,15 @@ async fn get_file(ctx: &mut GetCtx<'_>, remote: &str, local: &Path) -> Result<()
     }
     .with_context(|| format!("{}: cannot open for writing", path.display()))?;
 
-    let label = label_of(local);
-    let console = ctx.console;
-    let mut progress = |done: u64, total: u64| console.progress(&label, done, Some(total));
-    let result = get_to(ctx.conn, remote, offset, ctx.cwd, &mut file, &mut progress).await;
-    ctx.console.progress_done();
+    let result = get_to(
+        &ctx.conn,
+        remote,
+        offset,
+        ctx.cwd.as_deref(),
+        &mut file,
+        progress,
+    )
+    .await;
     let (attrs, received) = match result {
         Ok(v) => v,
         Err(e) => {
@@ -791,33 +987,52 @@ async fn get_file(ctx: &mut GetCtx<'_>, remote: &str, local: &Path) -> Result<()
             .await
             .with_context(|| format!("{}: cannot rename into place", path.display()))?;
     }
-    ctx.totals.add(received);
-    Ok(())
+    Ok(received)
 }
 
-/// Download a directory tree (`-r`), depth-first, entries in name order.
-async fn get_tree(ctx: &mut GetCtx<'_>, remote_root: &str, local_root: &Path) -> Result<()> {
+/// A regular file found by the walk of a `get -r` tree.
+struct GetEntry {
+    remote: String,
+    local: PathBuf,
+    size: u64,
+}
+
+/// Download a directory tree (`-r`): list it first (local directories
+/// created pre-order, in name order), then download the files `-j` at a
+/// time, then apply directory attributes post-order (with `-P`).
+async fn get_tree(
+    ctx: &Arc<GetCtx>,
+    remote_root: &str,
+    local_root: &Path,
+    totals: &mut Totals,
+) -> Result<()> {
+    let cwd = ctx.cwd.as_deref();
     let mut stack: Vec<(String, PathBuf)> =
         vec![(remote_root.to_owned(), local_root.to_path_buf())];
     let mut created: Vec<(PathBuf, u32, i64)> = Vec::new();
+    let mut files: Vec<GetEntry> = Vec::new();
     while let Some((remote_dir, local_dir)) = stack.pop() {
         tokio::fs::create_dir_all(&local_dir)
             .await
             .with_context(|| format!("{}: cannot create directory", local_dir.display()))?;
         if ctx.args.preserve {
-            let attrs = stat(ctx.conn, &remote_dir, ctx.cwd)
+            let attrs = stat(&ctx.conn, &remote_dir, cwd)
                 .await?
                 .ok_or_else(|| anyhow!("{remote_dir}: vanished during transfer"))?;
             created.push((local_dir.clone(), attrs.mode & 0o7777, attrs.mtime));
         }
-        let mut entries = list_all(ctx.conn, &remote_dir, ctx.cwd).await?;
+        let mut entries = list_all(&ctx.conn, &remote_dir, cwd).await?;
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         let mut subdirs = Vec::new();
         for entry in entries {
             let remote = join_path(&remote_dir, &entry.name);
             let local = local_dir.join(&entry.name);
             match entry.attrs.kind {
-                FileKind::File => get_file(ctx, &remote, &local).await?,
+                FileKind::File => files.push(GetEntry {
+                    remote,
+                    local,
+                    size: entry.attrs.size,
+                }),
                 FileKind::Dir => subdirs.push((remote, local)),
                 FileKind::Symlink { target } => {
                     ctx.console
@@ -830,6 +1045,34 @@ async fn get_tree(ctx: &mut GetCtx<'_>, remote_root: &str, local_root: &Path) ->
         }
         stack.extend(subdirs.into_iter().rev());
     }
+
+    let bytes_total: u64 = files.iter().map(|f| f.size).sum();
+    let agg = Aggregate::new(
+        &ctx.console,
+        basename(remote_root).unwrap_or(remote_root).to_owned(),
+        files.len(),
+        bytes_total,
+    );
+    agg.report();
+    let tasks: Vec<_> = files
+        .into_iter()
+        .map(|entry| {
+            let ctx = Arc::clone(ctx);
+            let agg = Arc::clone(&agg);
+            async move {
+                let mut last = 0u64;
+                let mut progress = |done: u64, _total: u64| agg.advance(&mut last, done);
+                let received = get_file(&ctx, &entry.remote, &entry.local, &mut progress).await?;
+                agg.file_done(last, entry.size);
+                Ok(received)
+            }
+        })
+        .collect();
+    let files_count = tasks.len() as u64;
+    let result = run_parallel(ctx.args.concurrency(), tasks).await;
+    ctx.console.progress_done();
+    totals.add_many(files_count, result?);
+
     for (dir, mode, mtime) in created.into_iter().rev() {
         tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))
             .await

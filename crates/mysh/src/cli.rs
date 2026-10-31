@@ -99,6 +99,17 @@ pub struct ConnectOpts {
     #[arg(short = 'N', long = "no-session")]
     pub no_session: bool,
 
+    /// Reattach a detached session (`--attach` picks the only one,
+    /// `--attach=ID` a specific one) instead of opening a new one.
+    #[arg(
+        long,
+        value_name = "ID",
+        num_args = 0..=1,
+        require_equals = true,
+        conflicts_with_all = ["shell", "no_session"]
+    )]
+    pub attach: Option<Option<u32>>,
+
     /// Local forward `[bind:]port:host:hostport` (repeatable).
     #[arg(short = 'L', long = "local", value_name = "SPEC")]
     pub local: Vec<String>,
@@ -126,6 +137,11 @@ pub struct ConnectOpts {
     /// Ignore key files on disk; use only the compiled-in identity and peers.
     #[arg(long)]
     pub baked_only: bool,
+
+    /// Do not reuse a running interactive client's control socket for
+    /// `put`/`get`/`forward`/`authorize`; always open a new connection.
+    #[arg(long = "no-ctl")]
+    pub no_ctl: bool,
 }
 
 /// `HOST [-- CMD...]` with the shared connection options.
@@ -319,16 +335,33 @@ pub enum MetaCommand {
         #[arg(value_name = "ID")]
         id: Option<u32>,
     },
-    /// List sessions.
-    Sessions,
-    /// Send a signal to a session (default: TERM).
+    /// List sessions (`-a`: also the server's detached ones).
+    Sessions {
+        /// Include sessions detached on the server, attachable with `attach`.
+        #[arg(short = 'a', long = "all")]
+        all: bool,
+    },
+    /// Reattach a session detached on the server and foreground it.
+    Attach {
+        /// Session id (default: the only detached session).
+        #[arg(value_name = "ID")]
+        id: Option<u32>,
+    },
+    /// Leave a session running on the server and drop it from the stack.
+    Detach {
+        /// Session id (default: most recently used).
+        #[arg(value_name = "ID")]
+        id: Option<u32>,
+    },
+    /// Send a signal to a session (default: TERM), or cancel a background
+    /// job with `%ID`.
     Kill {
         /// Signal name or number.
         #[arg(short = 's', long = "signal", value_name = "SIG")]
         signal: Option<String>,
-        /// Session id.
+        /// Session id, or `%ID` for a job.
         #[arg(value_name = "ID")]
-        id: u32,
+        id: String,
     },
     /// Write TEXT to the most recently used session and foreground it.
     /// Caret notation (`^]`, `^C`) and `\xNN` escapes are decoded.
@@ -389,9 +422,19 @@ pub enum MetaCommand {
     },
     /// Append the client's public key to the remote `authorized_keys`.
     Authorize(AuthorizeArgs),
+    /// List background jobs (`CMD &`), show one job's output, or wait for one.
+    Jobs {
+        /// Wait for job ID to finish.
+        #[arg(short = 'w', long, requires = "id")]
+        wait: bool,
+        /// Job id.
+        #[arg(value_name = "ID")]
+        id: Option<u32>,
+    },
     /// Close the connection if no session is running.
     Exit,
-    /// Close the connection now; running sessions get SIGHUP.
+    /// Close the connection now; PTY sessions stay attachable while the
+    /// server keeps them (`kill` ends one).
     Disconnect,
 }
 
@@ -436,10 +479,50 @@ pub struct PutArgs {
     #[arg(short = 'F', long)]
     pub follow_symlinks: bool,
 
+    /// Concurrent file streams for `-r` (default 4).
+    #[arg(short = 'j', long = "jobs", value_name = "N", default_value_t = DEFAULT_TRANSFER_JOBS)]
+    pub jobs: usize,
+
     /// LOCAL... [REMOTE]; with one path REMOTE defaults to the MRU session's
     /// cwd, then `~`.
     #[arg(value_name = "PATH", required = true, num_args = 1..)]
     pub paths: Vec<String>,
+}
+
+impl PutArgs {
+    /// Concurrency for recursive transfers; a zero (`Default`) means the
+    /// clap default.
+    #[must_use]
+    pub fn concurrency(&self) -> usize {
+        if self.jobs == 0 {
+            DEFAULT_TRANSFER_JOBS
+        } else {
+            self.jobs
+        }
+    }
+
+    /// The prompt words that reproduce this command (for the control socket).
+    #[must_use]
+    pub fn to_argv(&self) -> Vec<String> {
+        let mut argv = vec!["put".to_owned()];
+        if self.recursive {
+            argv.push("-r".to_owned());
+        }
+        if self.continue_ {
+            argv.push("-c".to_owned());
+        }
+        if self.preserve {
+            argv.push("-P".to_owned());
+        }
+        if self.follow_symlinks {
+            argv.push("-F".to_owned());
+        }
+        argv.push("-j".to_owned());
+        argv.push(self.concurrency().to_string());
+        argv.push("--".to_owned());
+        argv.extend(self.paths.iter().cloned());
+        argv
+    }
 }
 
 /// `get [-r] [-c] [-P] REMOTE... [LOCAL]`.
@@ -457,9 +540,46 @@ pub struct GetArgs {
     #[arg(short = 'P', long)]
     pub preserve: bool,
 
+    /// Concurrent file streams for `-r` (default 4).
+    #[arg(short = 'j', long = "jobs", value_name = "N", default_value_t = DEFAULT_TRANSFER_JOBS)]
+    pub jobs: usize,
+
     /// REMOTE... [LOCAL]; with one path LOCAL defaults to the client cwd.
     #[arg(value_name = "PATH", required = true, num_args = 1..)]
     pub paths: Vec<String>,
+}
+
+impl GetArgs {
+    /// Concurrency for recursive transfers; a zero (`Default`) means the
+    /// clap default.
+    #[must_use]
+    pub fn concurrency(&self) -> usize {
+        if self.jobs == 0 {
+            DEFAULT_TRANSFER_JOBS
+        } else {
+            self.jobs
+        }
+    }
+
+    /// The prompt words that reproduce this command (for the control socket).
+    #[must_use]
+    pub fn to_argv(&self) -> Vec<String> {
+        let mut argv = vec!["get".to_owned()];
+        if self.recursive {
+            argv.push("-r".to_owned());
+        }
+        if self.continue_ {
+            argv.push("-c".to_owned());
+        }
+        if self.preserve {
+            argv.push("-P".to_owned());
+        }
+        argv.push("-j".to_owned());
+        argv.push(self.concurrency().to_string());
+        argv.push("--".to_owned());
+        argv.extend(self.paths.iter().cloned());
+        argv
+    }
 }
 
 /// `ls [-l] [-a] [REMOTE]`.
@@ -541,15 +661,45 @@ pub struct AuthorizeArgs {
     pub pubkey: Option<PathBuf>,
 }
 
+impl AuthorizeArgs {
+    /// The prompt words that reproduce this command (for the control socket).
+    #[must_use]
+    pub fn to_argv(&self) -> Vec<String> {
+        let mut argv = vec!["authorize".to_owned()];
+        if let Some(p) = &self.pubkey {
+            argv.push("--".to_owned());
+            argv.push(p.to_string_lossy().into_owned());
+        }
+        argv
+    }
+}
+
+/// Default `-j` for recursive transfers.
+pub const DEFAULT_TRANSFER_JOBS: usize = 4;
+
 /// Parse one prompt line. `Ok(None)` for a blank line; `Err` carries the
-/// rendered clap diagnostic (which is the help text for `-h`).
-pub fn parse_meta_line(line: &str) -> Result<Option<MetaCommand>, String> {
+/// rendered clap diagnostic (which is the help text for `-h`). The boolean
+/// is `true` when the line ended with a lone `&` token (run in the
+/// background); an `&` glued to a word (`put a&`) is part of that word.
+pub fn parse_meta_line(line: &str) -> Result<Option<(MetaCommand, bool)>, String> {
     let words = shlex::split(line).ok_or_else(|| "unbalanced quotes".to_owned())?;
+    parse_meta_argv(words)
+}
+
+/// [`parse_meta_line`] for an already tokenized line.
+pub fn parse_meta_argv(mut words: Vec<String>) -> Result<Option<(MetaCommand, bool)>, String> {
     if words.is_empty() {
         return Ok(None);
     }
+    let background = words.last().is_some_and(|w| w == "&");
+    if background {
+        words.pop();
+        if words.is_empty() {
+            return Err("nothing to run in the background before `&`\n".to_owned());
+        }
+    }
     match MetaCli::try_parse_from(words) {
-        Ok(cli) => Ok(Some(cli.cmd)),
+        Ok(cli) => Ok(Some((cli.cmd, background))),
         Err(e) => Err(e.render().to_string()),
     }
 }
@@ -589,9 +739,11 @@ mod tests {
     }
 
     fn meta(line: &str) -> MetaCommand {
-        parse_meta_line(line)
+        let (cmd, background) = parse_meta_line(line)
             .unwrap_or_else(|e| panic!("parse {line:?}: {e}"))
-            .unwrap_or_else(|| panic!("empty parse for {line:?}"))
+            .unwrap_or_else(|| panic!("empty parse for {line:?}"));
+        assert!(!background, "{line:?} parsed as background");
+        cmd
     }
 
     #[test]
@@ -778,14 +930,14 @@ mod tests {
             meta("kill -s INT 3"),
             MetaCommand::Kill {
                 signal: Some("INT".to_owned()),
-                id: 3
+                id: "3".to_owned()
             }
         );
         assert_eq!(
             meta("kill 1"),
             MetaCommand::Kill {
                 signal: None,
-                id: 1
+                id: "1".to_owned()
             }
         );
     }
@@ -829,7 +981,11 @@ mod tests {
     fn meta_simple_commands() {
         assert_eq!(meta("exit"), MetaCommand::Exit);
         assert_eq!(meta("disconnect"), MetaCommand::Disconnect);
-        assert_eq!(meta("sessions"), MetaCommand::Sessions);
+        assert_eq!(meta("sessions"), MetaCommand::Sessions { all: false });
+        assert_eq!(meta("sessions -a"), MetaCommand::Sessions { all: true });
+        assert_eq!(meta("attach"), MetaCommand::Attach { id: None });
+        assert_eq!(meta("attach 4"), MetaCommand::Attach { id: Some(4) });
+        assert_eq!(meta("detach 2"), MetaCommand::Detach { id: Some(2) });
         assert_eq!(meta("fg 2"), MetaCommand::Fg { id: Some(2) });
         assert_eq!(meta("ping -c 3"), MetaCommand::Ping { count: Some(3) });
         assert_eq!(
@@ -883,6 +1039,7 @@ mod tests {
             "resize",
             "log",
             "authorize",
+            "jobs",
             "exit",
             "disconnect",
         ] {
@@ -895,5 +1052,124 @@ mod tests {
         assert!(put.contains("Usage"), "{put}");
         assert!(put.contains("--recursive"), "{put}");
         assert!(meta_help(Some("nope")).contains("unknown command"));
+    }
+
+    #[test]
+    fn meta_background_suffix() {
+        let (cmd, background) = parse_meta_line("put a b &")
+            .expect("parse")
+            .expect("non-empty");
+        assert!(background);
+        assert_eq!(
+            cmd,
+            MetaCommand::Put(PutArgs {
+                paths: vec!["a".into(), "b".into()],
+                jobs: DEFAULT_TRANSFER_JOBS,
+                ..PutArgs::default()
+            })
+        );
+        let err = parse_meta_line("&").expect_err("lone & is an error");
+        assert!(err.contains("nothing to run"), "{err}");
+        // Glued `&` belongs to the word.
+        let (cmd, background) = parse_meta_line("put a&")
+            .expect("parse")
+            .expect("non-empty");
+        assert!(!background);
+        assert_eq!(
+            cmd,
+            MetaCommand::Put(PutArgs {
+                paths: vec!["a&".into()],
+                jobs: DEFAULT_TRANSFER_JOBS,
+                ..PutArgs::default()
+            })
+        );
+    }
+
+    #[test]
+    fn meta_jobs_and_kill_job() {
+        assert_eq!(
+            meta("jobs"),
+            MetaCommand::Jobs {
+                wait: false,
+                id: None
+            }
+        );
+        assert_eq!(
+            meta("jobs -w 2"),
+            MetaCommand::Jobs {
+                wait: true,
+                id: Some(2)
+            }
+        );
+        assert!(parse_meta_line("jobs -w").is_err());
+        assert_eq!(
+            meta("kill %2"),
+            MetaCommand::Kill {
+                signal: None,
+                id: "%2".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn transfer_jobs_flag_and_argv_round_trip() {
+        let put = PutArgs {
+            recursive: true,
+            preserve: true,
+            jobs: 0,
+            paths: vec!["a b".into(), "-x".into(), "dest".into()],
+            ..PutArgs::default()
+        };
+        assert_eq!(put.concurrency(), DEFAULT_TRANSFER_JOBS);
+        let argv = put.to_argv();
+        let (cmd, background) = parse_meta_argv(argv).expect("parse").expect("non-empty");
+        assert!(!background);
+        assert_eq!(
+            cmd,
+            MetaCommand::Put(PutArgs {
+                jobs: DEFAULT_TRANSFER_JOBS,
+                ..put
+            })
+        );
+
+        let get = GetArgs {
+            continue_: true,
+            jobs: 2,
+            paths: vec!["r".into()],
+            ..GetArgs::default()
+        };
+        let (cmd, _) = parse_meta_argv(get.to_argv())
+            .expect("parse")
+            .expect("non-empty");
+        assert_eq!(cmd, MetaCommand::Get(get));
+        assert_eq!(
+            meta("get -j 8 r"),
+            MetaCommand::Get(GetArgs {
+                jobs: 8,
+                paths: vec!["r".into()],
+                ..GetArgs::default()
+            })
+        );
+
+        let auth = AuthorizeArgs {
+            pubkey: Some(PathBuf::from("k.pub")),
+        };
+        let (cmd, _) = parse_meta_argv(auth.to_argv())
+            .expect("parse")
+            .expect("non-empty");
+        assert_eq!(cmd, MetaCommand::Authorize(auth));
+        let (cmd, _) = parse_meta_argv(AuthorizeArgs::default().to_argv())
+            .expect("parse")
+            .expect("non-empty");
+        assert_eq!(cmd, MetaCommand::Authorize(AuthorizeArgs::default()));
+    }
+
+    #[test]
+    fn no_ctl_flag() {
+        let c = cli(&["put", "--no-ctl", "host", "a"]);
+        match c.command {
+            Some(Command::Put(p)) => assert!(p.opts.no_ctl),
+            other => panic!("expected put, got {other:?}"),
+        }
     }
 }

@@ -33,7 +33,10 @@ After 3 the server runs authorization. Then both sides call
 counters, which is what lets the read and write halves run concurrently
 without a lock.
 
-`caps` is a reserved bitfield, zero in v1. `name` is the server's hostname
+`caps` is a bitfield of optional features that need no version bump
+(`mysh_proto::caps`): `SIG_AUTH` (1) and `PERSIST` (2, server → client:
+detached PTY sessions are kept, see §10bis; set when `--detach-grace` is
+not 0). Unknown bits are ignored. `name` is the server's hostname
 (informational, shown by `info`).
 
 Timeouts: the server allows 5 s from TCP accept to the end of message 3.
@@ -110,6 +113,8 @@ enum Open {
     ForwardedTcp { listener: u32, peer: String }, // server → client; raw after Ok
     File { op: FileOp, cwd: Option<String> },  // client → server; see 04-sessions.md
     Cwd { session: u32 },                      // client → server; one CwdReply then close
+    Attach { session: u32 },                   // client → server; reattach a detached PTY session (§10bis)
+    ListSessions,                              // client → server; one Msg<Vec<DetachedSession>> then close (§10bis)
 }
 
 enum OpenReply {
@@ -156,7 +161,10 @@ RTT shown by `info`/`ping` is measured here.
 One stream per session; message mode in both directions. Both PTY and
 non-PTY (exec) sessions share it; stderr is only used without a PTY. A
 connection may have many sessions open at once (the client's `shell`
-command); session ids are unique per connection and never reused.
+command). Session ids are **server-wide**: one counter per server process,
+starting at 1, never reused, so a detached PTY session (§10bis) keeps its
+id across the connections that attach to it. The per-connection quota
+(§12) still applies to the sessions a connection currently holds.
 
 ```rust
 struct SessionRequest {
@@ -184,6 +192,7 @@ enum SessionOut {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),          // exec without pty only
     Exited(ExitStatus),       // last message; server then closes its write side
+    Attached { session: u32, pid: u32, buffered: u64, dropped: u64 },  // first message on an Attach stream (§10bis)
 }
 enum ExitStatus { Code(i32), Signal { signal: i32, core_dumped: bool } }
 ```
@@ -200,7 +209,19 @@ negligible. Backpressure comes from the yamux window: a client that reads
 slowly throttles the remote process instead of growing buffers on either
 side.
 
-The `session` id in `Started` is referenced by `Open::Cwd`.
+The `session` id in `Started` is referenced by `Open::Cwd` and
+`Open::Attach`.
+
+**Attach semantics.** When a PTY session's stream ends without `Exited` —
+the connection dropped, or the client half-closed the stream (`detach`) —
+and the server's detach grace window is open, the server does not hang the
+session up: it keeps the master and the child, drains output into a bounded
+ring, and lists the session as detached (§10bis). The next `Open::Attach`
+turns the new stream into the session stream: `Attached` (in place of
+`Started`), the ring as `Stdout` chunks, then live traffic with the same
+`SessionIn`/`SessionOut` rules, ending in `Exited`. A client should send
+`Resize` right after `Attached`, since its terminal is not the one the
+session last saw. Exec (non-PTY) sessions never persist.
 
 ## 8. TCP forwarding streams
 
@@ -258,6 +279,45 @@ resolves the foreground process group of the session's pty
 pid, then `None` (04-sessions.md). Used by the meta shell so that
 `put foo` lands where the remote shell currently is.
 
+## 10bis. Detached sessions
+
+Advertised by `caps::PERSIST` in the `ServerHello`; both opens answer
+`Err { Unsupported }` when the server's grace window is 0.
+
+`Open::ListSessions` → `Ok` → `Msg<Vec<DetachedSession>>` → close. Only the
+sessions opened by **the connecting client key** are listed: detached ones
+(`detached: Some(unix seconds)`, `buffered` = ring bytes) first, then the
+ones currently attached by any connection (`detached: None`, so the client
+can show the full picture). Other keys' sessions do not exist from the
+client's point of view.
+
+```rust
+struct DetachedSession {
+    id: u32,
+    pid: u32,
+    kind: String,            // "shell" or the exec command line
+    started: i64,            // unix seconds
+    detached: Option<i64>,   // unix seconds; None while attached
+    buffered: u64,
+}
+```
+
+`Open::Attach { session }` → `Ok` when `session` belongs to this client key
+and is detached, else `Err { NotFound }` (unknown, expired, or another
+key's) or `Err { Limit, "attached by another connection" }`; `Denied` under
+`no-pty`; `Limit` at the per-connection session quota, which the attached
+session now counts towards. After `Ok`: `SessionOut::Attached { session,
+pid, buffered, dropped }`, `buffered` bytes of `Stdout` (what the session
+printed while detached; `dropped` bytes older than the 1 MiB ring were
+lost), then the normal session stream (§7). If the process exited while
+detached, the entry stays listable until the grace window ends and an
+attach replays the ring and then sends `Exited` with the recorded status.
+
+Server side the detached session is owned by the server, not by any
+connection: a grace timer (default 10 min, `--detach-grace SECS`) hangs it
+up (close the master → `SIGHUP`, reap) when nobody reattaches; server
+shutdown hangs every detached session up.
+
 ## 11. Versioning and extensibility
 
 - Incompatible changes bump `PROTOCOL_VERSION`; the preamble negotiates
@@ -285,3 +345,4 @@ pid, then `None` (04-sessions.md). Used by the meta shell so that
 | ping interval / dead after    | 30 s / 3 |
 | server idle close             | 120 s (`--idle-timeout`) |
 | rekey (bytes / age of key)    | 1 GiB / 1 h |
+| detach grace / detached ring  | 600 s (`--detach-grace`) / 1 MiB |

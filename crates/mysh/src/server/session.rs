@@ -12,19 +12,25 @@ use std::{
     io,
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Duration,
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use mysh_net::{
     framing::{read_msg, write_msg, write_reply},
+    keys::PublicKey,
     mux::Stream,
 };
 use mysh_proto::{
     SESSION_CHUNK,
-    limits::MAX_SESSIONS,
+    limits::{DETACHED_RING, MAX_SESSIONS},
     open::{ErrorCode, OpenReply},
-    session::{ExitStatus, PtyRequest, SessionIn, SessionKind, SessionOut, SessionRequest},
+    session::{
+        DetachedSession, ExitStatus, PtyRequest, SessionIn, SessionKind, SessionOut, SessionRequest,
+    },
 };
 use mysh_pty::{
     process::{exit_status, kill, login_shell, process_cwd},
@@ -33,15 +39,15 @@ use mysh_pty::{
 };
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _, WriteHalf},
-    process::ChildStdin,
-    sync::mpsc,
+    process::{Child, ChildStdin},
+    sync::{mpsc, oneshot},
     task::JoinHandle,
     time::Instant,
 };
 use tracing::{debug, info, warn};
 
 use super::{ConnCtx, Policy, files, resolve_remote_path};
-use crate::cli::Feature;
+use crate::{cli::Feature, client::session::Ring};
 
 /// After the child is reaped, keep draining the pty for at most this long
 /// (docs/04-sessions.md, "Exit").
@@ -62,65 +68,248 @@ pub struct SessionHandle {
     pub master: Option<Arc<AsyncPtyMaster>>,
 }
 
-#[derive(Debug, Default)]
-struct Table {
-    /// Last id handed out; ids start at 1 and are never reused.
-    last_id: u32,
+/// Per-connection session table (shared through [`ConnCtx`]): the quota
+/// count and the handles the cwd probe needs. Ids come from the server-wide
+/// [`Registry`] so a detached session keeps its id across connections.
+#[derive(Debug, Clone, Default)]
+pub struct Sessions {
+    registry: Registry,
     /// Reserved (`None`) and started (`Some`) sessions; `len()` is the
     /// quota count.
-    live: HashMap<u32, Option<SessionHandle>>,
+    live: Arc<Mutex<HashMap<u32, Option<SessionHandle>>>>,
 }
 
-/// Per-connection session table (shared through [`ConnCtx`]).
-#[derive(Debug, Clone, Default)]
-pub struct Sessions(Arc<Mutex<Table>>);
-
 impl Sessions {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(registry: Registry) -> Self {
+        Self {
+            registry,
+            live: Arc::default(),
+        }
     }
 
-    fn table(&self) -> MutexGuard<'_, Table> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    fn table(&self) -> MutexGuard<'_, HashMap<u32, Option<SessionHandle>>> {
+        self.live.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Reserve a session id (it counts towards `MAX_SESSIONS` at once);
-    /// `None` when the quota is reached.
+    /// Reserve a fresh session id (it counts towards `MAX_SESSIONS` at
+    /// once); `None` when the quota is reached.
     pub fn reserve(&self) -> Option<u32> {
         let mut table = self.table();
-        if table.live.len() >= MAX_SESSIONS {
+        if table.len() >= MAX_SESSIONS {
             return None;
         }
-        table.last_id += 1;
-        let id = table.last_id;
-        table.live.insert(id, None);
+        let id = self.registry.next_id();
+        table.insert(id, None);
         Some(id)
+    }
+
+    /// Reserve a slot for an existing (detached) session id; `false` at the
+    /// quota.
+    pub fn adopt(&self, id: u32) -> bool {
+        let mut table = self.table();
+        if table.len() >= MAX_SESSIONS {
+            return false;
+        }
+        table.insert(id, None);
+        true
     }
 
     /// Attach the started process to a reserved id.
     pub fn set(&self, id: u32, handle: SessionHandle) {
-        if let Some(slot) = self.table().live.get_mut(&id) {
+        if let Some(slot) = self.table().get_mut(&id) {
             *slot = Some(handle);
         }
     }
 
     pub fn remove(&self, id: u32) {
-        self.table().live.remove(&id);
+        self.table().remove(&id);
     }
 
     /// The started session `id`, if any.
     pub fn get(&self, id: u32) -> Option<SessionHandle> {
-        self.table().live.get(&id).cloned().flatten()
+        self.table().get(&id).cloned().flatten()
     }
 
     /// Reserved plus started sessions.
     pub fn len(&self) -> usize {
-        self.table().live.len()
+        self.table().len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+// ---------------------------------------------------------------------------
+// Server-wide registry: ids and detached sessions
+
+/// What `ListSessions` reports about a PTY session.
+#[derive(Debug, Clone)]
+struct Meta {
+    /// Client key the session was opened with; only it may list or attach.
+    owner: PublicKey,
+    pid: u32,
+    /// `shell` or the exec command line.
+    kind: String,
+    /// Unix seconds.
+    started: i64,
+}
+
+/// A PTY session waiting in the detach grace window
+/// (docs/04-sessions.md, "Client gone").
+#[derive(Debug)]
+struct Parked {
+    meta: Meta,
+    /// Unix seconds.
+    since: i64,
+    /// Output captured while detached; shared with the pump task.
+    ring: Arc<Mutex<Ring>>,
+    /// Tells the pump task to hand the session back; dropping it (server
+    /// shutdown) hangs the session up instead.
+    stop: oneshot::Sender<()>,
+    /// The detached pump; `None` once it hung the session up.
+    pump: JoinHandle<Option<PtySession>>,
+}
+
+#[derive(Debug)]
+enum Slot {
+    /// A client is attached (listed with `detached: None`).
+    Attached(Meta),
+    Detached(Parked),
+}
+
+impl Slot {
+    fn meta(&self) -> &Meta {
+        match self {
+            Self::Attached(meta) => meta,
+            Self::Detached(parked) => &parked.meta,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RegistryInner {
+    /// Last id handed out; ids start at 1 and are never reused.
+    last_id: AtomicU32,
+    /// Every live PTY session, attached or detached, by id.
+    pty: Mutex<HashMap<u32, Slot>>,
+}
+
+/// Server-wide session state shared by every connection: the id counter
+/// and the PTY sessions that `ListSessions`/`Attach` can see
+/// (docs/03-protocol.md §10bis).
+#[derive(Debug, Clone, Default)]
+pub struct Registry(Arc<RegistryInner>);
+
+impl Registry {
+    fn next_id(&self) -> u32 {
+        self.0.last_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn pty(&self) -> MutexGuard<'_, HashMap<u32, Slot>> {
+        self.0.pty.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn register(&self, id: u32, meta: Meta) {
+        self.pty().insert(id, Slot::Attached(meta));
+    }
+
+    fn unregister(&self, id: u32) {
+        self.pty().remove(&id);
+    }
+
+    /// `owner`'s sessions, detached ones first (then by id).
+    fn list(&self, owner: &PublicKey) -> Vec<DetachedSession> {
+        let table = self.pty();
+        let mut rows: Vec<DetachedSession> = table
+            .iter()
+            .filter(|(_, slot)| slot.meta().owner == *owner)
+            .map(|(id, slot)| {
+                let meta = slot.meta();
+                let (detached, buffered) = match slot {
+                    Slot::Attached(_) => (None, 0),
+                    Slot::Detached(parked) => (
+                        Some(parked.since),
+                        parked.ring.lock().map_or(0, |ring| ring.len() as u64),
+                    ),
+                };
+                DetachedSession {
+                    id: *id,
+                    pid: meta.pid,
+                    kind: meta.kind.clone(),
+                    started: meta.started,
+                    detached,
+                    buffered,
+                }
+            })
+            .collect();
+        rows.sort_by_key(|row| (row.detached.is_none(), row.id));
+        rows
+    }
+
+    /// Take `id` out of the grace window for `owner`; the slot stays
+    /// registered as attached. Sessions of other keys do not exist.
+    fn claim(&self, id: u32, owner: &PublicKey) -> Result<Parked, (ErrorCode, String)> {
+        let mut table = self.pty();
+        match table.get(&id) {
+            Some(Slot::Detached(parked)) if parked.meta.owner == *owner => {}
+            Some(Slot::Attached(meta)) if meta.owner == *owner => {
+                return Err((
+                    ErrorCode::Limit,
+                    "attached by another connection".to_owned(),
+                ));
+            }
+            _ => return Err((ErrorCode::NotFound, "no such detached session".to_owned())),
+        }
+        let Some(Slot::Detached(parked)) = table.remove(&id) else {
+            unreachable!("checked above under the same lock");
+        };
+        table.insert(id, Slot::Attached(parked.meta.clone()));
+        Ok(parked)
+    }
+
+    /// Grace expiry from the pump task: forget `id` unless a client claimed
+    /// it meanwhile. `true` when the caller must hang the session up.
+    fn expire(&self, id: u32) -> bool {
+        let mut table = self.pty();
+        match table.get(&id) {
+            Some(Slot::Attached(_)) => false,
+            Some(Slot::Detached(_)) => {
+                table.remove(&id);
+                true
+            }
+            None => true,
+        }
+    }
+
+    /// Server shutdown: hang up every detached session and wait for the
+    /// pumps to reap them (bounded per session by `DRAIN_AFTER_EXIT`).
+    pub async fn close_detached(&self) {
+        let parked: Vec<Parked> = {
+            let mut table = self.pty();
+            let ids: Vec<u32> = table
+                .iter()
+                .filter(|(_, slot)| matches!(slot, Slot::Detached(_)))
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| match table.remove(&id) {
+                    Some(Slot::Detached(parked)) => Some(parked),
+                    _ => None,
+                })
+                .collect()
+        };
+        for Parked { stop, pump, .. } in parked {
+            drop(stop);
+            let _ = pump.await;
+        }
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 // ---------------------------------------------------------------------------
@@ -407,8 +596,24 @@ async fn run_session(mut stream: Stream, req: &SessionRequest, ctx: &ConnCtx, id
         cwd,
     };
     match &req.pty {
-        Some(pty) => run_pty(stream, &cmd, pty, ctx, id, cwd_fallback).await,
+        Some(pty) => {
+            let meta = Meta {
+                owner: ctx.client_key,
+                pid: 0,
+                kind: kind_label(&req.kind),
+                started: unix_now(),
+            };
+            run_pty(stream, &cmd, pty, ctx, id, cwd_fallback, meta).await;
+        }
         None => run_exec(stream, &cmd, ctx, id, cwd_fallback).await,
+    }
+}
+
+/// `ListSessions` label: `shell` or the exec command line.
+fn kind_label(kind: &SessionKind) -> String {
+    match kind {
+        SessionKind::Shell => "shell".to_owned(),
+        SessionKind::Exec { argv } => argv.join(" "),
     }
 }
 
@@ -454,6 +659,21 @@ async fn start_stream(stream: Stream, id: u32, pid: u32, cwd_fallback: bool) -> 
     Some(io)
 }
 
+/// A PTY session's resources, which outlive any one stream once the server
+/// keeps detached sessions: the pump state travels with them between the
+/// attached pump, the detached pump and a reattach.
+#[derive(Debug)]
+struct PtySession {
+    id: u32,
+    pid: u32,
+    master: Arc<AsyncPtyMaster>,
+    child: Child,
+    /// Set once the child is reaped.
+    status: Option<ExitStatus>,
+    master_eof: bool,
+}
+
+#[allow(clippy::too_many_arguments)] // spawn inputs; a struct would only move them
 async fn run_pty(
     mut stream: Stream,
     cmd: &Command,
@@ -461,8 +681,9 @@ async fn run_pty(
     ctx: &ConnCtx,
     id: u32,
     cwd_fallback: bool,
+    mut meta: Meta,
 ) {
-    let (Spawned { mut child, pid }, master) = match spawn_pty(cmd, pty) {
+    let (Spawned { child, pid }, master) = match spawn_pty(cmd, pty) {
         Ok(spawned) => spawned,
         Err(e) => {
             let (code, message) = spawn_error(&e);
@@ -470,62 +691,203 @@ async fn run_pty(
             return;
         }
     };
-    let master = Arc::new(master);
+    let session = PtySession {
+        id,
+        pid,
+        master: Arc::new(master),
+        child,
+        status: None,
+        master_eof: false,
+    };
+    meta.pid = pid;
     ctx.sessions.set(
         id,
         SessionHandle {
             pid,
-            master: Some(Arc::clone(&master)),
+            master: Some(Arc::clone(&session.master)),
         },
     );
+    ctx.registry.register(id, meta.clone());
     info!(peer = %ctx.peer, session = id, pid, program = %cmd.program.display(), "pty session started");
-    let Some(mut io) = start_stream(stream, id, pid, cwd_fallback).await else {
-        ctx.sessions.remove(id);
-        return;
-    };
+    match start_stream(stream, id, pid, cwd_fallback).await {
+        Some(io) => serve_pty(io, session, meta, ctx).await,
+        None => settle(Outcome::ClientGone, None, session, meta, ctx, &[]).await,
+    }
+}
 
-    let outcome = pump_pty(&mut io, &master, &mut child, id, pid).await;
+/// Pump `session` over `io` until it ends or the client goes away, then
+/// report `Exited` or park it (shared by a fresh session and a reattach).
+async fn serve_pty(mut io: SessionIo, mut session: PtySession, meta: Meta, ctx: &ConnCtx) {
+    let outcome = pump_pty(&mut io, &mut session).await;
+    settle(outcome, Some(io), session, meta, ctx, &[]).await;
+}
 
-    // Closing the master hangs up the session's controlling tty (SIGHUP);
-    // the child, if still running, is reaped in the background.
+/// After a pump: `Exited` → hang up and finish the stream; the client gone
+/// → park the session for the grace window (persistence on and the child
+/// still running) or hang up as before. `carry` seeds the ring with replay
+/// bytes the client never received.
+async fn settle(
+    outcome: Outcome,
+    io: Option<SessionIo>,
+    session: PtySession,
+    meta: Meta,
+    ctx: &ConnCtx,
+    carry: &[u8],
+) {
+    let (id, pid) = (session.id, session.pid);
     ctx.sessions.remove(id);
-    drop(master);
     match outcome {
-        Outcome::ClientGone => {
-            debug!(peer = %ctx.peer, session = id, pid, "client left; pty session hung up");
-        }
         Outcome::Exited(status) => {
             debug!(peer = %ctx.peer, session = id, pid, %status, "pty session exited");
-            io.finish(status).await;
+            ctx.registry.unregister(id);
+            // Closing the master hangs up the session's controlling tty
+            // (SIGHUP); the child, if still running, is reaped in the
+            // background.
+            drop(session);
+            if let Some(io) = io {
+                io.finish(status).await;
+            }
+        }
+        Outcome::ClientGone => {
+            let grace = ctx.policy.detach_grace;
+            if grace.is_zero() || session.status.is_some() {
+                debug!(peer = %ctx.peer, session = id, pid, "client left; pty session hung up");
+                ctx.registry.unregister(id);
+                drop(session);
+            } else {
+                info!(peer = %ctx.peer, session = id, pid, grace_secs = grace.as_secs(), "client left; pty session detached");
+                park(session, meta, grace, &ctx.registry, carry);
+            }
         }
     }
 }
 
+/// Move `session` into the grace window: a pump task keeps draining the
+/// master into a ring so the process never blocks on a full pty buffer,
+/// and hangs up when the window passes without a reattach.
+fn park(session: PtySession, meta: Meta, grace: Duration, registry: &Registry, carry: &[u8]) {
+    let id = session.id;
+    let mut ring = Ring::new(DETACHED_RING);
+    ring.push(carry);
+    let ring = Arc::new(Mutex::new(ring));
+    let (stop, stop_rx) = oneshot::channel();
+    // The slot is inserted under the lock the pump's expiry path takes, so
+    // even a tiny grace window cannot fire before the session is parked.
+    let mut table = registry.pty();
+    let pump = tokio::spawn(detached_pump(
+        session,
+        Arc::clone(&ring),
+        stop_rx,
+        grace,
+        registry.clone(),
+    ));
+    table.insert(
+        id,
+        Slot::Detached(Parked {
+            meta,
+            since: unix_now(),
+            ring,
+            stop,
+            pump,
+        }),
+    );
+}
+
+/// Detached pump: master → ring, reap the child, hang up at grace expiry.
+/// Returns the session when `stop` asks for it (a reattach), `None` once
+/// it hung up (expiry, or the sender dropped at server shutdown).
+async fn detached_pump(
+    mut session: PtySession,
+    ring: Arc<Mutex<Ring>>,
+    mut stop: oneshot::Receiver<()>,
+    grace: Duration,
+    registry: Registry,
+) -> Option<PtySession> {
+    let master = Arc::clone(&session.master);
+    let mut reader: &AsyncPtyMaster = &master;
+    let mut buf = vec![0u8; SESSION_CHUNK];
+    let deadline = Instant::now() + grace;
+    let mut grace_armed = true;
+    let (id, pid) = (session.id, session.pid);
+    loop {
+        tokio::select! {
+            stopped = &mut stop => {
+                if stopped.is_ok() {
+                    return Some(session);
+                }
+                // Sender dropped (server shutdown): hang up.
+                registry.expire(id);
+                break;
+            },
+            read = reader.read(&mut buf), if !session.master_eof => match read {
+                Ok(0) | Err(_) => session.master_eof = true,
+                Ok(n) => {
+                    if let Ok(mut ring) = ring.lock() {
+                        ring.push(&buf[..n]);
+                    }
+                }
+            },
+            waited = session.child.wait(), if session.status.is_none() => {
+                let status = reaped(waited, id, pid);
+                debug!(session = id, pid, %status, "detached pty session exited");
+                session.status = Some(status);
+            },
+            () = tokio::time::sleep_until(deadline), if grace_armed => {
+                if registry.expire(id) {
+                    debug!(session = id, pid, "detach grace expired; hanging up");
+                    break;
+                }
+                // Claimed concurrently: the stop signal is on its way.
+                grace_armed = false;
+            },
+        }
+    }
+    drop(master);
+    hang_up(session).await;
+    None
+}
+
+/// Close the master (SIGHUP through the controlling tty) and reap the
+/// child, waiting at most `DRAIN_AFTER_EXIT` for it.
+async fn hang_up(session: PtySession) {
+    let PtySession {
+        master,
+        mut child,
+        status,
+        ..
+    } = session;
+    drop(master);
+    if status.is_none() {
+        let _ = tokio::time::timeout(DRAIN_AFTER_EXIT, child.wait()).await;
+    }
+}
+
 /// Pump a pty session until the child is reaped and the master drained
-/// (or the 2 s post-exit bound passes), or the client goes away.
-async fn pump_pty(
-    io: &mut SessionIo,
-    master: &AsyncPtyMaster,
-    child: &mut tokio::process::Child,
-    id: u32,
-    pid: u32,
-) -> Outcome {
-    let mut reader: &AsyncPtyMaster = master;
-    let mut writer: &AsyncPtyMaster = master;
+/// (or the 2 s post-exit bound passes), or the client goes away. Picks up
+/// where a detached pump left off (`status`, `master_eof`).
+async fn pump_pty(io: &mut SessionIo, session: &mut PtySession) -> Outcome {
+    let (id, pid) = (session.id, session.pid);
+    let master = Arc::clone(&session.master);
+    let mut reader: &AsyncPtyMaster = &master;
+    let mut writer: &AsyncPtyMaster = &master;
     let mut buf = vec![0u8; SESSION_CHUNK];
     // Stdin bytes not yet written to the master; `written` is the offset.
     let mut pending: Vec<u8> = Vec::new();
     let mut written = 0usize;
-    let mut status: Option<ExitStatus> = None;
-    let mut master_eof = false;
     let mut drain_until: Option<Instant> = None;
+    if let Some(status) = session.status {
+        if session.master_eof {
+            return Outcome::Exited(status);
+        }
+        drain_until = Some(Instant::now() + DRAIN_AFTER_EXIT);
+    }
 
     loop {
         tokio::select! {
-            read = reader.read(&mut buf), if !master_eof => match read {
+            read = reader.read(&mut buf), if !session.master_eof => match read {
                 Ok(0) | Err(_) => {
-                    master_eof = true;
-                    if let Some(status) = status {
+                    session.master_eof = true;
+                    if let Some(status) = session.status {
                         return Outcome::Exited(status);
                     }
                 }
@@ -567,20 +929,135 @@ async fn pump_pty(
                     }
                 }
             },
-            waited = child.wait(), if status.is_none() => {
+            waited = session.child.wait(), if session.status.is_none() => {
                 let exited = reaped(waited, id, pid);
-                if master_eof {
+                if session.master_eof {
                     return Outcome::Exited(exited);
                 }
-                status = Some(exited);
+                session.status = Some(exited);
                 drain_until = Some(Instant::now() + DRAIN_AFTER_EXIT);
             },
             () = tokio::time::sleep_until(drain_until.unwrap_or_else(Instant::now)), if drain_until.is_some() => {
                 debug!(session = id, "pty still open {}s after exit; hanging up", DRAIN_AFTER_EXIT.as_secs());
-                return status.map_or(Outcome::ClientGone, Outcome::Exited);
+                return session.status.map_or(Outcome::ClientGone, Outcome::Exited);
             },
         }
     }
+}
+
+/// Serve one `Open::Attach` stream (docs/03-protocol.md §10bis): claim the
+/// detached session for this client key, reply `Ok`, send `Attached` and
+/// the buffered output, then pump it like a fresh session.
+#[allow(clippy::needless_pass_by_value)] // handler signature per the dispatch contract
+pub async fn handle_attach(mut stream: Stream, id: u32, ctx: ConnCtx) {
+    if ctx.policy.detach_grace.is_zero() {
+        files::send_error(
+            &mut stream,
+            ErrorCode::Unsupported,
+            "session persistence is not enabled",
+        )
+        .await;
+        return;
+    }
+    if ctx.policy.denies(Feature::Pty) {
+        files::send_error(&mut stream, ErrorCode::Denied, "pty sessions are denied").await;
+        return;
+    }
+    if !ctx.sessions.adopt(id) {
+        files::send_error(
+            &mut stream,
+            ErrorCode::Limit,
+            &format!("at most {MAX_SESSIONS} sessions per connection"),
+        )
+        .await;
+        return;
+    }
+    let parked = match ctx.registry.claim(id, &ctx.client_key) {
+        Ok(parked) => parked,
+        Err((code, message)) => {
+            ctx.sessions.remove(id);
+            files::send_error(&mut stream, code, &message).await;
+            return;
+        }
+    };
+    let Parked {
+        meta,
+        ring,
+        stop,
+        pump,
+        ..
+    } = parked;
+    let _ = stop.send(());
+    let Some(session) = pump.await.ok().flatten() else {
+        // Expired between the claim and the hand-over.
+        ctx.registry.unregister(id);
+        ctx.sessions.remove(id);
+        files::send_error(&mut stream, ErrorCode::NotFound, "no such detached session").await;
+        return;
+    };
+    let (replay, dropped) = ring.lock().map_or((Vec::new(), 0), |mut r| r.take());
+    ctx.sessions.set(
+        id,
+        SessionHandle {
+            pid: session.pid,
+            master: Some(Arc::clone(&session.master)),
+        },
+    );
+    info!(peer = %ctx.peer, session = id, pid = session.pid, buffered = replay.len(), dropped, "pty session reattached");
+
+    let mut io = SessionIo::new(stream);
+    let header = SessionOut::Attached {
+        session: id,
+        pid: session.pid,
+        buffered: replay.len() as u64,
+        dropped: dropped as u64,
+    };
+    let mut sent = 0usize;
+    let delivered = async {
+        write_reply(&mut io.wr, &OpenReply::Ok).await?;
+        io.send(&header).await?;
+        for chunk in replay.chunks(SESSION_CHUNK) {
+            io.send(&SessionOut::Stdout(chunk.to_vec())).await?;
+            sent += chunk.len();
+        }
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+    if delivered.is_ok() {
+        serve_pty(io, session, meta, &ctx).await;
+    } else {
+        settle(
+            Outcome::ClientGone,
+            Some(io),
+            session,
+            meta,
+            &ctx,
+            &replay[sent..],
+        )
+        .await;
+    }
+}
+
+/// Serve one `Open::ListSessions` stream: `Ok`, one
+/// `Msg<Vec<DetachedSession>>` with this client key's PTY sessions, close.
+/// `Unsupported` when persistence is off.
+#[allow(clippy::needless_pass_by_value)] // handler signature per the dispatch contract
+pub async fn handle_list_sessions(mut stream: Stream, ctx: ConnCtx) {
+    if ctx.policy.detach_grace.is_zero() {
+        files::send_error(
+            &mut stream,
+            ErrorCode::Unsupported,
+            "session persistence is not enabled",
+        )
+        .await;
+        return;
+    }
+    if write_reply(&mut stream, &OpenReply::Ok).await.is_err() {
+        return;
+    }
+    let rows = ctx.registry.list(&ctx.client_key);
+    let _ = write_msg(&mut stream, &rows).await;
+    let _ = stream.shutdown().await;
 }
 
 /// `write` to the child's stdin, or nothing when it has been closed.
@@ -1017,7 +1494,8 @@ mod tests {
 
     #[test]
     fn session_table_quota_and_ids() {
-        let sessions = Sessions::new();
+        let registry = Registry::default();
+        let sessions = Sessions::new(registry.clone());
         assert!(sessions.is_empty());
         let first = sessions.reserve().unwrap();
         assert_eq!(first, 1);
@@ -1032,11 +1510,58 @@ mod tests {
         assert_eq!(sessions.get(first).map(|h| h.pid), Some(42));
         sessions.remove(first);
         assert!(sessions.get(first).is_none());
-        // Ids are never reused.
+        // Ids are never reused and are server-wide: a second connection on
+        // the same registry continues the sequence.
         assert_eq!(sessions.reserve().unwrap(), 2);
+        let other = Sessions::new(registry);
+        assert_eq!(other.reserve().unwrap(), 3);
         while sessions.len() < MAX_SESSIONS {
             sessions.reserve().unwrap();
         }
         assert!(sessions.reserve().is_none());
+        assert!(!sessions.adopt(99), "adopt honours the quota too");
+        assert!(other.adopt(99));
+        assert_eq!(other.len(), 2);
+    }
+
+    #[test]
+    fn registry_lists_and_claims_per_owner() {
+        let registry = Registry::default();
+        let alice = mysh_net::keys::SecretKey::generate().public();
+        let bob = mysh_net::keys::SecretKey::generate().public();
+        let meta = Meta {
+            owner: alice,
+            pid: 7,
+            kind: "shell".to_owned(),
+            started: 1,
+        };
+        registry.register(1, meta.clone());
+        assert_eq!(registry.list(&alice).len(), 1);
+        assert!(registry.list(&alice)[0].detached.is_none());
+        assert_eq!(registry.list(&bob).len(), 0);
+        // Attached: the owner gets `Limit`, anyone else `NotFound`.
+        assert_eq!(
+            registry.claim(1, &alice).err().map(|e| e.0),
+            Some(ErrorCode::Limit)
+        );
+        assert_eq!(
+            registry.claim(1, &bob).err().map(|e| e.0),
+            Some(ErrorCode::NotFound)
+        );
+        assert_eq!(
+            registry.claim(2, &alice).err().map(|e| e.0),
+            Some(ErrorCode::NotFound)
+        );
+        assert!(!registry.expire(1), "an attached slot never expires");
+        registry.unregister(1);
+        assert_eq!(registry.list(&alice).len(), 0);
+        assert!(registry.expire(1), "unknown ids hang up defensively");
+        assert_eq!(kind_label(&SessionKind::Shell), "shell");
+        assert_eq!(
+            kind_label(&SessionKind::Exec {
+                argv: vec!["ls".into(), "-l".into()]
+            }),
+            "ls -l"
+        );
     }
 }

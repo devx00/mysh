@@ -16,8 +16,8 @@ stateDiagram-v2
 
 One dispatcher (`mysh::client::meta`) serves three frontends: the
 interactive prompt; CLI subcommands (`mysh put HOST …`) that connect, run one
-command and exit; and, later, a control socket so another terminal can reuse
-a live connection (roadmap).
+command and exit; and a control socket so a CLI subcommand in another
+terminal reuses a live interactive connection ("Control socket").
 
 ## Meta key
 
@@ -74,7 +74,8 @@ is `Ctrl-Z` at the prompt, `~?` is `help`.
   redrawn.
 - `Ctrl-D` on an empty line is `exit`.
 - Tokenizer: POSIX-like quoting via `shlex` (`put "my file.txt"`). Local
-  paths get `~` expansion on the client; remote paths on the server.
+  paths get `~` expansion on the client; remote paths on the server. A
+  final `&` token runs the command as a background job ("Background jobs").
 - Commands run on the live connection as new yamux streams; sessions are
   never disturbed by them.
 - Every command has `-h`; `help` lists them. Each command is a small `clap`
@@ -89,11 +90,13 @@ is `Ctrl-Z` at the prompt, `~?` is `help`.
 | `help`       | `help [CMD]`                                                    |                                                                       |
 | `shell`      | `shell [--home] [CMD...]`                                       | start a new interactive PTY session and bring it to the foreground: the server's login shell (`--shell` → `$SHELL` → passwd → `/bin/sh`), or `CMD` under a PTY (`shell htop`, `shell bash --norc`). Starts in the cwd of the most recently used session, if any, unless `--home`. See "Session stack" |
 | `fg`         | `fg [ID]`                                                       | bring session ID (default: most recently used) to the foreground, replaying its buffered output. Also bound to the meta key at the prompt |
-| `sessions`   | `sessions`                                                      | list sessions: id, pid, kind, buffered bytes; `*` marks the most recently used |
-| `kill`       | `kill [-s SIG] ID`                                              | `SessionIn::Signal` to session ID (default `TERM`)                     |
+| `sessions`   | `sessions [-a]`                                                 | list sessions: id, pid, kind, buffered bytes; `*` marks the most recently used. `-a` also asks the server (`ListSessions`) and prints its view: sessions detached from this or an earlier connection with their age and buffered output, and attached ones |
+| `attach`     | `attach [ID]`                                                   | reattach a session detached on the server (same key) and foreground it; replays what it printed while detached. Without ID: the only detached session, else the list is printed and nothing happens. See "Session persistence" |
+| `detach`     | `detach [ID]`                                                   | leave session ID (default: most recently used) running on the server and drop it from the stack: the stream is half-closed without a signal; prints `[mysh] session N detached; reattach with: mysh --attach=N HOST`. Refused when the server keeps no sessions (`--detach-grace 0`), since it would hang the session up |
+| `kill`       | `kill [-s SIG] ID` · `kill %ID`                                 | `SessionIn::Signal` to session ID (default `TERM`); `%ID` cancels background job ID |
 | `send`       | `send TEXT...`                                                  | write TEXT to the most recently used session and foreground it; caret notation (`^]`, `^C`) and `\xNN` are decoded |
-| `put`        | `put [-r] [-c] [-P] [-F] LOCAL... [REMOTE]`                     | default REMOTE = cwd of the MRU session (probe) → `~`; progress bar. `-P` preserves mode/mtime, `-F` follows symlinks (`-p`/`-L` are taken by the shared CLI options) |
-| `get`        | `get [-r] [-c] [-P] REMOTE... [LOCAL]`                          | default LOCAL = client cwd; `-P` preserves mode/mtime                  |
+| `put`        | `put [-r] [-c] [-P] [-F] [-j N] LOCAL... [REMOTE]`              | default REMOTE = cwd of the MRU session (probe) → `~`; progress bar. `-P` preserves mode/mtime, `-F` follows symlinks (`-p`/`-L` are taken by the shared CLI options); `-r` uploads `-j` files at a time (default 4) with one aggregate progress line |
+| `get`        | `get [-r] [-c] [-P] [-j N] REMOTE... [LOCAL]`                   | default LOCAL = client cwd; `-P` preserves mode/mtime; `-r`/`-j` as for `put` |
 | `ls`         | `ls [-l] [-a] [REMOTE]`                                         | remote listing; default = MRU session cwd → `~`                        |
 | `cwd`        | `cwd`                                                           | print remote cwd (probe source: fg process / shell / home fallback) and local cwd |
 | `lcd`        | `lcd [DIR]`                                                     | change the client's working directory used by the prompt               |
@@ -104,8 +107,9 @@ is `Ctrl-Z` at the prompt, `~?` is `help`.
 | `resize`     | `resize`                                                        | re-send the current terminal size to the MRU session                   |
 | `log`        | `log FILE` · `log off`                                          | tee everything written to the terminal (whichever session is foreground, replays included) to FILE from now on (`script`-like) |
 | `authorize`  | `authorize [PUBKEY_FILE]`                                       | append the client's public key (default: the identity in use) to the server's `~/.config/mysh/authorized_keys` via `File` ops; creates the dir `0700`; skips if already present. Equivalent of `ssh-copy-id` |
-| `exit`       | `exit` / `Ctrl-D`                                               | close the connection if no session is running; otherwise refuse and list them (`fg`, or `disconnect` to end them) |
-| `disconnect` | `disconnect`                                                    | close the connection now; running sessions get `SIGHUP` from their pty  |
+| `jobs`       | `jobs [-w] [ID]`                                                | list background jobs (`CMD &`); `jobs ID` shows one job's state and captured output; `-w` waits for it first. See "Background jobs" |
+| `exit`       | `exit` / `Ctrl-D`                                               | close the connection if no session is running; otherwise refuse and list them (`fg`, `detach`, or `disconnect`) |
+| `disconnect` | `disconnect`                                                    | close the connection now. PTY sessions are **not** killed: the server keeps them for its detach grace window (default 10 min) and `mysh --attach HOST` gets them back; with `--detach-grace 0` they get `SIGHUP` from their pty as before. `kill ID` is how you end one |
 
 Output formats are plain text, one record per line, suitable for eyes; there
 is no machine-readable mode in v1.
@@ -155,8 +159,40 @@ mysh is not a terminal multiplexer: it does not emulate the terminal, so
 switching between two full-screen programs can leave the terminal in the
 mode of the previous one (alternate screen, mouse reporting, bracketed
 paste). The `Resize` redraw covers the common cases; `Ctrl-L` or `reset`
-covers the rest. Sessions live exactly as long as the connection (reattach
-is roadmap M5).
+covers the rest. Sessions outlive the connection on servers that keep
+detached sessions (below); otherwise they live exactly as long as it.
+
+## Session persistence
+
+The server keeps a PTY session whose client went away (connection lost,
+`disconnect`, or `detach`) for `--detach-grace` seconds (default 600; 0 =
+off, advertised to clients through `caps::PERSIST`). While detached the
+server drains the session's output into a 1 MiB ring; the process never
+blocks on a full pty. Reattaching replays the ring, then it is a normal
+session (04-sessions.md "Client gone", 03-protocol.md §10bis). This is the
+`dtach` model, not a terminal multiplexer: no screen state is kept, so a
+full-screen program needs the `Resize`-triggered redraw (sent right after
+`Attached`) or `Ctrl-L`.
+
+- `mysh --attach HOST` connects, lists, and foregrounds the only detached
+  session; with several, it prints them and exits 1 unless `--attach=ID`
+  names one; with none, "no detached sessions" and exit 1. The attached
+  session is the primary: the client auto-exits when it ends with its
+  status, exactly like `-s`. Needs a terminal. If the server keeps no
+  sessions the client says so and exits 2.
+- `attach [ID]` at the prompt follows the same rules and lands the session
+  in the stack, foregrounded. `detach [ID]` is the inverse. `sessions -a`
+  shows the server's list.
+- Detached sessions belong to the **client key**: another key cannot see or
+  attach them. Session ids are server-wide (one counter per server), which
+  is what makes `--attach=ID` meaningful across connections.
+- A session attached by one connection cannot be attached by another
+  (`attached by another connection`); `detach` it there first, or wait for
+  that connection to go away.
+- When the process exits while detached the entry stays listed until the
+  window ends, and attaching it replays the ring and reports `Exited`.
+- `detach` drops the client-side ring for that session; what the session
+  prints from then on is what the server replays.
 
 ## Modes and exit
 
@@ -164,6 +200,7 @@ is roadmap M5).
 | --------------------------- | ---------------------------------------- | --------------------------------------------------- | ------------------------------ |
 | `mysh HOST`                 | prompt                                   | `exit`/`Ctrl-D` with no sessions, or `disconnect`   | 0 (255 if the connection drops) |
 | `mysh -s HOST`              | `shell` run immediately (ssh feel)       | **auto-exit**: the session list becomes empty       | status of that first shell     |
+| `mysh --attach[=ID] HOST`   | the detached session foregrounded (replay first) | **auto-exit**: the session list becomes empty | status of that session (1 if nothing or several to attach, 2 if the server keeps none) |
 | `mysh HOST CMD...`          | exec session, no prompt (`-t` for a PTY) | the command exits                                   | its status                     |
 | `mysh -N HOST` / `mysh forward` | nothing; stdin untouched             | `Ctrl-C`/`SIGTERM`, or the connection drops         | 0 / 255                        |
 | `mysh HOST < script`        | prompt commands read from stdin, no prompt, stop at first failure | stdin EOF or a failing command | 0 / 1 (255 on drop)           |
@@ -181,6 +218,7 @@ exit code if other sessions outlive it (04-sessions.md).
 ```
 mysh [OPTIONS] HOST                     connect, land at the prompt
 mysh [OPTIONS] -s HOST                  connect and `shell` immediately; exit when the last session ends
+mysh [OPTIONS] --attach[=ID] HOST       connect and reattach a detached session; exit when it ends
 mysh [OPTIONS] HOST [--] CMD ...        run CMD remotely (no prompt), exit with its status
 mysh connect [OPTIONS] HOST [CMD ...]   same as the above; escape hatch when HOST collides with a subcommand name
 mysh serve [OPTIONS]
@@ -204,6 +242,7 @@ Connection options (shared by every HOST-taking command):
 | `--pin KEY`           | expected server key or fingerprint                        |
 | `--accept-new` / `--strict` | TOFU policy                                         |
 | `-s`                  | run `shell` on connect; auto-exit when the last session ends |
+| `--attach[=ID]`       | reattach a detached session instead (the only one, or ID); auto-exit when it ends |
 | `-t` / `-T`           | force / forbid a PTY for `CMD`                            |
 | `-N`                  | no session and no stdin; forwards only (safe to run with `&`) |
 | `-L/-R/-D SPEC`       | forwards, repeatable                                      |
@@ -211,6 +250,7 @@ Connection options (shared by every HOST-taking command):
 | `-q`                  | no connect banner                                         |
 | `--env NAME[=VALUE]`  | send an environment variable (server must accept it)      |
 | `--baked-only`        | ignore files on disk                                      |
+| `--no-ctl`            | never use or serve the control socket (below)             |
 | `-v`                  | repeatable; `-vv` includes handshake and stream events    |
 
 `HOST` forms: `host`, `host:port`, `[v6addr]:port`, `v6addr` (bare), or a
@@ -235,8 +275,8 @@ Server options:
 | `-v`                                | log level                                                 |
 
 Signals: `SIGTERM`/`SIGINT` → send `Shutdown` on every connection, wait up
-to 5 s for sessions to end, exit. `SIGHUP` is ignored (files are re-read per
-connection anyway).
+to 5 s for sessions to end, hang up detached sessions, exit. `SIGHUP` is
+ignored (files are re-read per connection anyway).
 
 ## Config file (v1, minimal)
 
@@ -260,11 +300,68 @@ shell = true           # `mysh pi` goes straight to a shell
 Flags override the alias; the alias overrides `[defaults]`; `[defaults]`
 overrides built-ins. No `Match` blocks, no includes.
 
-## Control socket (roadmap, designed now)
+## Control socket
 
-`$XDG_RUNTIME_DIR/mysh/<server-fingerprint>.sock` (falls back to
-`~/.cache/mysh/`), created by interactive clients. A CLI subcommand for the
-same host connects to it if present and sends the meta command line; the
-interactive client executes it on its connection and streams back output.
-The dispatcher already takes an abstract "output sink", which is what makes
-this a transport change rather than a feature rewrite.
+An interactive client (prompt mode on a terminal) listens on a unix socket
+so that `mysh put/get/forward/authorize HOST …` from another terminal reuse
+its live connection instead of opening a new one: no second handshake, no
+second TOFU prompt, nothing counted by the server's handshake rate limit.
+
+- Path: `$XDG_RUNTIME_DIR/mysh/<host>_<port>.sock`, falling back to
+  `$XDG_CACHE_HOME/mysh/` then `~/.cache/mysh/` (`Paths.runtime_dir`). The
+  directory is created `0700`, the socket `0600`. `<host>` is the resolved
+  target host with every character outside `[A-Za-z0-9.-]` replaced by `_`
+  (`[fe80::1]:7000` → `fe80__1_7000.sock`). The target, not the server
+  fingerprint, keys the socket: a CLI subcommand knows the target before it
+  connects, but learns the fingerprint only by connecting.
+- Lifetime: created after the connect banner, removed when the prompt
+  exits. A socket file that no longer accepts connections is stale and is
+  replaced; one that does belongs to another client for the same target,
+  and the new client prints a notice and runs without a socket.
+- Protocol, one request per connection: the requester writes one
+  `Msg<CtlRequest { argv: Vec<String>, cwd: String }>` (the prompt words,
+  and its working directory for local paths); the serving client replies
+  with a stream of `Msg<CtlEvent>` — `Out(bytes)`, `Err(bytes)`,
+  `Progress { label, done, total }` — ending with `Done { code }`. Both use
+  `mysh_proto::frame` framing (`client::ctl`).
+- Allowed over the socket: `put get ls cwd forward exec info ping sessions
+  kill jobs authorize help`. Refused with an error event: `shell fg send
+  resize log exit disconnect attach detach` (they need the serving client's
+  terminal) and `lcd` (the request carries its own cwd). A trailing `&` is
+  refused too.
+- The serving client runs each request on its own task with a capture
+  console, concurrently with the prompt, and prints `[mysh] ctl: put …`
+  above it. `sessions`/`kill`/`cwd`/`info` see the prompt's sessions; an
+  `exec` runs in a private session that ends with the request (if the
+  requester hangs up mid-way the request is cancelled and the session gets
+  `SIGTERM`).
+- CLI side: `mysh put|get|forward|authorize HOST …` first tries the socket
+  for the resolved target; the reply is streamed to the local stdout/stderr
+  (progress drawn locally) and the process exits with `code`. No usable
+  socket → today's path (a fresh connection). `--no-ctl` skips the socket on
+  both sides: a CLI command always connects, an interactive client never
+  listens. `mysh forward HOST -L …` over the socket adds the forwards to the
+  live client and returns at once.
+
+## Background jobs
+
+A prompt line ending in a lone `&` token runs as a job: `put big.iso ~/ &`.
+The prompt returns immediately with `[N] started`; the job runs with a
+capture console, so nothing it prints interleaves with the prompt. Only
+`put`, `get`, `ls`, `exec` and `authorize` can be backgrounded (the rest
+need the terminal); `&` alone is an error, and an `&` glued to a word
+(`put a&`) is part of that word (the tokenizer only strips a final `&`
+token).
+
+- `jobs` lists them: id (from 1), state (`running` or the last progress
+  percentage, `done`, `exit N`, `failed`, `cancelled`), elapsed time, and the
+  command line.
+- `jobs ID` prints the job's state and its captured output (stdout and
+  stderr interleaved, the last 64 KiB).
+- `jobs -w ID` waits for the job to finish, then prints the same.
+- `kill %ID` cancels a running job (the task is aborted; an `exec` job's
+  session gets `SIGTERM`).
+- Completion is announced above the prompt — `[mysh] job 3 done: put
+  big.iso ~/ (2.9 MiB, 1.2 s)` — followed by the captured output.
+- In scripted mode (`mysh HOST < script`) `&` works the same; at end of
+  input the script waits for its jobs and exits 1 if any failed.

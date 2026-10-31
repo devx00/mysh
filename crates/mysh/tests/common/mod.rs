@@ -33,9 +33,25 @@ pub struct TempDir(pub PathBuf);
 
 impl TempDir {
     pub fn new(tag: &str) -> Self {
+        Self::under(&std::env::temp_dir(), tag)
+    }
+
+    /// A directory with a short absolute path (`/tmp` when it exists) for
+    /// unix sockets, whose path length is capped at ~100 bytes; the macOS
+    /// `$TMPDIR` is too deep for that.
+    pub fn short(tag: &str) -> Self {
+        let tmp = Path::new("/tmp");
+        if tmp.is_dir() {
+            Self::under(tmp, tag)
+        } else {
+            Self::new(tag)
+        }
+    }
+
+    fn under(base: &Path, tag: &str) -> Self {
         static N: AtomicUsize = AtomicUsize::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = base.join(format!(
             "mysh-it-{tag}-{}-{n}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -78,6 +94,9 @@ pub struct ServerOpts {
     pub handshakes_per_minute: Option<u32>,
     /// `Policy.idle_timeout`; `None` keeps the protocol default.
     pub idle_timeout: Option<Duration>,
+    /// `Policy.detach_grace`; `None` keeps the protocol default (10 min),
+    /// `Some(ZERO)` switches persistence off.
+    pub detach_grace: Option<Duration>,
     /// Also listen on `[::1]:0` (see [`TestServer::addr_v6`]).
     pub listen_v6: bool,
 }
@@ -222,6 +241,9 @@ pub async fn start_server(opts: ServerOpts) -> TestServer {
     if let Some(idle) = opts.idle_timeout {
         policy.idle_timeout = idle;
     }
+    if let Some(grace) = opts.detach_grace {
+        policy.detach_grace = grace;
+    }
 
     let mut listen: Vec<SocketAddr> = vec!["127.0.0.1:0".parse().expect("addr")];
     let v6: SocketAddr = "[::1]:0".parse().expect("addr");
@@ -262,8 +284,9 @@ pub fn mysh_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mysh"))
 }
 
-/// Environment for a child `mysh` client: config dir and HOME under the
-/// temp tree so nothing in the real home is read or written.
+/// Environment for a child `mysh` client: config dir, HOME and the runtime
+/// dir (control sockets) under the temp tree so nothing in the real home or
+/// `$XDG_RUNTIME_DIR` is read or written.
 pub fn client_env(server: &TestServer) -> Vec<(String, String)> {
     vec![
         (
@@ -271,6 +294,10 @@ pub fn client_env(server: &TestServer) -> Vec<(String, String)> {
             server.client_dir.display().to_string(),
         ),
         ("HOME".into(), server.home.display().to_string()),
+        (
+            "XDG_RUNTIME_DIR".into(),
+            server.dir.join("run").display().to_string(),
+        ),
         ("TERM".into(), "xterm".into()),
         ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
     ]

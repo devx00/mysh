@@ -612,6 +612,8 @@ mod tests {
             force_pty: false,
             no_pty: false,
             no_session: false,
+            attach: None,
+            no_ctl: false,
         }
     }
 

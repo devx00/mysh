@@ -41,6 +41,13 @@ files and forwards ports on Linux, macOS and Android.
   size and resize, raw-mode guard, `SIGWINCH`/`SIGCONT`, cwd probe via
   `/proc` or `proc_pidinfo`, shell/home/user resolution for glibc, musl,
   macOS and bionic.
+- **Control socket, background jobs, parallel transfers** (M5): an
+  interactive client listens on `$XDG_RUNTIME_DIR/mysh/<host>_<port>.sock`
+  and `mysh put|get|forward|authorize HOST …` reuse its connection when the
+  socket is there (`--no-ctl` opts out); a prompt line ending in `&` runs as
+  a job (`jobs [-w] [ID]`, `kill %ID`, completion notices above the
+  prompt); `put -r`/`get -r` transfer `-j N` files at a time (default 4)
+  with one aggregate progress line.
 - **Verification**: 239 tests (unit plus integration against an in-process
   loopback server, including real-pty interactive tests); `scripts/
   android-build.sh` links an Android binary with the NDK clang;
