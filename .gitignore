@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+*.profraw
+.DS_Store
+.env
+
+# Key material. Baked-key inputs live outside the tree or match these names.
+*.secret
+baked-*
+!docs/**

@@ -1,0 +1,72 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+mysh-proto = { path = "crates/mysh-proto" }
+mysh-net = { path = "crates/mysh-net" }
+mysh-pty = { path = "crates/mysh-pty" }
+
+anyhow = "1"
+base64 = "0.23"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+curve25519-dalek = "4"
+dirs = "7"
+futures = "0.3"
+indicatif = "0.18"
+libc = "0.2"
+postcard = { version = "1", features = ["use-std"] }
+rpassword = "7"
+rustix = { version = "1", features = ["fs", "pipe", "process", "pty", "stdio", "termios"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+shlex = "2"
+# `std` is intentionally off: snow 0.10's `std` feature pulls in `ring`
+# unconditionally (`ring/std`), which needs a C cross toolchain. snow's
+# `Error` implements `core::error::Error` regardless. Only the primitives of
+# Noise_XX_25519_ChaChaPoly_BLAKE2s are enabled.
+snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"] }
+ssh-key = { version = "0.6", features = ["ed25519", "encryption", "std"] }
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+yamux = "0.14"
+zeroize = { version = "1", features = ["derive"] }
+
+[workspace.lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+# pedantic lints that fight idiomatic code in this codebase
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+
+# Curve arithmetic and AEADs are unusably slow at opt-level 0; keep our own
+# crates debuggable but optimise dependencies.
+[profile.dev.package."*"]
+opt-level = 2

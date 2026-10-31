@@ -1,0 +1,35 @@
+[package]
+name = "mysh"
+description = "Minimal encrypted remote shell for personal infrastructure (client + server in one binary)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Compile an identity and trusted peers into the binary. Requires
+# MYSH_BAKED_IDENTITY (private key file) and MYSH_BAKED_PEERS
+# (authorized_keys-format file) at build time. See docs/02-security.md.
+baked = []
+
+[dependencies]
+mysh-net.workspace = true
+mysh-proto.workspace = true
+mysh-pty.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+indicatif.workspace = true
+postcard.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+shlex.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

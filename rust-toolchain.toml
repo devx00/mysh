@@ -1,0 +1,14 @@
+[toolchain]
+# Pinned for reproducible builds across machines and CI. Bump deliberately
+# together with `rust-version` in Cargo.toml.
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+# Every platform in the support matrix. `cargo check --target <t>` works for
+# all of these without a cross linker; see docs/01-architecture.md for linking.
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "aarch64-unknown-linux-musl",
+  "x86_64-unknown-linux-musl",
+  "aarch64-linux-android",
+]
