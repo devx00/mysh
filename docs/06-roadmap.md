@@ -9,7 +9,7 @@ is smoke-tested from M2 onward.
 
 Workspace, lints, CI, this spec.
 
-### M1 — authenticated transport + remote exec
+### M1 — authenticated transport + remote exec ✔
 
 - `mysh-proto`: constants, `Open`/`OpenReply`, control and session messages.
 - `mysh-net`: key files (native + OpenSSH ed25519, encrypted), fingerprints,
@@ -22,7 +22,7 @@ Workspace, lints, CI, this spec.
   wrong pin, TOFU accept/reject), key conversion vectors cross-checked
   against `age`/`ssh-keygen` output, exec exit-code propagation.
 
-### M2 — interactive PTY
+### M2 — interactive PTY ✔
 
 - `mysh-pty`: pty pair, controlling-tty spawn, winsize, cwd probe, raw mode
   guard, signal plumbing (all three platforms).
@@ -34,7 +34,7 @@ Workspace, lints, CI, this spec.
 - Tests: pty session runs `sh -c 'stty size'` and sees the requested size;
   resize mid-session is observed; exit via signal maps to `128+n`.
 
-### M3 — meta shell, files, forwards
+### M3 — meta shell, files, forwards ✔
 
 - The prompt as home: line editor with history, connect banner, scripted
   stdin mode, `-s`, auto-exit rules; CLI subcommands over the same

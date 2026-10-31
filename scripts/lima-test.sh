@@ -19,5 +19,5 @@ limactl shell "$instance" -- bash -lc '
   source ~/.cargo/env
   rsync -a --delete --exclude target /mnt/mysh/ ~/mysh/
   cd ~/mysh
-  cargo test --workspace 2>&1 | tail -n 40
+  cargo test --workspace 2>&1
 '
