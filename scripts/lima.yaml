@@ -1,0 +1,25 @@
+base: template://ubuntu-lts
+cpus: 4
+memory: "6GiB"
+disk: "30GiB"
+mounts:
+  - location: "~/Development/mysh"
+    mountPoint: "/mnt/mysh"
+    writable: false
+  - location: "/tmp/lima"
+    writable: true
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y build-essential pkg-config curl git rsync expect
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux
+      if ! command -v cargo >/dev/null; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.1 --component clippy --component rustfmt
+      fi

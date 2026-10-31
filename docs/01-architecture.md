@@ -141,7 +141,7 @@ src/
 | `libc` (macOS only)            | `proc_pidinfo` for cwd probe           |                                                            |
 | `clap`                         | CLI                                    | derive                                                     |
 | `shlex`                        | meta shell tokenizer                   |                                                            |
-| `rustyline` (M3)               | prompt line editing, history           | must coexist with our raw mode and tokio; a small built-in editor is the fallback |
+| (built-in line editor)         | prompt line editing, history           | `client::meta` owns a small editor fed by the stdin reader task; `rustyline` was dropped because it would compete with that task for stdin |
 | `indicatif`                    | transfer progress bars                 |                                                            |
 | `rpassword`                    | passphrase and TOFU prompts            |                                                            |
 | `dirs`                         | XDG / platform directories             |                                                            |

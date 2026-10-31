@@ -165,14 +165,19 @@ fn read_master(master: &PtyMaster, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-impl AsyncRead for AsyncPtyMaster {
+/// Reads and writes only need `&self` (`AsyncFd` readiness is `&self`), so
+/// the traits are implemented for `&AsyncPtyMaster` as well, like tokio does
+/// for `&TcpStream`. This lets a shared `Arc<AsyncPtyMaster>` be pumped by
+/// one task while another probes it (`foreground_pgrp`).
+impl AsyncRead for &AsyncPtyMaster {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let this: &AsyncPtyMaster = *self;
         loop {
-            let mut guard = ready!(self.0.poll_read_ready(cx))?;
+            let mut guard = ready!(this.0.poll_read_ready(cx))?;
             let unfilled = buf.initialize_unfilled();
             match guard.try_io(|inner| read_master(inner.get_ref(), unfilled)) {
                 Ok(Ok(n)) => {
@@ -187,14 +192,15 @@ impl AsyncRead for AsyncPtyMaster {
     }
 }
 
-impl AsyncWrite for AsyncPtyMaster {
+impl AsyncWrite for &AsyncPtyMaster {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
+        let this: &AsyncPtyMaster = *self;
         loop {
-            let mut guard = ready!(self.0.poll_write_ready(cx))?;
+            let mut guard = ready!(this.0.poll_write_ready(cx))?;
             match guard
                 .try_io(|inner| rustix::io::write(inner.get_ref(), data).map_err(io::Error::from))
             {
@@ -210,6 +216,36 @@ impl AsyncWrite for AsyncPtyMaster {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // A pty has no half-close; the session closes the master by dropping it.
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncRead for AsyncPtyMaster {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut this: &AsyncPtyMaster = &self;
+        Pin::new(&mut this).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for AsyncPtyMaster {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut this: &AsyncPtyMaster = &self;
+        Pin::new(&mut this).poll_write(cx, data)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }
@@ -261,5 +297,24 @@ mod tests {
         let mut out = Vec::new();
         let n = master.read_to_end(&mut out).await.expect("read_to_end");
         assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn shared_master_reads_and_writes_through_reference() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (master, slave) = open_pty(WinSize::default()).expect("open pty");
+        let master = Arc::new(master.into_async().expect("async"));
+        let mut writer: &AsyncPtyMaster = &master;
+        let mut reader: &AsyncPtyMaster = &master;
+        // With no process on the slave, the line discipline echoes input
+        // back to the master.
+        writer.write_all(b"x").await.expect("write");
+        let mut buf = [0u8; 1];
+        reader.read_exact(&mut buf).await.expect("read echo");
+        assert_eq!(&buf, b"x");
+        assert!(master.foreground_pgrp().is_ok());
+        drop(slave);
     }
 }

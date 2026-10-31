@@ -45,10 +45,14 @@ is `Ctrl-Z` at the prompt, `~?` is `help`.
 ## The prompt
 
 - `mysh HOST> ` on the same terminal (HOST as typed, or the alias name). A
-  readline-style line editor with history (`~/.local/state/mysh/history`),
-  basic editing keys, and `Ctrl-R` search; local-path completion is roadmap.
-  The terminal stays in raw mode throughout, which is what makes the meta
-  key bindable here; the editor restores cooked-mode semantics itself.
+  small built-in line editor (`client::meta`) with history
+  (`~/.local/state/mysh/history`, last 1000 lines) and the usual keys:
+  printable insert, Backspace/Delete, Left/Right, Home/End, `Ctrl-A/E`,
+  `Ctrl-U/K/W`, Up/Down history, `Ctrl-L` redraw. `Ctrl-R` search and
+  local-path completion are roadmap (M5). The terminal stays in raw mode
+  throughout, which is what makes the meta key bindable here; the editor
+  handles echo and editing itself since one stdin reader task owns stdin for
+  the whole run.
 - On connect, one line: `connected to HOST (SHA256:…, trusted via
   known_hosts); type "shell" for a shell, "help" for commands` — `-q`
   silences it.
@@ -76,8 +80,8 @@ is `Ctrl-Z` at the prompt, `~?` is `help`.
 | `sessions`   | `sessions`                                                      | list sessions: id, pid, kind, buffered bytes; `*` marks the most recently used |
 | `kill`       | `kill [-s SIG] ID`                                              | `SessionIn::Signal` to session ID (default `TERM`)                     |
 | `send`       | `send TEXT...`                                                  | write TEXT to the most recently used session and foreground it; caret notation (`^]`, `^C`) and `\xNN` are decoded |
-| `put`        | `put [-r] [-c] [-p] [-L] LOCAL... [REMOTE]`                     | default REMOTE = cwd of the MRU session (probe) → `~`; progress bar    |
-| `get`        | `get [-r] [-c] [-p] REMOTE... [LOCAL]`                          | default LOCAL = client cwd                                             |
+| `put`        | `put [-r] [-c] [-P] [-F] LOCAL... [REMOTE]`                     | default REMOTE = cwd of the MRU session (probe) → `~`; progress bar. `-P` preserves mode/mtime, `-F` follows symlinks (`-p`/`-L` are taken by the shared CLI options) |
+| `get`        | `get [-r] [-c] [-P] REMOTE... [LOCAL]`                          | default LOCAL = client cwd; `-P` preserves mode/mtime                  |
 | `ls`         | `ls [-l] [-a] [REMOTE]`                                         | remote listing; default = MRU session cwd → `~`                        |
 | `cwd`        | `cwd`                                                           | print remote cwd (probe source: fg process / shell / home fallback) and local cwd |
 | `lcd`        | `lcd [DIR]`                                                     | change the client's working directory used by the prompt               |

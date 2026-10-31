@@ -76,7 +76,7 @@ Workspace, lints, CI, this spec.
 - Signature authentication (`NN` + ed25519 signature over the handshake
   hash) enabling `ssh-agent`, `sk-*` keys, and keys that cannot be exported.
 - Background transfers (`put … &`, `jobs`), parallel recursive transfers.
-- Local path completion at the prompt.
+- Local path completion and `Ctrl-R` history search at the prompt.
 - Post-quantum hybrid (X25519 + ML-KEM) if `snow` or a successor exposes it.
 
 ## Decisions log
@@ -101,6 +101,7 @@ later.
 | 13 | `-N` reads no stdin; everything else lands at the prompt | `-N` opens the prompt on a tty | reading the tty would `SIGTTIN`-stop a backgrounded `mysh -N … &` |
 | 14 | the prompt is the home state; `shell` opens a real shell; `-s` for ssh-like feel | ssh model (shell first, meta via escape) | the connection outlives any one shell; forwards, transfers and several shells are first-class, not escapes |
 | 15 | single-byte meta key `Ctrl-]`, interceptable anywhere; `send` for the literal | ssh `~` line-start sequences | one keystroke, no line-start rule, no held bytes or timers; telnet precedent; collides only with vim tag jump, rebindable |
+| 16 | `put`/`get` use `-P` (preserve) and `-F` (follow symlinks); `put -c` stats the remote and resumes with `truncate:false, atomic:false`; `get` writes `<path>.mysh-tmp` then renames | scp's `-p`/`-L`; always-atomic writes | `-p`/`-L` are the shared `--port`/`-L` CLI options and meta commands share the clap definitions; resume cannot be atomic by definition; `ls -l` times are UTC until a tz dependency is justified |
 
 ## Testing strategy
 

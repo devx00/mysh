@@ -1,0 +1,775 @@
+//! One client connection: dial, server-trust check, Noise handshake, the
+//! control stream (pings, notices, shutdown) and the acceptor for streams
+//! the server opens (`ForwardedTcp`). See docs/03-protocol.md §1–§6 and
+//! docs/02-security.md "Server trust (client)".
+//!
+//! TOFU is a two-step dance because the handshake's `verify_server` callback
+//! is synchronous: an unknown key is reported out of the callback as
+//! [`TrustError::Unknown`] (the handshake aborts without revealing our
+//! identity), the user is asked on the console, and on `yes` the key is
+//! appended to `known_hosts` and we dial again — the second handshake then
+//! sees a known key.
+
+use std::{
+    collections::HashMap,
+    fmt,
+    net::SocketAddr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context as _, Result, anyhow, bail};
+use mysh_net::{
+    framing::{read_msg, write_msg, write_reply},
+    handshake::{HandshakeError, Handshaken, client_handshake},
+    keys::{Fingerprint, Identity, PublicKey},
+    mux::{Incoming, Mode, Mux, OpenError, Stream, accept_open},
+    noise::TransferStats,
+    trust::KnownHosts,
+};
+use mysh_proto::{
+    control::ControlMsg,
+    handshake::{ClientHello, ServerHello},
+    limits,
+    open::{ErrorCode, Open, OpenReply},
+};
+use tokio::{
+    io::{AsyncWriteExt as _, ReadHalf, WriteHalf},
+    net::TcpStream,
+    sync::{mpsc, oneshot, watch},
+    time::timeout,
+};
+use tracing::{debug, info, warn};
+
+use crate::{
+    client::console::Console,
+    config::{Paths, Target},
+    identity::{Baked, ClientTrust, TrustDecision, load_client_identity},
+};
+
+/// Per-address TCP connect budget.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Client-side bound on the whole handshake (the server allows 5 s).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Handler for `Open::ForwardedTcp` streams; must answer the `OpenReply`
+/// itself (registered by `client::forward::Forwards`).
+pub type ForwardedHandler = Box<dyn Fn(Stream, u32, String) + Send + Sync>;
+
+/// Why the server key was refused inside the handshake callback.
+#[derive(Debug)]
+enum TrustError {
+    /// Loud, no bypass.
+    Mismatch {
+        source: String,
+        line: usize,
+        expected: Fingerprint,
+        actual: Fingerprint,
+    },
+    /// Not known anywhere; carries the key so the caller can ask the user.
+    Unknown { key: PublicKey },
+    /// Not known and `--strict`.
+    Strict { actual: Fingerprint },
+}
+
+impl fmt::Display for TrustError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mismatch {
+                source,
+                line,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "server key mismatch (recorded in {source} line {line}: expected {expected}, got {actual})"
+            ),
+            Self::Unknown { key } => {
+                write!(f, "server key {} is not known", key.fingerprint())
+            }
+            Self::Strict { actual } => write!(f, "server key {actual} is not known (--strict)"),
+        }
+    }
+}
+
+impl std::error::Error for TrustError {}
+
+struct Inner {
+    mux: Mux,
+    target: Target,
+    hello: ServerHello,
+    remote: PublicKey,
+    via: String,
+    identity_fp: Fingerprint,
+    identity_line: String,
+    connected_at: Instant,
+    version: u16,
+    peer_addr: SocketAddr,
+    control: mpsc::Sender<ControlMsg>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<()>>>,
+    next_nonce: AtomicU64,
+    last_rtt: Mutex<Option<Duration>>,
+    /// `Some(reason)` once the connection is gone.
+    closed: watch::Sender<Option<String>>,
+    handler: Mutex<Option<ForwardedHandler>>,
+    console: Console,
+}
+
+/// Handle to a live connection; cheap to clone.
+#[derive(Clone)]
+pub struct Connection {
+    inner: Arc<Inner>,
+}
+
+impl fmt::Debug for Connection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Connection")
+            .field("target", &self.inner.target.display)
+            .field("peer", &self.inner.peer_addr)
+            .field("remote", &self.inner.remote.fingerprint())
+            .field("via", &self.inner.via)
+            .field("closed", &self.is_closed())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Connection {
+    pub fn mux(&self) -> &Mux {
+        &self.inner.mux
+    }
+
+    pub fn target(&self) -> &Target {
+        &self.inner.target
+    }
+
+    pub fn server_hello(&self) -> &ServerHello {
+        &self.inner.hello
+    }
+
+    pub fn remote_key(&self) -> PublicKey {
+        self.inner.remote
+    }
+
+    /// How the server key was trusted (`pin`, `baked`, a `known_hosts` file…).
+    pub fn trusted_via(&self) -> &str {
+        &self.inner.via
+    }
+
+    pub fn identity_fingerprint(&self) -> Fingerprint {
+        self.inner.identity_fp.clone()
+    }
+
+    /// Our public key as a `mysh-x25519 …` line (for `authorize`).
+    pub fn identity_line(&self) -> &str {
+        &self.inner.identity_line
+    }
+
+    pub fn connected_at(&self) -> Instant {
+        self.inner.connected_at
+    }
+
+    pub fn version(&self) -> u16 {
+        self.inner.version
+    }
+
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.inner.peer_addr
+    }
+
+    /// Round trip of the most recent ping (keep-alive or `ping`).
+    pub fn last_rtt(&self) -> Option<Duration> {
+        self.inner.last_rtt.lock().ok().and_then(|r| *r)
+    }
+
+    pub async fn open(&self, open: &Open) -> Result<Stream, OpenError> {
+        self.inner.mux.open(open).await
+    }
+
+    /// One control-stream round trip.
+    pub async fn ping(&self) -> Result<Duration> {
+        let nonce = self.inner.next_nonce.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .pending
+            .lock()
+            .map_err(|_| anyhow!("ping table poisoned"))?
+            .insert(nonce, tx);
+        let start = Instant::now();
+        let sent = self.inner.control.send(ControlMsg::Ping { nonce }).await;
+        if sent.is_err() {
+            self.forget_ping(nonce);
+            bail!("connection closed");
+        }
+        match timeout(limits::PING_INTERVAL, rx).await {
+            Ok(Ok(())) => {
+                let rtt = start.elapsed();
+                if let Ok(mut last) = self.inner.last_rtt.lock() {
+                    *last = Some(rtt);
+                }
+                Ok(rtt)
+            }
+            Ok(Err(_)) => {
+                self.forget_ping(nonce);
+                bail!("connection closed")
+            }
+            Err(_) => {
+                self.forget_ping(nonce);
+                bail!("ping timed out")
+            }
+        }
+    }
+
+    fn forget_ping(&self, nonce: u64) {
+        if let Ok(mut p) = self.inner.pending.lock() {
+            p.remove(&nonce);
+        }
+    }
+
+    /// Ask the server for the cwd of session `session`'s foreground process
+    /// (docs/03-protocol.md §10). `None` on any failure.
+    pub async fn cwd_probe(&self, session: u32) -> Option<String> {
+        let mut stream = match self.open(&Open::Cwd { session }).await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!(session, error = %e, "cwd probe refused");
+                return None;
+            }
+        };
+        match timeout(
+            limits::OPEN_REPLY_DEADLINE,
+            read_msg::<_, Option<String>>(&mut stream),
+        )
+        .await
+        {
+            Ok(Ok(cwd)) => cwd,
+            Ok(Err(e)) => {
+                debug!(session, error = %e, "cwd probe failed");
+                None
+            }
+            Err(_) => {
+                debug!(session, "cwd probe timed out");
+                None
+            }
+        }
+    }
+
+    pub fn stats(&self) -> TransferStats {
+        self.inner.mux.stats()
+    }
+
+    /// Register the handler for server-opened `ForwardedTcp` streams.
+    pub fn set_forwarded_handler(&self, handler: ForwardedHandler) {
+        if let Ok(mut h) = self.inner.handler.lock() {
+            *h = Some(handler);
+        }
+    }
+
+    /// Whether the connection has ended (peer closed, ping timeout,
+    /// shutdown notice, or [`Connection::close`]).
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.borrow().is_some()
+    }
+
+    /// Why the connection ended, once it has.
+    pub fn close_reason(&self) -> Option<String> {
+        self.inner.closed.borrow().clone()
+    }
+
+    /// Resolves once the connection has ended.
+    pub async fn closed(&self) {
+        let mut rx = self.inner.closed.subscribe();
+        let _ = rx.wait_for(std::option::Option::is_some).await;
+    }
+
+    /// Graceful close: tell the server, close the mux, wait for the driver.
+    pub async fn close(&self) {
+        let _ = timeout(
+            Duration::from_secs(1),
+            self.inner.control.send(ControlMsg::Shutdown {
+                reason: "client exiting".to_owned(),
+            }),
+        )
+        .await;
+        self.inner.mux.close().await;
+        self.inner.mark_closed("closed by client");
+    }
+}
+
+impl Inner {
+    fn mark_closed(&self, reason: &str) {
+        self.closed.send_if_modified(|c| {
+            if c.is_some() {
+                false
+            } else {
+                *c = Some(reason.to_owned());
+                true
+            }
+        });
+    }
+}
+
+/// Resolve and dial `host:port`, trying each address in order.
+async fn dial(host: &str, port: u16) -> Result<TcpStream> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("resolving {host}"))?
+        .collect();
+    if addrs.is_empty() {
+        bail!("{host}: no addresses");
+    }
+    let mut last: Option<anyhow::Error> = None;
+    for addr in addrs {
+        debug!(%addr, "connecting");
+        match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => {
+                stream.set_nodelay(true).context("TCP_NODELAY")?;
+                return Ok(stream);
+            }
+            Ok(Err(e)) => last = Some(anyhow!("{addr}: {e}")),
+            Err(_) => last = Some(anyhow!("{addr}: connect timed out")),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("{host}:{port}: connect failed")))
+}
+
+/// Outcome of one handshake attempt.
+enum Attempt {
+    Done(Box<AttemptDone>),
+    /// Unknown key; ask the user.
+    Unknown(PublicKey),
+}
+
+struct AttemptDone {
+    handshaken: Handshaken<TcpStream>,
+    hello: ServerHello,
+    via: String,
+}
+
+async fn attempt(target: &Target, identity: &Identity, trust: &ClientTrust) -> Result<Attempt> {
+    let tcp = dial(&target.host, target.port).await?;
+    let mut via = String::new();
+    let verify = |key: &PublicKey,
+                  _hello: &ServerHello|
+     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match trust.evaluate(&target.host, target.port, key) {
+            TrustDecision::Trusted { via: v } => {
+                via = v;
+                Ok(())
+            }
+            TrustDecision::Mismatch {
+                source,
+                line,
+                expected,
+            } => Err(Box::new(TrustError::Mismatch {
+                source,
+                line,
+                expected,
+                actual: key.fingerprint(),
+            })),
+            TrustDecision::Unknown if trust.strict => Err(Box::new(TrustError::Strict {
+                actual: key.fingerprint(),
+            })),
+            TrustDecision::Unknown if trust.accept_new => {
+                KnownHosts::append(&trust.write_to, &target.host, target.port, key)?;
+                info!(fingerprint = %key.fingerprint(), path = %trust.write_to.display(), "accepted new server key");
+                "accept-new".clone_into(&mut via);
+                Ok(())
+            }
+            TrustDecision::Unknown => Err(Box::new(TrustError::Unknown { key: *key })),
+        }
+    };
+    let result = timeout(
+        HANDSHAKE_TIMEOUT,
+        client_handshake(tcp, &identity.secret, ClientHello { caps: 0 }, verify),
+    )
+    .await;
+    match result {
+        Ok(Ok((handshaken, hello))) => Ok(Attempt::Done(Box::new(AttemptDone {
+            handshaken,
+            hello,
+            via,
+        }))),
+        Ok(Err(HandshakeError::Trust(err))) => match err.downcast::<TrustError>() {
+            Ok(trust_err) => match *trust_err {
+                TrustError::Unknown { key } => Ok(Attempt::Unknown(key)),
+                TrustError::Mismatch {
+                    source,
+                    line,
+                    expected,
+                    actual,
+                } => Err(mismatch_error(target, &source, line, &expected, &actual)),
+                other @ TrustError::Strict { .. } => Err(anyhow!("{other}")),
+            },
+            Err(other) => Err(anyhow!("server not trusted: {other}")),
+        },
+        Ok(Err(HandshakeError::Denied {
+            code: ErrorCode::Unauthorized,
+            ..
+        })) => Err(anyhow!(
+            "server refused our key {}: not authorized",
+            identity.public.fingerprint()
+        )),
+        Ok(Err(HandshakeError::Denied { code, message })) => {
+            Err(anyhow!("server refused the connection: {code}: {message}"))
+        }
+        Ok(Err(e)) => {
+            Err(e).with_context(|| format!("handshake with {}:{} failed", target.host, target.port))
+        }
+        Err(_) => Err(anyhow!(
+            "handshake with {}:{} timed out",
+            target.host,
+            target.port
+        )),
+    }
+}
+
+fn mismatch_error(
+    target: &Target,
+    source: &str,
+    line: usize,
+    expected: &Fingerprint,
+    actual: &Fingerprint,
+) -> anyhow::Error {
+    anyhow!(
+        "\n\
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n\
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+The key presented by {host}:{port} does not match the one recorded in\n\
+  {source}, line {line}\n\
+expected: {expected}\n\
+actual:   {actual}\n\
+Someone could be eavesdropping on you right now, or the server's key was\n\
+replaced. There is no bypass flag: if the change is legitimate, remove or\n\
+fix that entry and connect again.",
+        host = target.host,
+        port = target.port,
+    )
+}
+
+/// Ask the user whether to trust `key`; `Ok(true)` only on an explicit yes.
+async fn tofu_prompt(target: &Target, key: &PublicKey, console: &Console) -> Result<bool> {
+    console.print(&format!(
+        "The authenticity of host {}:{} can't be established.\n\
+         Fingerprint {}\n\
+         Are you sure you want to continue connecting (yes/no)? ",
+        target.host,
+        target.port,
+        key.fingerprint()
+    ));
+    console.flush().await;
+    let answer = tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).map(|_| line)
+    })
+    .await
+    .context("stdin reader")?
+    .context("reading answer")?;
+    Ok(answer.trim().eq_ignore_ascii_case("yes"))
+}
+
+/// Dial, verify the server, handshake, and start the connection tasks.
+pub async fn connect(
+    target: &Target,
+    paths: &Paths,
+    baked: &Baked,
+    console: &Console,
+) -> Result<Connection> {
+    let identity = load_client_identity(target, paths, baked)?;
+    let trust = ClientTrust::for_target(target, paths, baked)?;
+    let mut accepted: Option<PublicKey> = None;
+    loop {
+        match attempt(target, &identity, &trust).await? {
+            Attempt::Done(done) => {
+                let AttemptDone {
+                    handshaken,
+                    hello,
+                    via,
+                } = *done;
+                return establish(target.clone(), &identity, handshaken, hello, via, console);
+            }
+            Attempt::Unknown(key) => {
+                if accepted == Some(key) {
+                    bail!(
+                        "server key {} still unknown after accepting it",
+                        key.fingerprint()
+                    );
+                }
+                let stdin_tty = mysh_pty::terminal::is_terminal(std::io::stdin());
+                if !(console.is_tty() && stdin_tty) {
+                    bail!(
+                        "host key verification failed: {}:{} is not in known_hosts (key {}); \
+                         use --accept-new or add it to {}",
+                        target.host,
+                        target.port,
+                        key.fingerprint(),
+                        trust.write_to.display()
+                    );
+                }
+                if !tofu_prompt(target, &key, console).await? {
+                    bail!("host key verification failed");
+                }
+                KnownHosts::append(&trust.write_to, &target.host, target.port, &key)
+                    .with_context(|| format!("writing {}", trust.write_to.display()))?;
+                console.println(&format!(
+                    "Warning: permanently added {}:{} ({}) to {}.",
+                    target.host,
+                    target.port,
+                    key.fingerprint(),
+                    trust.write_to.display()
+                ));
+                accepted = Some(key);
+                // Reconnect: the aborted handshake never sent our identity,
+                // and `evaluate` re-reads known_hosts, so the next attempt
+                // finds the key.
+            }
+        }
+    }
+}
+
+fn establish(
+    target: Target,
+    identity: &Identity,
+    handshaken: Handshaken<TcpStream>,
+    hello: ServerHello,
+    via: String,
+    console: &Console,
+) -> Result<Connection> {
+    let Handshaken {
+        stream,
+        remote,
+        version,
+    } = handshaken;
+    let peer_addr = stream.get_ref().peer_addr().context("peer address")?;
+    info!(peer = %peer_addr, fingerprint = %remote.fingerprint(), via, version, "connected");
+    let (mux, incoming) = Mux::new(stream, Mode::Client);
+    let (control_tx, control_rx) = mpsc::channel(32);
+    let (closed, _) = watch::channel(None);
+    let inner = Arc::new(Inner {
+        mux,
+        target,
+        hello,
+        remote,
+        via,
+        identity_fp: identity.public.fingerprint(),
+        identity_line: identity.public.to_line(identity.comment.as_deref()),
+        connected_at: Instant::now(),
+        version,
+        peer_addr,
+        control: control_tx,
+        pending: Mutex::new(HashMap::new()),
+        next_nonce: AtomicU64::new(1),
+        last_rtt: Mutex::new(None),
+        closed,
+        handler: Mutex::new(None),
+        console: console.clone(),
+    });
+    let conn = Connection { inner };
+    tokio::spawn(start_control(conn.clone(), control_rx));
+    tokio::spawn(acceptor(conn.clone(), incoming));
+    tokio::spawn({
+        let conn = conn.clone();
+        async move {
+            conn.inner.mux.closed().await;
+            conn.inner.mark_closed("connection closed");
+        }
+    });
+    Ok(conn)
+}
+
+/// Open the control stream, then run its reader, writer and the pinger.
+async fn start_control(conn: Connection, control_rx: mpsc::Receiver<ControlMsg>) {
+    let stream = match conn.inner.mux.open(&Open::Control).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "control stream refused");
+            conn.inner
+                .mark_closed(&format!("control stream refused: {e}"));
+            conn.inner.mux.close().await;
+            return;
+        }
+    };
+    let (rd, wr) = tokio::io::split(stream);
+    tokio::spawn(control_writer(wr, control_rx));
+    tokio::spawn(control_reader(conn.clone(), rd));
+    tokio::spawn(pinger(conn));
+}
+
+async fn control_writer(mut wr: WriteHalf<Stream>, mut rx: mpsc::Receiver<ControlMsg>) {
+    while let Some(msg) = rx.recv().await {
+        let shutdown = matches!(msg, ControlMsg::Shutdown { .. });
+        if let Err(e) = write_msg(&mut wr, &msg).await {
+            debug!(error = %e, "control write failed");
+            break;
+        }
+        if shutdown {
+            break;
+        }
+    }
+    let _ = wr.shutdown().await;
+}
+
+async fn control_reader(conn: Connection, mut rd: ReadHalf<Stream>) {
+    loop {
+        match read_msg::<_, ControlMsg>(&mut rd).await {
+            Ok(ControlMsg::Pong { nonce }) => {
+                let waiter = conn
+                    .inner
+                    .pending
+                    .lock()
+                    .ok()
+                    .and_then(|mut p| p.remove(&nonce));
+                if let Some(tx) = waiter {
+                    let _ = tx.send(());
+                }
+            }
+            Ok(ControlMsg::Ping { nonce }) => {
+                if conn
+                    .inner
+                    .control
+                    .send(ControlMsg::Pong { nonce })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(ControlMsg::Notice(text)) => conn.inner.console.notice(&format!("server: {text}")),
+            Ok(ControlMsg::Shutdown { reason }) => {
+                conn.inner
+                    .mark_closed(&format!("server shutting down: {reason}"));
+                conn.inner.mux.close().await;
+                break;
+            }
+            Err(e) => {
+                debug!(error = %e, "control stream ended");
+                if !conn.is_closed() {
+                    conn.inner.mark_closed("control stream closed");
+                    conn.inner.mux.close().await;
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// Keep-alive: a ping every `PING_INTERVAL`; `PING_DEAD_AFTER` consecutive
+/// misses declare the connection dead.
+async fn pinger(conn: Connection) {
+    let mut unanswered: u32 = 0;
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(limits::PING_INTERVAL) => {}
+            () = conn.closed() => return,
+        }
+        match conn.ping().await {
+            Ok(rtt) => {
+                unanswered = 0;
+                debug!(?rtt, "pong");
+            }
+            Err(e) => {
+                if conn.is_closed() {
+                    return;
+                }
+                unanswered += 1;
+                warn!(unanswered, error = %e, "ping unanswered");
+                if unanswered >= limits::PING_DEAD_AFTER {
+                    conn.inner.mark_closed("ping timeout");
+                    conn.inner.mux.close().await;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Streams opened by the server: only `ForwardedTcp` is meaningful.
+async fn acceptor(conn: Connection, mut incoming: Incoming) {
+    while let Some(mut stream) = incoming.accept().await {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            let open = match timeout(limits::OPEN_REPLY_DEADLINE, accept_open(&mut stream)).await {
+                Ok(Ok(Ok(open))) => open,
+                Ok(Ok(Err(tag))) => {
+                    debug!(tag, "unknown stream kind from server");
+                    reply_unsupported(&mut stream, "unknown stream kind").await;
+                    return;
+                }
+                Ok(Err(e)) => {
+                    debug!(error = %e, "bad stream prologue from server");
+                    return;
+                }
+                Err(_) => {
+                    debug!("server stream prologue timed out");
+                    return;
+                }
+            };
+            match open {
+                Open::ForwardedTcp { listener, peer } => {
+                    let mut stream = Some(stream);
+                    if let Ok(guard) = conn.inner.handler.lock()
+                        && let Some(handler) = guard.as_ref()
+                        && let Some(s) = stream.take()
+                    {
+                        handler(s, listener, peer);
+                    }
+                    if let Some(mut s) = stream {
+                        debug!(listener, "ForwardedTcp with no handler registered");
+                        reply_unsupported(&mut s, "no remote forward handler").await;
+                    }
+                }
+                other => {
+                    debug!(?other, "server opened an unexpected stream kind");
+                    reply_unsupported(&mut stream, "clients only accept ForwardedTcp").await;
+                }
+            }
+        });
+    }
+    debug!("incoming stream channel closed");
+}
+
+async fn reply_unsupported(stream: &mut Stream, message: &str) {
+    let _ = write_reply(
+        stream,
+        &OpenReply::Err {
+            code: ErrorCode::Unsupported,
+            message: message.to_owned(),
+        },
+    )
+    .await;
+    let _ = stream.shutdown().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_is_send_sync() {
+        fn check<T: Send + Sync>() {}
+        check::<Connection>();
+    }
+
+    #[test]
+    fn trust_error_messages_name_fingerprints() {
+        let key = PublicKey::from_bytes([7u8; 32]);
+        let fp = key.fingerprint();
+        let err = TrustError::Mismatch {
+            source: "/tmp/kh".to_owned(),
+            line: 3,
+            expected: fp.clone(),
+            actual: fp.clone(),
+        };
+        let text = err.to_string();
+        assert!(text.contains("/tmp/kh line 3"));
+        assert!(text.contains(fp.as_str()));
+        assert!(
+            TrustError::Unknown { key }
+                .to_string()
+                .contains(fp.as_str())
+        );
+    }
+}

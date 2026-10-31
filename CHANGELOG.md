@@ -12,3 +12,7 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Design documents under `docs/` (architecture, security, protocol,
   sessions, meta shell, roadmap).
 - `baked` feature plumbing in `crates/mysh/build.rs`.
+- `mysh serve` core: listeners with `[::]`→`0.0.0.0` fallback, handshake
+  semaphore, authorization against the trust set, control stream
+  (ping/pong, idle timeout, graceful `Shutdown`), stream dispatch, PTY and
+  exec sessions with the env allow-list, and the cwd probe.

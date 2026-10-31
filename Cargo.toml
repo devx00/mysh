@@ -42,8 +42,8 @@ snow = { version = "0.10", default-features = false, features = ["default-resolv
 ssh-key = { version = "0.6", features = ["ed25519", "encryption", "std"] }
 thiserror = "2"
 toml = "1"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["compat"] }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 yamux = "0.14"
