@@ -22,12 +22,17 @@ curve25519-dalek = "4"
 dirs = "7"
 futures = "0.3"
 indicatif = "0.18"
+# HMAC-SHA1 for OpenSSH `|1|salt|hash` hashed known_hosts entries (mysh-net::trust).
+hmac = "0.12"
 libc = "0.2"
 postcard = { version = "1", features = ["use-std"] }
 rpassword = "7"
+# rand_core 0.6 matches ssh-key 0.6; `getrandom` provides `OsRng` for key generation.
+rand_core = { version = "0.6", features = ["getrandom"] }
 rustix = { version = "1", features = ["fs", "pipe", "process", "pty", "stdio", "termios"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
+sha1 = "0.10"
 shlex = "2"
 # `std` is intentionally off: snow 0.10's `std` feature pulls in `ring`
 # unconditionally (`ring/std`), which needs a C cross toolchain. snow's
@@ -36,6 +41,7 @@ shlex = "2"
 snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"] }
 ssh-key = { version = "0.6", features = ["ed25519", "encryption", "std"] }
 thiserror = "2"
+toml = "1"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 tracing = "0.1"

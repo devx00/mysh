@@ -15,12 +15,12 @@ fn main() {
         let identity = required("MYSH_BAKED_IDENTITY");
         let peers = required("MYSH_BAKED_PEERS");
         format!(
-            "pub(crate) const IDENTITY: Option<&str> = Some(include_str!({identity:?}));\n\
-             pub(crate) const PEERS: Option<&str> = Some(include_str!({peers:?}));\n"
+            "pub const IDENTITY: Option<&str> = Some(include_str!({identity:?}));\n\
+             pub const PEERS: Option<&str> = Some(include_str!({peers:?}));\n"
         )
     } else {
-        "pub(crate) const IDENTITY: Option<&str> = None;\n\
-         pub(crate) const PEERS: Option<&str> = None;\n"
+        "pub const IDENTITY: Option<&str> = None;\n\
+         pub const PEERS: Option<&str> = None;\n"
             .to_owned()
     };
     fs::write(&out, src).expect("write baked.rs into OUT_DIR");

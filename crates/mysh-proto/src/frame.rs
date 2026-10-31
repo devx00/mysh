@@ -20,7 +20,7 @@ pub enum Error {
 }
 
 /// Encode `msg` as a complete frame (header + body).
-pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, Error> {
+pub fn encode<T: Serialize + ?Sized>(msg: &T) -> Result<Vec<u8>, Error> {
     let mut out = vec![0u8; HEADER_LEN];
     postcard::to_io(msg, &mut out)?;
     let len = out.len() - HEADER_LEN;
