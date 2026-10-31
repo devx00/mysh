@@ -162,21 +162,22 @@ if it exits while other sessions are still open.
 stream per file; recursive operations issue them sequentially (parallel
 transfers are roadmap).
 
-`put [-r] [-c] [-p] LOCAL... [REMOTE]`:
+`put [-r] [-c] [-P] [-F] LOCAL... [REMOTE]` (`-P` preserve, `-F` follow
+symlinks; `-p`/`-L` are taken by the shared connection options):
 
 - one LOCAL and REMOTE absent → REMOTE = session cwd (probe) / `~`;
   one LOCAL and REMOTE is a directory → `REMOTE/<basename>`; several LOCAL →
   REMOTE must be a directory;
-- regular file: `Put{ mode, mtime (with -p), offset: 0, truncate: true, atomic }`,
+- regular file: `Put{ mode, mtime (with -P), offset: 0, truncate: true, atomic }`,
   stream, await `PutDone`;
 - `-c` continue: `Stat` the remote; if it is a regular file shorter than
   local, `offset = remote size, truncate: false, atomic: false`;
 - `-r`: walk local tree, `Mkdir` (ignore exists), files as above; symlinks
-  are skipped with a notice unless `-L` follows them;
+  are skipped with a notice unless `-F` follows them;
 - progress bar per file plus totals when stderr is a terminal.
 
-`get [-r] [-c] [-p] REMOTE... [LOCAL]` mirrors it: `Stat`/`List` first,
-`Get{offset}` per file, local temp-and-rename, set mode/mtime with `-p`.
+`get [-r] [-c] [-P] REMOTE... [LOCAL]` mirrors it: `Stat`/`List` first,
+`Get{offset}` per file, local temp-and-rename, set mode/mtime with `-P`.
 
 `ls [-l] [-a] [REMOTE]` → `List`, formatted like `ls -l` (mode string, size,
 mtime, name).

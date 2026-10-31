@@ -114,7 +114,10 @@ resets it.
 ## 6. Control stream
 
 Opened by the client immediately after the handshake; message mode in both
-directions.
+directions. The server closes the connection if the first stream it accepts
+is anything else, so the client's `connect` does not return until the
+control stream's `OpenReply::Ok` has arrived — no other stream can be
+opened earlier.
 
 ```rust
 enum ControlMsg {
@@ -127,8 +130,8 @@ enum ControlMsg {
 
 Keep-alive: the client pings every 30 s; three consecutive unanswered pings →
 the client declares the connection dead (exit 255). The server closes a
-connection that has been silent (no frames at all) for 120 s. TCP keep-alive
-is also enabled on the socket as a cheap first line.
+connection whose control stream has been silent for 120 s. TCP keep-alive is
+not set in v1 (tokio exposes no API for it; the pings cover liveness).
 
 RTT shown by `info`/`ping` is measured here.
 

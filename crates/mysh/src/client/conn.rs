@@ -489,7 +489,7 @@ pub async fn connect(
                     hello,
                     via,
                 } = *done;
-                return establish(target.clone(), &identity, handshaken, hello, via, console);
+                return establish(target.clone(), &identity, handshaken, hello, via, console).await;
             }
             Attempt::Unknown(key) => {
                 if accepted == Some(key) {
@@ -530,7 +530,7 @@ pub async fn connect(
     }
 }
 
-fn establish(
+async fn establish(
     target: Target,
     identity: &Identity,
     handshaken: Handshaken<TcpStream>,
@@ -568,7 +568,16 @@ fn establish(
         console: console.clone(),
     });
     let conn = Connection { inner };
-    tokio::spawn(start_control(conn.clone(), control_rx));
+    // The server requires the first stream to be Control; open and get it
+    // acknowledged before anyone can `open()` another stream on this
+    // connection.
+    let control = conn
+        .inner
+        .mux
+        .open(&Open::Control)
+        .await
+        .context("opening control stream")?;
+    start_control(conn.clone(), control, control_rx);
     tokio::spawn(acceptor(conn.clone(), incoming));
     tokio::spawn({
         let conn = conn.clone();
@@ -580,18 +589,8 @@ fn establish(
     Ok(conn)
 }
 
-/// Open the control stream, then run its reader, writer and the pinger.
-async fn start_control(conn: Connection, control_rx: mpsc::Receiver<ControlMsg>) {
-    let stream = match conn.inner.mux.open(&Open::Control).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = %e, "control stream refused");
-            conn.inner
-                .mark_closed(&format!("control stream refused: {e}"));
-            conn.inner.mux.close().await;
-            return;
-        }
-    };
+/// Run the control stream's reader, writer and the pinger.
+fn start_control(conn: Connection, stream: Stream, control_rx: mpsc::Receiver<ControlMsg>) {
     let (rd, wr) = tokio::io::split(stream);
     tokio::spawn(control_writer(wr, control_rx));
     tokio::spawn(control_reader(conn.clone(), rd));

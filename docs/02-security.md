@@ -118,8 +118,8 @@ The set of trusted client keys is the union of:
 1. baked peers;
 2. `~/.config/mysh/authorized_keys` (`mysh-x25519` and `ssh-ed25519` lines;
    unknown key types are skipped with a warning);
-3. `~/.ssh/authorized_keys`, `ssh-ed25519` entries only (default on;
-   `--no-ssh-authorized-keys` disables);
+3. `~/.ssh/authorized_keys`, `ssh-ed25519` (and `mysh-x25519`) entries;
+   other key types skipped (default on; `--no-ssh-authorized-keys` disables);
 4. `--authorized-key <pubkey>` and `--authorized-keys <path>`, repeatable.
 
 Files are re-read on every connection; no reload signal needed. A server

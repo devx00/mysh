@@ -172,14 +172,18 @@ ssh, not reimplementing it), `crossterm` (too much for raw mode + winsize),
 
 ```sh
 cargo build --release                                    # native
-cargo build --release --target aarch64-unknown-linux-musl   # static linux (needs musl linker, or use cross)
-cross build --release --target aarch64-linux-android     # android via docker NDK image
-cargo ndk -t arm64-v8a build --release                   # android via local NDK
+cargo build --release --target aarch64-unknown-linux-musl   # static linux (needs a musl linker)
+scripts/android-build.sh [TARGET] [API]                  # android: NDK clang as linker (ANDROID_NDK_HOME or the Homebrew cask)
 MYSH_BAKED_IDENTITY=fleet.secret MYSH_BAKED_PEERS=fleet.pub \
   cargo build --release --features baked                 # baked
 cargo check-matrix                                       # type-check every target, no linkers needed
 cargo lint                                               # clippy -D warnings
+scripts/lima-test.sh                                     # full test suite on Linux in a lima VM (scripts/lima.yaml)
 ```
+
+There are no C dependencies, so Android needs only the NDK's clang as the
+linker; `cross` is not used because its images are x86_64-only and would
+need emulation on Apple silicon.
 
 Release artifacts are the five `mysh` binaries above, built by a release
 workflow (06-roadmap.md M4). Android binaries are pushed with

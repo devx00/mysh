@@ -829,7 +829,12 @@ mod tests {
             argv: vec!["sh".to_owned(), "-c".to_owned(), "true".to_owned()],
         };
         let p = program_for(&multi, shell, path).unwrap();
-        assert_eq!(p.program, PathBuf::from("/bin/sh"));
+        // Merged-/usr distributions resolve `sh` to /usr/bin/sh first.
+        assert!(
+            p.program == Path::new("/bin/sh") || p.program == Path::new("/usr/bin/sh"),
+            "{:?}",
+            p.program
+        );
         assert_eq!(
             p.argv,
             vec![
