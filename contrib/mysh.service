@@ -1,0 +1,42 @@
+# systemd unit for `mysh serve`.
+#
+#   install -m 755 mysh /usr/local/bin/mysh
+#   install -m 644 contrib/mysh.service /etc/systemd/system/mysh.service
+#   systemctl daemon-reload && systemctl enable --now mysh
+#
+# The server serves the user it runs as (here: a dedicated `mysh` account;
+# use `User=root` for a root shell). The host key is generated on first start
+# under the state directory; authorize clients in
+# /var/lib/mysh/.config/mysh/authorized_keys or pass --authorized-key.
+
+[Unit]
+Description=mysh remote shell server
+Documentation=https://github.com/zachhanson94/mysh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mysh
+Group=mysh
+DynamicUser=yes
+StateDirectory=mysh
+Environment=HOME=/var/lib/mysh
+Environment=MYSH_CONFIG_DIR=/var/lib/mysh/.config/mysh
+ExecStart=/usr/local/bin/mysh serve --listen [::]:7722
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# Sessions need a pty and a working /dev/pts; everything else is locked down.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mysh /tmp
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

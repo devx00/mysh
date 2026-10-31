@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for `mysh serve`, run as the logged-in user.
+
+    install -m 755 mysh /usr/local/bin/mysh
+    cp contrib/com.mysh.serve.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mysh.serve.plist
+
+  Keys live in ~/.config/mysh (host key generated on first start); authorize
+  clients in ~/.config/mysh/authorized_keys or ~/.ssh/authorized_keys.
+  For a system daemon (login window, no user session) place the file in
+  /Library/LaunchDaemons and add a UserName key.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mysh.serve</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/mysh</string>
+    <string>serve</string>
+    <string>--listen</string>
+    <string>[::]:7722</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/mysh.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/mysh.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
