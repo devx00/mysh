@@ -66,9 +66,12 @@ Workspace, lints, CI, this spec.
   `no-files`, `no-forward`, `from=`, `restrict`; 02 "Per-key options") and
   enforcement ✔ (per-connection `Policy`, `from=` at authorization, forced
   command with `MYSH_ORIGINAL_COMMAND`).
-- Fuzz targets for every postcard decoder and the key/known_hosts parsers.
-- Release workflow: static artifacts for the five targets, checksums,
-  `contrib/` systemd unit, launchd plist, Termux:Boot script.
+- Fuzz targets ✔ for every postcard decoder and the key/trust/config
+  parsers (`fuzz/`, 16 targets, `scripts/fuzz-all.sh`).
+- Release ✔: `scripts/release.sh` links the five targets and writes
+  `SHA256SUMS`; `.github/workflows/release.yml` builds the same set on
+  tags; `contrib/` has the systemd unit (verified with
+  `systemd-analyze`), launchd plist (`plutil -lint`) and Termux:Boot script.
 
 ### M5 — quality of life
 
@@ -100,7 +103,9 @@ Workspace, lints, CI, this spec.
 - Local path completion and `Ctrl-R` history search at the prompt — done
   (`client::editor`): Tab completes local paths for `put`/`lcd`/`log`/
   `authorize` and `get`'s destination, `Ctrl-R` incremental search.
-- Post-quantum hybrid (X25519 + ML-KEM) if `snow` or a successor exposes it.
+- Post-quantum hybrid (X25519 + ML-KEM): deferred to a later round. `snow`
+  0.10 exposes no ML-KEM; a hybrid KEX would be a separate crypto path and
+  a trust-model decision in its own right.
 
 ## Decisions log
 

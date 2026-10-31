@@ -9,9 +9,11 @@
 //!   Noise transport messages
 //! - [`framing`]: async `Msg<T>` and `Open`/`OpenReply` helpers
 //! - [`mux`]: yamux multiplexing and the per-stream prologue
+//! - [`agent`]: OpenSSH `ssh-agent` client (list ed25519 identities, sign)
 
 #![forbid(unsafe_code)]
 
+pub mod agent;
 pub mod framing;
 pub mod handshake;
 pub mod keys;

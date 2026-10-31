@@ -10,12 +10,16 @@ and Android.
 - Every connection starts at a meta shell: `shell` opens a real remote
   shell (PTY, follows your terminal size), `Ctrl-]` brings you back without
   dropping anything; `put`, `get`, `forward`, `info`, and friends live
-  there too, and double as CLI subcommands.
+  there too, and double as CLI subcommands (which reuse a live client's
+  connection through its control socket).
+- Sessions survive a dropped connection: `mysh --attach HOST` picks them up
+  with the output you missed.
+- Per-key `authorized_keys` options (`command=`, `from=`, `no-pty`, …),
+  per-IP handshake rate limiting, automatic rekeying, fuzzed parsers.
 
-**Status:** working through milestone M3 — transport, sessions, meta shell,
-file transfer and port forwarding all run on Linux, macOS and Android.
-Hardening and release artifacts (M4) are next; see
-[docs/06-roadmap.md](docs/06-roadmap.md).
+**Status:** milestones M1–M5 of [docs/06-roadmap.md](docs/06-roadmap.md)
+are implemented and tested on Linux, macOS and Android; static release
+binaries are built by `scripts/release.sh`.
 
 | doc                                              | contents                                  |
 | ------------------------------------------------ | ----------------------------------------- |
@@ -50,9 +54,14 @@ cargo build --release        # native
 cargo lint                   # clippy, -D warnings
 cargo test --workspace       # unit + integration (loopback, real ptys)
 cargo check-matrix           # type-check every supported target
+scripts/release.sh           # all five release binaries + SHA256SUMS in dist/
 scripts/android-build.sh     # link an Android binary with the NDK clang
 scripts/lima-test.sh         # run the suite on Linux in a lima VM
+scripts/fuzz-all.sh 60       # every fuzz target for 60 s (needs nightly + cargo-fuzz)
 ```
+
+Deploy as a service with the files in [`contrib/`](contrib/) (systemd,
+launchd, Termux:Boot).
 
 Cross-compilation and baked (keyless) builds: see `docs/01-architecture.md`
 and `docs/02-security.md`.

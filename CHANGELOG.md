@@ -5,9 +5,10 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-Milestones M1–M3 of `docs/06-roadmap.md` are implemented: mysh connects,
-authenticates, runs interactive and non-interactive sessions, transfers
-files and forwards ports on Linux, macOS and Android.
+Milestones M1–M5 of `docs/06-roadmap.md` are implemented: mysh connects,
+authenticates, runs interactive and non-interactive sessions that survive a
+disconnect, transfers files and forwards ports on Linux, macOS and Android,
+and ships as static release binaries.
 
 ### Added
 
@@ -41,6 +42,16 @@ files and forwards ports on Linux, macOS and Android.
   size and resize, raw-mode guard, `SIGWINCH`/`SIGCONT`, cwd probe via
   `/proc` or `proc_pidinfo`, shell/home/user resolution for glibc, musl,
   macOS and bionic.
+- **Hardening** (M4): in-band rekey below yamux every 1 GiB or 1 h per
+  direction; `authorized_keys` options `command=`, `no-pty`, `no-files`,
+  `no-forward`, `from=` (IP, CIDR, glob, negation) and `restrict`; per-IP
+  handshake rate limiting (`--handshake-rate`), `--idle-timeout`, quotas
+  for sessions, listeners and streams; 16 libFuzzer targets over every
+  decoder and parser (`scripts/fuzz-all.sh`).
+- **Session persistence** (M5): PTY sessions outlive a disconnect for
+  `--detach-grace` (default 10 min) with a 1 MiB server-side output ring;
+  `mysh --attach[=ID] HOST`, prompt commands `attach`, `detach`,
+  `sessions -a`; a session can only be reattached by the key that opened it.
 - **Control socket, background jobs, parallel transfers** (M5): an
   interactive client listens on `$XDG_RUNTIME_DIR/mysh/<host>_<port>.sock`
   and `mysh put|get|forward|authorize HOST …` reuse its connection when the
@@ -48,10 +59,16 @@ files and forwards ports on Linux, macOS and Android.
   a job (`jobs [-w] [ID]`, `kill %ID`, completion notices above the
   prompt); `put -r`/`get -r` transfer `-j N` files at a time (default 4)
   with one aggregate progress line.
-- **Verification**: 239 tests (unit plus integration against an in-process
-  loopback server, including real-pty interactive tests); `scripts/
-  android-build.sh` links an Android binary with the NDK clang;
-  `scripts/lima-test.sh` runs the suite on Linux in a lima VM.
+- **Prompt** (M5): Tab completion of local paths and `Ctrl-R` reverse
+  history search.
+- **Release** (M4): `scripts/release.sh` links all five targets and writes
+  `SHA256SUMS`; `.github/workflows/release.yml` does the same on tags;
+  `contrib/` has a systemd unit, a launchd plist and a Termux:Boot script.
+- **Verification**: 300 tests (unit plus integration against an in-process
+  loopback server, including real-pty interactive, persistence and
+  control-socket tests); `scripts/android-build.sh` links an Android binary
+  with the NDK clang; `scripts/lima-test.sh` runs the suite on Linux in a
+  lima VM.
 
 ### Changed
 
