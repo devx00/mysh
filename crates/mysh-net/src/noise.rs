@@ -14,6 +14,14 @@
 //!
 //! A decrypt failure, a truncated frame or a malformed header poisons the
 //! stream: every later operation fails with the same error kind.
+//!
+//! Rekeying (docs/03 §3) is in-band: a transport message with empty
+//! plaintext (`u16-BE 16 ‖ tag`) tells the peer "the next message from me
+//! uses `REKEY(k)`". The sender emits it right after the data frame that
+//! crosses [`RekeyPolicy`] (bytes or elapsed time), then calls
+//! `rekey_outgoing`; the receiver calls `rekey_incoming` and surfaces
+//! nothing. snow's stateless `rekey_*` only replace the cipher key, so the
+//! nonce counters keep running on both sides, as Noise §4.2 requires.
 
 use std::fmt;
 use std::io;
@@ -21,8 +29,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, ready};
+use std::time::{Duration, Instant};
 
-use mysh_proto::{NOISE_MAX_MESSAGE, NOISE_TAG_LEN};
+use mysh_proto::{NOISE_MAX_MESSAGE, NOISE_TAG_LEN, limits};
 use snow::StatelessTransportState;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -32,17 +41,45 @@ pub const MAX_PLAINTEXT: usize = NOISE_MAX_MESSAGE - NOISE_TAG_LEN;
 /// Length prefix size.
 const HEADER_LEN: usize = 2;
 
+/// Wire size of the rekey signal: header plus an empty-plaintext message.
+const REKEY_FRAME_LEN: usize = HEADER_LEN + NOISE_TAG_LEN;
+
+/// When the sending side rotates its key. Either bound alone triggers;
+/// `bytes: 0` or `interval: ZERO` rekeys after every frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RekeyPolicy {
+    /// Plaintext bytes sent under one key.
+    pub bytes: u64,
+    /// Wall time one key stays in use.
+    pub interval: Duration,
+}
+
+impl Default for RekeyPolicy {
+    fn default() -> Self {
+        Self {
+            bytes: limits::REKEY_BYTES,
+            interval: limits::REKEY_INTERVAL,
+        }
+    }
+}
+
 /// Plaintext byte counters, readable after the stream moved into the mux.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TransferStats {
     pub bytes_in: u64,
     pub bytes_out: u64,
+    /// Rekeys this side initiated.
+    pub rekeys_out: u64,
+    /// Rekey signals received from the peer.
+    pub rekeys_in: u64,
 }
 
 #[derive(Debug, Default)]
 struct Counters {
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    rekeys_in: AtomicU64,
+    rekeys_out: AtomicU64,
 }
 
 /// Shared handle to a stream's [`TransferStats`].
@@ -54,6 +91,8 @@ impl StatsHandle {
         TransferStats {
             bytes_in: self.0.bytes_in.load(Ordering::Relaxed),
             bytes_out: self.0.bytes_out.load(Ordering::Relaxed),
+            rekeys_out: self.0.rekeys_out.load(Ordering::Relaxed),
+            rekeys_in: self.0.rekeys_in.load(Ordering::Relaxed),
         }
     }
 }
@@ -66,7 +105,8 @@ pub struct NoiseStream<S> {
     recv_nonce: u64,
     /// Plaintext accepted by `poll_write` but not yet sealed; `< MAX_PLAINTEXT`.
     pending: Vec<u8>,
-    /// One sealed frame (`header ‖ ciphertext`) waiting to reach `inner`.
+    /// Sealed frames (`header ‖ ciphertext`, at most one data frame plus one
+    /// rekey signal) waiting to reach `inner`.
     out: Vec<u8>,
     out_pos: usize,
     /// Incoming frame being assembled: `header ‖ ciphertext`.
@@ -82,6 +122,11 @@ pub struct NoiseStream<S> {
     plain_len: usize,
     poisoned: Option<io::ErrorKind>,
     stats: StatsHandle,
+    rekey: RekeyPolicy,
+    /// Plaintext sent under the current outgoing key.
+    bytes_since_rekey_out: u64,
+    /// When the current outgoing key came into use.
+    key_since: Instant,
 }
 
 impl<S> fmt::Debug for NoiseStream<S> {
@@ -89,6 +134,7 @@ impl<S> fmt::Debug for NoiseStream<S> {
         f.debug_struct("NoiseStream")
             .field("send_nonce", &self.send_nonce)
             .field("recv_nonce", &self.recv_nonce)
+            .field("rekey", &self.rekey)
             .field("pending", &self.pending.len())
             .field("out", &(self.out.len() - self.out_pos))
             .field("plain", &(self.plain_len - self.plain_pos))
@@ -106,7 +152,7 @@ impl<S> NoiseStream<S> {
             send_nonce: 0,
             recv_nonce: 0,
             pending: Vec::with_capacity(MAX_PLAINTEXT),
-            out: Vec::with_capacity(HEADER_LEN + NOISE_MAX_MESSAGE),
+            out: Vec::with_capacity(HEADER_LEN + NOISE_MAX_MESSAGE + REKEY_FRAME_LEN),
             out_pos: 0,
             frame: vec![0u8; HEADER_LEN + NOISE_MAX_MESSAGE],
             frame_len: 0,
@@ -116,7 +162,16 @@ impl<S> NoiseStream<S> {
             plain_len: 0,
             poisoned: None,
             stats: StatsHandle::default(),
+            rekey: RekeyPolicy::default(),
+            bytes_since_rekey_out: 0,
+            key_since: Instant::now(),
         }
+    }
+
+    /// Replace the outgoing rekey policy (default: `limits::REKEY_*`). The
+    /// current key's age still counts from when it came into use.
+    pub fn set_rekey_policy(&mut self, policy: RekeyPolicy) {
+        self.rekey = policy;
     }
 
     /// Plaintext byte counters so far.
@@ -149,35 +204,58 @@ impl<S> NoiseStream<S> {
         err
     }
 
-    /// Encrypt `pending` into `out`. Requires `out` to be empty.
-    fn seal_pending(&mut self) -> io::Result<()> {
-        debug_assert_eq!(self.out_pos, self.out.len());
-        let plain_len = self.pending.len();
-        let ct_len = plain_len + NOISE_TAG_LEN;
-        self.out.clear();
-        self.out_pos = 0;
-        self.out.resize(HEADER_LEN + ct_len, 0);
+    /// Seal `plain` as one frame appended to `out`, under the current key.
+    fn seal_frame(&mut self, plain: &[u8]) -> io::Result<()> {
+        let ct_len = plain.len() + NOISE_TAG_LEN;
+        let start = self.out.len();
+        self.out.resize(start + HEADER_LEN + ct_len, 0);
         let written = self
             .transport
-            .write_message(self.send_nonce, &self.pending, &mut self.out[HEADER_LEN..])
+            .write_message(self.send_nonce, plain, &mut self.out[start + HEADER_LEN..])
             .map_err(|e| io::Error::other(format!("noise encrypt: {e}")));
         let written = match written {
             Ok(n) => n,
             Err(e) => {
-                self.out.clear();
+                self.out.truncate(start);
                 return Err(self.poison(e));
             }
         };
         debug_assert_eq!(written, ct_len);
         #[allow(clippy::cast_possible_truncation)] // ct_len ≤ NOISE_MAX_MESSAGE ≤ u16::MAX
         let header = (ct_len as u16).to_be_bytes();
-        self.out[..HEADER_LEN].copy_from_slice(&header);
+        self.out[start..start + HEADER_LEN].copy_from_slice(&header);
         self.send_nonce += 1;
+        Ok(())
+    }
+
+    /// Encrypt `pending` into `out`, followed by a rekey signal when the
+    /// policy says the key is spent. Requires `out` to be empty and
+    /// `pending` non-empty: an empty data frame would be read as a rekey.
+    fn seal_pending(&mut self) -> io::Result<()> {
+        debug_assert_eq!(self.out_pos, self.out.len());
+        assert!(!self.pending.is_empty(), "sealing an empty data frame");
+        self.out.clear();
+        self.out_pos = 0;
+        let pending = std::mem::take(&mut self.pending);
+        let sealed = self.seal_frame(&pending);
+        self.pending = pending;
+        sealed?;
+        let plain_len = self.pending.len() as u64;
         self.pending.clear();
         self.stats
             .0
             .bytes_out
-            .fetch_add(plain_len as u64, Ordering::Relaxed);
+            .fetch_add(plain_len, Ordering::Relaxed);
+        self.bytes_since_rekey_out += plain_len;
+        if self.bytes_since_rekey_out >= self.rekey.bytes
+            || self.key_since.elapsed() >= self.rekey.interval
+        {
+            self.seal_frame(&[])?;
+            self.transport.rekey_outgoing();
+            self.bytes_since_rekey_out = 0;
+            self.key_since = Instant::now();
+            self.stats.0.rekeys_out.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -191,6 +269,13 @@ impl<S> NoiseStream<S> {
         self.frame_len = 0;
         self.frame_need = HEADER_LEN;
         match n {
+            Ok(0) => {
+                // Rekey signal: the peer's next message uses the derived key.
+                self.recv_nonce += 1;
+                self.transport.rekey_incoming();
+                self.stats.0.rekeys_in.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
             Ok(n) => {
                 self.recv_nonce += 1;
                 self.plain_pos = 0;
@@ -491,5 +576,90 @@ pub(crate) mod tests {
         let mut got = Vec::new();
         b.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"x");
+    }
+
+    /// Streams `data` from `w` to `r` in 32 KiB flushed writes while `r`
+    /// reads exactly that much; both run on the current task.
+    async fn pump(
+        w: &mut NoiseStream<tokio::io::DuplexStream>,
+        r: &mut NoiseStream<tokio::io::DuplexStream>,
+        data: &[u8],
+    ) {
+        let write = async {
+            for chunk in data.chunks(32 * 1024) {
+                w.write_all(chunk).await?;
+                w.flush().await?;
+            }
+            io::Result::Ok(())
+        };
+        let read = async {
+            let mut got = vec![0u8; data.len()];
+            r.read_exact(&mut got).await?;
+            io::Result::Ok(got)
+        };
+        let (sent, got) = tokio::join!(write, read);
+        sent.unwrap();
+        assert!(got.unwrap() == data, "pumped data differs");
+    }
+
+    #[tokio::test]
+    async fn rekey_by_bytes_both_directions() {
+        let (mut a, mut b) = stream_pair(8192);
+        let policy = RekeyPolicy {
+            bytes: 64 * 1024,
+            interval: Duration::from_secs(3600),
+        };
+        a.set_rekey_policy(policy);
+        b.set_rekey_policy(policy);
+        let data = pattern(1 << 20, 7);
+        pump(&mut a, &mut b, &data).await;
+        pump(&mut b, &mut a, &data).await;
+        // A trailing rekey signal is only consumed by the next read: ping
+        // both ways so every signal has been seen.
+        pump(&mut a, &mut b, b"ping").await;
+        pump(&mut b, &mut a, b"pong").await;
+        let (sa, sb) = (a.stats(), b.stats_handle().get());
+        assert!(sa.rekeys_out >= 15, "a rekeyed {} times", sa.rekeys_out);
+        assert!(sb.rekeys_out >= 15, "b rekeyed {} times", sb.rekeys_out);
+        assert_eq!(sb.rekeys_in, sa.rekeys_out);
+        assert_eq!(sa.rekeys_in, sb.rekeys_out);
+        assert_eq!(sa.bytes_out, (1 << 20) + 4);
+        assert_eq!(sb.bytes_in, (1 << 20) + 4);
+        // Nonces keep counting across rekeys and stay in step.
+        assert_eq!(a.send_nonce, b.recv_nonce);
+        assert_eq!(b.send_nonce, a.recv_nonce);
+    }
+
+    #[tokio::test]
+    async fn rekey_by_interval() {
+        let (mut a, mut b) = stream_pair(4096);
+        a.set_rekey_policy(RekeyPolicy {
+            bytes: u64::MAX,
+            interval: Duration::from_millis(50),
+        });
+        for byte in [b"a", b"b", b"c"] {
+            a.write_all(byte).await.unwrap();
+            a.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        a.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        b.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"abc");
+        assert!(a.stats().rekeys_out >= 1);
+        assert_eq!(b.stats().rekeys_in, a.stats().rekeys_out);
+        assert_eq!(b.stats().rekeys_out, 0);
+    }
+
+    #[tokio::test]
+    async fn zero_length_frame_is_invalid_data() {
+        let (_, tr) = transport_pair();
+        let (mut raw_a, raw_b) = tokio::io::duplex(64);
+        let mut b = NoiseStream::new(raw_b, tr);
+        raw_a.write_all(&[0, 0]).await.unwrap();
+        let mut buf = [0u8; 8];
+        let err = b.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(b.stats().rekeys_in, 0);
     }
 }

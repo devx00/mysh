@@ -131,8 +131,37 @@ remote static. An unauthorized client receives
 the connection is closed; the fingerprint is logged at `warn`. Authorization
 precedes every service: no stream is accepted from an unauthenticated peer.
 
-Per-key options (`command=`, `no-forward`, `from=`) are not in v1
-(06-roadmap.md).
+### Per-key options
+
+An `authorized_keys` line may start with the OpenSSH option prefix
+(comma-separated, values optionally double-quoted with `\"` escapes, names
+case-insensitive). Parsed by `mysh-net` into `trust::KeyOptions`; enforced
+by the server as a per-connection narrowing of its `Policy`:
+
+| option                | effect                                                                 |
+| --------------------- | ---------------------------------------------------------------------- |
+| `command="…"`         | forced command: every session runs it; the requested command is passed in `MYSH_ORIGINAL_COMMAND` |
+| `no-pty`              | PTY sessions denied for this key (`Feature::Pty`)                      |
+| `no-files`            | file streams denied (`Feature::Files`); mysh-specific                  |
+| `no-forward`          | local and remote forwarding denied; `no-port-forwarding` is an alias   |
+| `from="pat,…"`        | source-address filter, see below                                       |
+| `restrict`            | `no-pty,no-files,no-forward`; a later `pty`, `files` or `port-forwarding` re-enables one |
+
+Other OpenSSH options (`environment=`, `permitopen=`, `agent-forwarding`,
+…) are ignored with a `debug` log. A malformed option list (unterminated
+quote, `command`/`from` without a value) skips the whole line with a
+warning, so a typo never widens access.
+
+`from=` patterns are matched against the peer's IP address only — never a
+reverse-DNS name. A pattern is an exact address (`192.0.2.7`, `::1`,
+compared numerically), a CIDR block (`10.0.0.0/8`, `fd00::/8`; same address
+family only, no v4-mapped tricks), or a glob over the textual address (`*`,
+`?`; `192.168.1.*`). A leading `!` negates. OpenSSH semantics: if any
+negated pattern matches the connection is refused; otherwise at least one
+positive pattern must match. An empty list allows any source. The check
+runs in the authorization callback, so a refused source gets
+`Denied { Unauthorized }` exactly like an unknown key, and the pattern list
+is logged at `warn`.
 
 ## Server trust (client)
 
@@ -172,22 +201,40 @@ Does not protect against:
 - denial of service beyond basic limits (below);
 - traffic analysis (no padding; frame sizes reveal interactive typing).
 
-Limits and hardening in v1:
+Limits and hardening:
 
 - handshake must complete within 5 s; at most 64 concurrent handshakes per
   server, further connections are closed immediately;
+- per-address handshake rate limit: a token bucket per client IP with
+  capacity `--handshake-rate N` (default 10) refilled at `N` per minute,
+  checked on accept before the handshake; an over-limit socket is dropped
+  without a reply (the client sees EOF before the preamble) and logged at
+  `warn` at most once per 10 s per address. Buckets idle for 10 min are
+  forgotten. `--handshake-rate 0` disables the limiter;
+- idle timeout: a connection whose control stream carries nothing for
+  `--idle-timeout SECS` (default 120 s) is closed; the client's 30 s
+  keep-alive pings reset it;
 - Noise frames are capped at 65535 bytes by construction; control messages at
-  256 KiB; open streams at 512 per connection;
+  256 KiB; open streams at 512 per connection (yamux `max_num_streams`,
+  counting the control stream and every half-closed stream the local side
+  still holds). The cap is enforced on both ends: an opener that exceeds it
+  gets `TooManyStreams` and yamux closes that connection, so a client must
+  stay under it. Remote listeners are capped at 32 per connection
+  (`Rejected{Limit}`), sessions at 32;
+- per-key options narrow the policy for one connection (above): `no-pty`,
+  `no-files`, `no-forward`, `command=`, `from=`;
 - the PTY child's environment is built from scratch: `HOME`, `USER`,
   `LOGNAME`, `PATH`, `SHELL`, `MYSH_CONNECTION`, plus client-supplied
   `TERM`, `LANG`, `LC_*`, `COLORTERM`. Other client variables require
-  `--accept-env NAME` on the server;
+  `--accept-env NAME` on the server; `MYSH_*` names are always set by the
+  server (`MYSH_ORIGINAL_COMMAND` only under a forced command, and never
+  taken from the client);
 - feature switches on the server: `--deny pty|exec|files|forward-local|forward-remote`,
   repeatable;
 - secrets are `zeroize`d on drop; key files are written `0600`, config dir
   `0700`; the server refuses a private key file that is group/world readable;
 - logs contain fingerprints and addresses, never key bytes.
 
-Not in v1, tracked in 06-roadmap.md: rekeying within a session (ChaChaPoly
-nonce space is 2^64 messages; sessions are far shorter), per-IP handshake
-rate limiting, per-key options, post-quantum hybrid KEX.
+Rekeying within a session is in-band in the Noise layer (03-protocol.md
+§3): each direction rotates its key after 1 GiB or 1 h, whichever first.
+Not in v1, tracked in 06-roadmap.md: post-quantum hybrid KEX.

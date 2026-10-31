@@ -185,6 +185,24 @@ fn program_for(
     }
 }
 
+/// `command="…"` from the key's options (docs/02-security.md, "Per-key
+/// options"): `shell -c <forced>` regardless of what was requested.
+fn forced_program(shell: &Path, forced: &str) -> Program {
+    Program {
+        program: shell.to_path_buf(),
+        argv: vec![basename(shell).into(), "-c".into(), forced.into()],
+    }
+}
+
+/// `MYSH_ORIGINAL_COMMAND` for a forced command: the requested argv joined
+/// by spaces, empty for a `Shell` request.
+fn original_command(kind: &SessionKind) -> String {
+    match kind {
+        SessionKind::Shell => String::new(),
+        SessionKind::Exec { argv } => argv.join(" "),
+    }
+}
+
 /// Whether a client-supplied variable passes the allow-list: the built-in
 /// names, any `LC_*`, or a `--accept-env` entry (exact, or by prefix when
 /// the entry ends in `*`).
@@ -206,7 +224,8 @@ fn valid_env(name: &str, value: &str) -> bool {
 /// Child environment: allow-listed client variables, then the base set
 /// (`HOME`, `USER`, `LOGNAME`, `PATH`, `SHELL`, which a client may only
 /// override when `--accept-env` names them), then `TERM` from the pty
-/// request and the always-authoritative `MYSH_*` variables.
+/// request and the always-authoritative `MYSH_*` variables
+/// (`MYSH_ORIGINAL_COMMAND` only under a forced command).
 fn build_env(
     policy: &Policy,
     shell: &Path,
@@ -214,6 +233,7 @@ fn build_env(
     session: u32,
     client_env: &[(String, String)],
     term: Option<&str>,
+    original_command: Option<&str>,
 ) -> Vec<(OsString, OsString)> {
     let mut env: BTreeMap<String, String> = BTreeMap::new();
     for (name, value) in client_env {
@@ -236,6 +256,14 @@ fn build_env(
     }
     env.insert("MYSH_CONNECTION".to_owned(), connection.to_owned());
     env.insert("MYSH_SESSION".to_owned(), session.to_string());
+    match original_command {
+        Some(original) => {
+            env.insert("MYSH_ORIGINAL_COMMAND".to_owned(), original.to_owned());
+        }
+        None => {
+            env.remove("MYSH_ORIGINAL_COMMAND");
+        }
+    }
     env.into_iter()
         .map(|(k, v)| (OsString::from(k), OsString::from(v)))
         .collect()
@@ -347,16 +375,31 @@ pub async fn handle_session(mut stream: Stream, req: SessionRequest, ctx: ConnCt
 async fn run_session(mut stream: Stream, req: &SessionRequest, ctx: &ConnCtx, id: u32) {
     let policy = &*ctx.policy;
     let shell = login_shell(policy.shell.as_deref());
-    let program = match program_for(&req.kind, &shell, &policy.path) {
-        Ok(program) => program,
-        Err((code, message)) => {
-            files::send_error(&mut stream, code, &message).await;
-            return;
-        }
+    let program = match &policy.forced_command {
+        Some(forced) => forced_program(&shell, forced),
+        None => match program_for(&req.kind, &shell, &policy.path) {
+            Ok(program) => program,
+            Err((code, message)) => {
+                files::send_error(&mut stream, code, &message).await;
+                return;
+            }
+        },
     };
+    let original = policy
+        .forced_command
+        .as_ref()
+        .map(|_| original_command(&req.kind));
     let (cwd, cwd_fallback) = session_cwd(req.cwd.as_deref(), &policy.home);
     let term = req.pty.as_ref().map(|p| p.term.as_str());
-    let env = build_env(policy, &shell, &ctx.connection_env(), id, &req.env, term);
+    let env = build_env(
+        policy,
+        &shell,
+        &ctx.connection_env(),
+        id,
+        &req.env,
+        term,
+        original.as_deref(),
+    );
     let cmd = Command {
         program: program.program,
         argv: program.argv,
@@ -722,6 +765,11 @@ mod tests {
             home: PathBuf::from("/home/u"),
             user: "u".to_owned(),
             path: "/usr/bin:/bin".to_owned(),
+            forced_command: None,
+            handshakes_per_minute: 0,
+            idle_timeout: Duration::from_secs(120),
+            detach_grace: Duration::from_secs(600),
+            signature_auth: true,
         }
     }
 
@@ -776,6 +824,7 @@ mod tests {
             7,
             &client,
             Some("screen"),
+            None,
         );
         assert_eq!(env_value(&env, "HOME"), Some("/home/u"));
         assert_eq!(env_value(&env, "USER"), Some("u"));
@@ -796,10 +845,59 @@ mod tests {
         assert_eq!(env_value(&env, "BAD=NAME"), None);
 
         // Without a pty the client's TERM is used; with none at all, unset.
-        let env = build_env(&policy(), Path::new("/bin/sh"), "c", 1, &client, None);
+        let env = build_env(&policy(), Path::new("/bin/sh"), "c", 1, &client, None, None);
         assert_eq!(env_value(&env, "TERM"), Some("xterm-256color"));
-        let env = build_env(&policy(), Path::new("/bin/sh"), "c", 1, &[], None);
+        let env = build_env(&policy(), Path::new("/bin/sh"), "c", 1, &[], None, None);
         assert_eq!(env_value(&env, "TERM"), None);
+        assert_eq!(env_value(&env, "MYSH_ORIGINAL_COMMAND"), None);
+
+        // A forced command exposes the request; a client cannot smuggle
+        // its own value in even when the name is accepted.
+        let mut accepting = policy();
+        accepting.accept_env.push("MYSH_*".to_owned());
+        let smuggled = vec![("MYSH_ORIGINAL_COMMAND".to_owned(), "evil".to_owned())];
+        let env = build_env(
+            &accepting,
+            Path::new("/bin/sh"),
+            "c",
+            1,
+            &smuggled,
+            None,
+            Some("ls -l"),
+        );
+        assert_eq!(env_value(&env, "MYSH_ORIGINAL_COMMAND"), Some("ls -l"));
+        let env = build_env(
+            &accepting,
+            Path::new("/bin/sh"),
+            "c",
+            1,
+            &smuggled,
+            None,
+            None,
+        );
+        assert_eq!(env_value(&env, "MYSH_ORIGINAL_COMMAND"), None);
+    }
+
+    #[test]
+    fn forced_command_replaces_request() {
+        let shell = Path::new("/bin/zsh");
+        let p = forced_program(shell, "echo forced $MYSH_ORIGINAL_COMMAND");
+        assert_eq!(p.program, PathBuf::from("/bin/zsh"));
+        assert_eq!(
+            p.argv,
+            vec![
+                OsString::from("zsh"),
+                OsString::from("-c"),
+                OsString::from("echo forced $MYSH_ORIGINAL_COMMAND")
+            ]
+        );
+        assert_eq!(original_command(&SessionKind::Shell), "");
+        assert_eq!(
+            original_command(&SessionKind::Exec {
+                argv: vec!["ls".to_owned(), "-l".to_owned(), "a b".to_owned()],
+            }),
+            "ls -l a b"
+        );
     }
 
     #[test]

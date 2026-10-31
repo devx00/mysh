@@ -1,17 +1,11 @@
-//! The meta prompt (docs/05-meta-shell.md): a small built-in line editor fed
-//! by the stdin reader task, the command dispatcher shared with the
-//! scripted frontend (`mysh HOST < script`), and prompt history.
-//!
-//! The editor is deliberately tiny: the terminal is in raw mode for the
-//! whole run and one task owns stdin, so a readline crate would have to be
-//! driven byte by byte anyway. Every keystroke redraws the line
-//! (`\r`, clear to end of line, prompt, buffer, cursor move), which is
-//! correct for lines shorter than the terminal width and good enough here.
+//! The meta prompt (docs/05-meta-shell.md): the prompt loop driving the
+//! line editor (`client::editor`) from the stdin reader task, the command
+//! dispatcher shared with the scripted frontend (`mysh HOST < script`), and
+//! the session request helpers.
 
 use std::{
     fmt::Write as _,
     fs,
-    io::Write as _,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -30,6 +24,7 @@ use crate::{
     client::{
         conn::Connection,
         console::{Console, human},
+        editor::{Edit, LineEditor, format_columns},
         files,
         forward::{ForwardInfo, ForwardKind, Forwards},
         session::{Event, Stack},
@@ -38,8 +33,7 @@ use crate::{
     config::{ForwardSpec, Target, decode_send_text, expand_tilde},
 };
 
-/// Lines kept in the history file.
-pub const HISTORY_CAP: usize = 1000;
+pub use crate::client::editor::{HISTORY_CAP, History};
 
 /// Why the prompt returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,397 +78,6 @@ impl std::fmt::Debug for Ctx {
             .field("local_cwd", &self.local_cwd)
             .field("auto_exit", &self.auto_exit)
             .finish_non_exhaustive()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// History
-
-/// Prompt history, persisted to `paths.history`.
-#[derive(Debug)]
-pub struct History {
-    path: Option<PathBuf>,
-    entries: Vec<String>,
-    /// Entries added this run (appended on save).
-    added: usize,
-}
-
-impl History {
-    /// Load the last [`HISTORY_CAP`] lines; a missing file is empty history.
-    pub fn load(path: &Path) -> Self {
-        let text = fs::read_to_string(path).unwrap_or_default();
-        Self {
-            path: Some(path.to_path_buf()),
-            entries: trim_history(text.lines().map(str::to_owned).collect()),
-            added: 0,
-        }
-    }
-
-    /// In-memory only (tests, scripted mode).
-    pub fn empty() -> Self {
-        Self {
-            path: None,
-            entries: Vec::new(),
-            added: 0,
-        }
-    }
-
-    pub fn entries(&self) -> &[String] {
-        &self.entries
-    }
-
-    /// Remember `line` unless blank or identical to the previous entry.
-    pub fn push(&mut self, line: &str) {
-        let line = line.trim();
-        if line.is_empty() || self.entries.last().is_some_and(|l| l == line) {
-            return;
-        }
-        self.entries.push(line.to_owned());
-        self.added += 1;
-    }
-
-    /// Append this run's lines, then trim the file to [`HISTORY_CAP`].
-    /// Creates the parent directory `0700`.
-    pub fn save(&self) -> std::io::Result<()> {
-        let Some(path) = &self.path else {
-            return Ok(());
-        };
-        if self.added == 0 {
-            return Ok(());
-        }
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            create_private_dir(dir)?;
-        }
-        let existing = fs::read_to_string(path).unwrap_or_default();
-        let mut all: Vec<String> = existing.lines().map(str::to_owned).collect();
-        all.extend(
-            self.entries[self.entries.len() - self.added..]
-                .iter()
-                .cloned(),
-        );
-        let all = trim_history(all);
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
-        }
-        for line in &all {
-            writeln!(file, "{line}")?;
-        }
-        Ok(())
-    }
-}
-
-fn trim_history(mut lines: Vec<String>) -> Vec<String> {
-    lines.retain(|l| !l.trim().is_empty());
-    if lines.len() > HISTORY_CAP {
-        lines.drain(..lines.len() - HISTORY_CAP);
-    }
-    lines
-}
-
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    if dir.is_dir() {
-        return Ok(());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-    }
-    #[cfg(not(unix))]
-    {
-        fs::create_dir_all(dir)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Line editor
-
-/// What a batch of keystrokes produced besides edits to the buffer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Edit {
-    /// Enter: the finished line.
-    Line(String),
-    /// `Ctrl-C`: the line was cleared.
-    Cancel,
-    /// `Ctrl-D` on an empty line.
-    Eof,
-    /// `Ctrl-Z`.
-    Suspend,
-    /// `Ctrl-L`.
-    ClearScreen,
-}
-
-/// A decoded key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Key {
-    Char(char),
-    Ctrl(u8),
-    Enter,
-    Backspace,
-    Delete,
-    Left,
-    Right,
-    Home,
-    End,
-    Up,
-    Down,
-}
-
-/// Minimal readline: one line, cursor, history navigation.
-#[derive(Debug)]
-pub struct LineEditor {
-    prompt: String,
-    buf: Vec<char>,
-    cursor: usize,
-    history: Vec<String>,
-    /// Index into `history` while browsing; `None` = editing a new line.
-    hist_pos: Option<usize>,
-    /// The new line stashed while browsing history.
-    stash: Vec<char>,
-    esc: Vec<u8>,
-    utf8: Vec<u8>,
-}
-
-impl LineEditor {
-    pub fn new(prompt: &str, history: Vec<String>) -> Self {
-        Self {
-            prompt: prompt.to_owned(),
-            buf: Vec::new(),
-            cursor: 0,
-            history,
-            hist_pos: None,
-            stash: Vec::new(),
-            esc: Vec::new(),
-            utf8: Vec::new(),
-        }
-    }
-
-    pub fn line(&self) -> String {
-        self.buf.iter().collect()
-    }
-
-    pub fn cursor(&self) -> usize {
-        self.cursor
-    }
-
-    pub fn push_history(&mut self, line: &str) {
-        if !line.trim().is_empty() && self.history.last().is_none_or(|l| l != line) {
-            self.history.push(line.to_owned());
-        }
-    }
-
-    /// Terminal bytes that redraw the prompt and line with the cursor placed.
-    pub fn render(&self) -> String {
-        let mut out = String::with_capacity(self.prompt.len() + self.buf.len() + 16);
-        out.push_str("\r\x1b[K");
-        out.push_str(&self.prompt);
-        out.extend(self.buf.iter());
-        let back = self.buf.len() - self.cursor;
-        if back > 0 {
-            let _ = write!(out, "\x1b[{back}D");
-        }
-        out
-    }
-
-    /// Decode `bytes` (possibly a partial escape or UTF-8 sequence) and apply
-    /// the keys; returns the non-edit results in order.
-    pub fn feed(&mut self, bytes: &[u8]) -> Vec<Edit> {
-        let mut out = Vec::new();
-        for &b in bytes {
-            if let Some(key) = self.decode(b)
-                && let Some(edit) = self.apply(key)
-            {
-                out.push(edit);
-            }
-        }
-        out
-    }
-
-    fn decode(&mut self, b: u8) -> Option<Key> {
-        if !self.esc.is_empty() {
-            return self.decode_escape(b);
-        }
-        if !self.utf8.is_empty() || b >= 0x80 {
-            self.utf8.push(b);
-            return match std::str::from_utf8(&self.utf8) {
-                Ok(s) => {
-                    let c = s.chars().next();
-                    self.utf8.clear();
-                    c.map(Key::Char)
-                }
-                Err(e) if e.error_len().is_none() && self.utf8.len() < 4 => None,
-                Err(_) => {
-                    self.utf8.clear();
-                    None
-                }
-            };
-        }
-        Some(match b {
-            0x1b => {
-                self.esc.push(b);
-                return None;
-            }
-            b'\r' | b'\n' => Key::Enter,
-            0x7f | 0x08 => Key::Backspace,
-            0x01..=0x1a => Key::Ctrl(b + 0x40),
-            0x20..=0x7e => Key::Char(char::from(b)),
-            _ => return None,
-        })
-    }
-
-    fn decode_escape(&mut self, b: u8) -> Option<Key> {
-        match self.esc.as_slice() {
-            [0x1b] => {
-                if b == b'[' || b == b'O' {
-                    self.esc.push(b);
-                } else {
-                    // Alt+key or a bare ESC: ignored.
-                    self.esc.clear();
-                }
-                None
-            }
-            [0x1b, b'O'] => {
-                self.esc.clear();
-                match b {
-                    b'A' => Some(Key::Up),
-                    b'B' => Some(Key::Down),
-                    b'C' => Some(Key::Right),
-                    b'D' => Some(Key::Left),
-                    b'H' => Some(Key::Home),
-                    b'F' => Some(Key::End),
-                    _ => None,
-                }
-            }
-            _ => {
-                // CSI: parameters until a final byte in 0x40..=0x7e.
-                if (0x40..=0x7e).contains(&b) {
-                    let params: String = self.esc[2..].iter().map(|&p| char::from(p)).collect();
-                    self.esc.clear();
-                    match b {
-                        b'A' => Some(Key::Up),
-                        b'B' => Some(Key::Down),
-                        b'C' => Some(Key::Right),
-                        b'D' => Some(Key::Left),
-                        b'H' => Some(Key::Home),
-                        b'F' => Some(Key::End),
-                        b'~' => match params.as_str() {
-                            "1" | "7" => Some(Key::Home),
-                            "4" | "8" => Some(Key::End),
-                            "3" => Some(Key::Delete),
-                            _ => None,
-                        },
-                        _ => None,
-                    }
-                } else {
-                    self.esc.push(b);
-                    if self.esc.len() > 16 {
-                        self.esc.clear();
-                    }
-                    None
-                }
-            }
-        }
-    }
-
-    fn apply(&mut self, key: Key) -> Option<Edit> {
-        match key {
-            Key::Char(c) => {
-                self.buf.insert(self.cursor, c);
-                self.cursor += 1;
-            }
-            Key::Enter => {
-                let line = self.line();
-                self.buf.clear();
-                self.cursor = 0;
-                self.hist_pos = None;
-                self.stash.clear();
-                return Some(Edit::Line(line));
-            }
-            Key::Backspace | Key::Ctrl(b'H') => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                    self.buf.remove(self.cursor);
-                }
-            }
-            Key::Delete => {
-                if self.cursor < self.buf.len() {
-                    self.buf.remove(self.cursor);
-                }
-            }
-            Key::Left | Key::Ctrl(b'B') => self.cursor = self.cursor.saturating_sub(1),
-            Key::Right | Key::Ctrl(b'F') => self.cursor = (self.cursor + 1).min(self.buf.len()),
-            Key::Home | Key::Ctrl(b'A') => self.cursor = 0,
-            Key::End | Key::Ctrl(b'E') => self.cursor = self.buf.len(),
-            Key::Up | Key::Ctrl(b'P') => self.history_move(-1),
-            Key::Down | Key::Ctrl(b'N') => self.history_move(1),
-            Key::Ctrl(b'U') => {
-                self.buf.drain(..self.cursor);
-                self.cursor = 0;
-            }
-            Key::Ctrl(b'K') => self.buf.truncate(self.cursor),
-            Key::Ctrl(b'W') => {
-                let mut start = self.cursor;
-                while start > 0 && self.buf[start - 1] == ' ' {
-                    start -= 1;
-                }
-                while start > 0 && self.buf[start - 1] != ' ' {
-                    start -= 1;
-                }
-                self.buf.drain(start..self.cursor);
-                self.cursor = start;
-            }
-            Key::Ctrl(b'D') => {
-                if self.buf.is_empty() {
-                    return Some(Edit::Eof);
-                }
-                if self.cursor < self.buf.len() {
-                    self.buf.remove(self.cursor);
-                }
-            }
-            Key::Ctrl(b'C') => {
-                self.buf.clear();
-                self.cursor = 0;
-                self.hist_pos = None;
-                return Some(Edit::Cancel);
-            }
-            Key::Ctrl(b'L') => return Some(Edit::ClearScreen),
-            Key::Ctrl(b'Z') => return Some(Edit::Suspend),
-            Key::Ctrl(_) => {}
-        }
-        None
-    }
-
-    fn history_move(&mut self, delta: i32) {
-        if self.history.is_empty() {
-            return;
-        }
-        let next = match (self.hist_pos, delta) {
-            (None, d) if d < 0 => Some(self.history.len() - 1),
-            (None, _) => return,
-            (Some(0), d) if d < 0 => return,
-            (Some(i), d) if d < 0 => Some(i - 1),
-            (Some(i), _) if i + 1 >= self.history.len() => None,
-            (Some(i), _) => Some(i + 1),
-        };
-        if self.hist_pos.is_none() {
-            self.stash = self.buf.clone();
-        }
-        self.hist_pos = next;
-        self.buf = match next {
-            Some(i) => self.history[i].chars().collect(),
-            None => self.stash.clone(),
-        };
-        self.cursor = self.buf.len();
     }
 }
 
@@ -1070,7 +673,12 @@ fn draw(console: &Console, editor: &LineEditor, render: &Arc<Mutex<String>>) {
 /// leave. The terminal must be interactive.
 pub async fn run_prompt(ctx: &mut Ctx, term: &mut Terminal) -> Outcome {
     let prompt = format!("mysh {}> ", ctx.conn.target().display);
-    let mut editor = LineEditor::new(&prompt, ctx.history.entries().to_vec());
+    let mut editor = LineEditor::new(
+        &prompt,
+        ctx.history.entries().to_vec(),
+        ctx.home.clone(),
+        ctx.local_cwd.clone(),
+    );
     let render = Arc::new(Mutex::new(String::new()));
     install_hook(&ctx.console, &render);
     draw(&ctx.console, &editor, &render);
@@ -1107,6 +715,7 @@ async fn prompt_loop(
                             ctx.history.push(&line);
                             editor.push_history(&line);
                             let flow = handle_line(ctx, &line, term).await;
+                            editor.set_cwd(ctx.local_cwd.clone());
                             install_hook(&ctx.console, render);
                             match flow {
                                 Flow::Continue => {}
@@ -1134,6 +743,11 @@ async fn prompt_loop(
                             term.suspend();
                         }
                         Edit::ClearScreen => ctx.console.print("\x1b[H\x1b[2J"),
+                        Edit::ShowCandidates(items) => {
+                            ctx.console.print("\r\n");
+                            ctx.console
+                                .print(&format_columns(&items, usize::from(term.winsize().cols)));
+                        }
                     }
                 }
                 draw(&ctx.console, editor, render);
@@ -1240,135 +854,6 @@ pub async fn run_script(ctx: &mut Ctx) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn editor() -> LineEditor {
-        LineEditor::new("p> ", vec!["first".to_owned(), "second".to_owned()])
-    }
-
-    #[test]
-    fn insert_and_enter() {
-        let mut e = editor();
-        assert_eq!(e.feed(b"hel").len(), 0);
-        assert_eq!(e.line(), "hel");
-        assert_eq!(e.feed(b"lo\r"), vec![Edit::Line("hello".to_owned())]);
-        assert_eq!(e.line(), "");
-        assert_eq!(e.cursor(), 0);
-    }
-
-    #[test]
-    fn backspace_and_cursor_moves() {
-        let mut e = editor();
-        e.feed(b"abcd");
-        e.feed(b"\x7f");
-        assert_eq!(e.line(), "abc");
-        e.feed(b"\x1b[D\x1b[D"); // left twice
-        assert_eq!(e.cursor(), 1);
-        e.feed(b"X");
-        assert_eq!(e.line(), "aXbc");
-        e.feed(b"\x01"); // Ctrl-A
-        assert_eq!(e.cursor(), 0);
-        e.feed(b"\x05"); // Ctrl-E
-        assert_eq!(e.cursor(), 4);
-        e.feed(b"\x1b[H");
-        assert_eq!(e.cursor(), 0);
-        e.feed(b"\x1b[3~"); // Delete
-        assert_eq!(e.line(), "Xbc");
-        e.feed(b"\x1bOF"); // End
-        assert_eq!(e.cursor(), 3);
-    }
-
-    #[test]
-    fn kill_keys() {
-        let mut e = editor();
-        e.feed(b"one two three");
-        e.feed(b"\x17"); // Ctrl-W
-        assert_eq!(e.line(), "one two ");
-        e.feed(b"\x1b[D\x1b[D");
-        e.feed(b"\x0b"); // Ctrl-K
-        assert_eq!(e.line(), "one tw");
-        e.feed(b"\x15"); // Ctrl-U
-        assert_eq!(e.line(), "");
-        assert_eq!(e.cursor(), 0);
-    }
-
-    #[test]
-    fn history_navigation() {
-        let mut e = editor();
-        e.feed(b"new");
-        e.feed(b"\x1b[A");
-        assert_eq!(e.line(), "second");
-        e.feed(b"\x1b[A");
-        assert_eq!(e.line(), "first");
-        e.feed(b"\x1b[A");
-        assert_eq!(e.line(), "first");
-        e.feed(b"\x1b[B\x1b[B");
-        assert_eq!(e.line(), "new");
-        e.push_history("new");
-        e.push_history("new");
-        assert_eq!(e.history.len(), 3);
-    }
-
-    #[test]
-    fn control_edits() {
-        let mut e = editor();
-        assert_eq!(e.feed(b"\x04"), vec![Edit::Eof]);
-        e.feed(b"abc");
-        assert_eq!(e.feed(b"\x03"), vec![Edit::Cancel]);
-        assert_eq!(e.line(), "");
-        assert_eq!(e.feed(b"\x0c"), vec![Edit::ClearScreen]);
-        assert_eq!(e.feed(b"\x1a"), vec![Edit::Suspend]);
-    }
-
-    #[test]
-    fn split_escape_and_utf8() {
-        let mut e = editor();
-        e.feed(b"ab");
-        e.feed(b"\x1b");
-        e.feed(b"[");
-        e.feed(b"D");
-        assert_eq!(e.cursor(), 1);
-        let euro = "€".as_bytes();
-        e.feed(&euro[..1]);
-        e.feed(&euro[1..]);
-        assert_eq!(e.line(), "a€b");
-    }
-
-    #[test]
-    fn render_places_cursor() {
-        let mut e = editor();
-        e.feed(b"abc\x1b[D");
-        assert_eq!(e.render(), "\r\x1b[Kp> abc\x1b[1D");
-        e.feed(b"\x05");
-        assert_eq!(e.render(), "\r\x1b[Kp> abc");
-    }
-
-    #[test]
-    fn history_push_and_trim() {
-        let mut h = History::empty();
-        h.push("a");
-        h.push("a");
-        h.push("  ");
-        h.push("b");
-        assert_eq!(h.entries(), ["a", "b"]);
-        let many: Vec<String> = (0..HISTORY_CAP + 5).map(|i| i.to_string()).collect();
-        let trimmed = trim_history(many);
-        assert_eq!(trimmed.len(), HISTORY_CAP);
-        assert_eq!(trimmed[0], "5");
-    }
-
-    #[test]
-    fn history_save_round_trip() {
-        let dir = std::env::temp_dir().join(format!("mysh-hist-{}", std::process::id()));
-        let path = dir.join("history");
-        let mut h = History::load(&path);
-        assert_eq!(h.entries().len(), 0);
-        h.push("ls -l");
-        h.push("exit");
-        h.save().expect("save history");
-        let again = History::load(&path);
-        assert_eq!(again.entries(), ["ls -l", "exit"]);
-        let _ = fs::remove_dir_all(&dir);
-    }
 
     #[test]
     fn kind_labels() {

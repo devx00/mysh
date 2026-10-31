@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::io::Write as _;
+use std::net::IpAddr;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -15,8 +16,8 @@ use base64::engine::general_purpose::STANDARD_PAD_INDIFFERENT;
 use hmac::Mac as _;
 
 use crate::keys::{
-    Fingerprint, KeyError, PUBLIC_KEY_TYPE, PublicKey, SSH_ED25519_TYPE, open_append_private,
-    parse_public_key,
+    Fingerprint, KeyError, PUBLIC_KEY_TYPE, PublicKey, SSH_ED25519_TYPE, decode_ssh_ed25519_blob,
+    open_append_private, parse_public_key,
 };
 
 /// Key type tokens accepted in trust stores.
@@ -110,6 +111,188 @@ fn append_line_to(path: &Path, line: &str) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 // authorized_keys
 
+/// Per-key restrictions from the option prefix of an `authorized_keys`
+/// line (`docs/02-security.md`, "Authorization").
+///
+/// Recognised: `command="…"`, `no-pty`, `no-files`, `no-forward` (alias
+/// `no-port-forwarding`), `from="pat,…"`, `restrict` (= the three `no-*`
+/// flags; a later `pty`, `files` or `port-forwarding` re-enables one, as in
+/// OpenSSH). Anything else is ignored with a `debug` log. Option names are
+/// case-insensitive.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeyOptions {
+    /// Forced command; the requested command is exposed to it by the server.
+    pub command: Option<String>,
+    pub no_pty: bool,
+    pub no_files: bool,
+    pub no_forward: bool,
+    /// Source patterns (`from=`), negations kept with their leading `!`.
+    /// Empty = any source.
+    pub from: Vec<String>,
+}
+
+/// Why an option prefix was rejected (the whole line is then skipped).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OptionsError {
+    UnterminatedQuote,
+    MissingValue(String),
+}
+
+impl std::fmt::Display for OptionsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnterminatedQuote => f.write_str("unterminated quoted option value"),
+            Self::MissingValue(name) => write!(f, "option `{name}` requires a value"),
+        }
+    }
+}
+
+impl KeyOptions {
+    /// Whether a client connecting from `ip` passes the `from=` patterns:
+    /// true when there are none; otherwise no negated pattern may match and
+    /// at least one positive pattern must.
+    pub fn allows_source(&self, ip: IpAddr) -> bool {
+        if self.from.is_empty() {
+            return true;
+        }
+        let text = ip.to_string();
+        let mut positive = false;
+        for pattern in &self.from {
+            let (negated, pattern) = match pattern.strip_prefix('!') {
+                Some(rest) => (true, rest),
+                None => (false, pattern.as_str()),
+            };
+            if source_matches(pattern, ip, &text) {
+                if negated {
+                    return false;
+                }
+                positive = true;
+            }
+        }
+        positive
+    }
+
+    /// Parses one comma-separated option list (the text before the key
+    /// type). Values may be double-quoted with `\"` escapes.
+    fn parse_list(&mut self, list: &str) -> Result<(), OptionsError> {
+        let mut rest = list;
+        loop {
+            rest = rest.trim_start_matches([',', ' ', '\t']);
+            if rest.is_empty() {
+                return Ok(());
+            }
+            let name_len = rest.find([',', '=']).unwrap_or(rest.len());
+            let name = &rest[..name_len];
+            rest = &rest[name_len..];
+            let value = if let Some(after_eq) = rest.strip_prefix('=') {
+                let (value, tail) = take_option_value(after_eq)?;
+                rest = tail;
+                Some(value)
+            } else {
+                None
+            };
+            self.apply(name, value)?;
+        }
+    }
+
+    fn apply(&mut self, name: &str, value: Option<String>) -> Result<(), OptionsError> {
+        let lower = name.to_ascii_lowercase();
+        let need_value =
+            |value: Option<String>| value.ok_or_else(|| OptionsError::MissingValue(lower.clone()));
+        match lower.as_str() {
+            "command" => self.command = Some(need_value(value)?),
+            "from" => {
+                let value = need_value(value)?;
+                for pattern in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    let bare = pattern.strip_prefix('!').unwrap_or(pattern);
+                    if bare.contains('/') && parse_cidr(bare).is_none() {
+                        tracing::warn!(pattern, "authorized_keys: malformed CIDR in from=");
+                    }
+                    self.from.push(pattern.to_owned());
+                }
+            }
+            "no-pty" => self.no_pty = true,
+            "no-files" => self.no_files = true,
+            "no-forward" | "no-port-forwarding" => self.no_forward = true,
+            "restrict" => {
+                self.no_pty = true;
+                self.no_files = true;
+                self.no_forward = true;
+            }
+            "pty" => self.no_pty = false,
+            "files" => self.no_files = false,
+            "port-forwarding" => self.no_forward = false,
+            _ => tracing::debug!(option = name, "authorized_keys: ignoring unknown option"),
+        }
+        Ok(())
+    }
+}
+
+/// Reads an option value starting right after `=`: a double-quoted string
+/// (only `\"` is unescaped, as in OpenSSH) or a bare run up to the next
+/// comma. Returns the value and the remaining text.
+fn take_option_value(s: &str) -> Result<(String, &str), OptionsError> {
+    let Some(quoted) = s.strip_prefix('"') else {
+        let end = s.find(',').unwrap_or(s.len());
+        return Ok((s[..end].to_owned(), &s[end..]));
+    };
+    let mut value = String::new();
+    let mut chars = quoted.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => return Ok((value, &quoted[i + 1..])),
+            '\\' => match chars.next() {
+                Some((_, '"')) => value.push('"'),
+                Some((_, other)) => {
+                    value.push('\\');
+                    value.push(other);
+                }
+                None => break,
+            },
+            other => value.push(other),
+        }
+    }
+    Err(OptionsError::UnterminatedQuote)
+}
+
+/// Parses `addr/prefix` into the network address bits, the prefix length
+/// and the address width.
+fn parse_cidr(s: &str) -> Option<(u128, u32, u32)> {
+    let (addr, bits) = s.split_once('/')?;
+    let bits: u32 = bits.parse().ok()?;
+    let (value, width) = match addr.parse::<IpAddr>().ok()? {
+        IpAddr::V4(v4) => (u128::from(u32::from(v4)), 32),
+        IpAddr::V6(v6) => (u128::from(v6), 128),
+    };
+    (bits <= width).then_some((value, bits, width))
+}
+
+/// One `from=` pattern against a source address: an exact address, a CIDR
+/// block (same family only) or a glob over the textual address.
+fn source_matches(pattern: &str, ip: IpAddr, text: &str) -> bool {
+    if let Ok(exact) = pattern.parse::<IpAddr>() {
+        return exact == ip;
+    }
+    if pattern.contains('/') {
+        let Some((net, bits, width)) = parse_cidr(pattern) else {
+            return false;
+        };
+        let (value, ip_width) = match ip {
+            IpAddr::V4(v4) => (u128::from(u32::from(v4)), 32),
+            IpAddr::V6(v6) => (u128::from(v6), 128),
+        };
+        if width != ip_width {
+            return false;
+        }
+        if bits == 0 {
+            return true;
+        }
+        let shift = width - bits;
+        return net >> shift == value >> shift;
+    }
+    glob_match(&pattern.to_ascii_lowercase(), text)
+}
+
 /// One trusted client key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -119,6 +302,11 @@ pub struct Entry {
     pub source: String,
     /// 1-based line number within `source`.
     pub line: usize,
+    /// Restrictions from the line's option prefix.
+    pub options: KeyOptions,
+    /// Raw Ed25519 public key when the line was `ssh-ed25519` (for
+    /// signature authentication); `None` for native `mysh-x25519` lines.
+    pub ed25519: Option<[u8; 32]>,
 }
 
 /// The set of trusted client public keys.
@@ -133,9 +321,9 @@ impl AuthorizedKeys {
     }
 
     /// Parses `authorized_keys` text. Blank and `#` lines are skipped;
-    /// OpenSSH option prefixes before the key type are tolerated and
-    /// ignored; unknown key types and malformed lines are skipped with a
-    /// warning.
+    /// OpenSSH option prefixes before the key type are parsed into
+    /// [`KeyOptions`]; unknown key types, malformed options and malformed
+    /// lines are skipped with a warning.
     pub fn parse(text: &str, source: &str) -> Self {
         let mut entries = Vec::new();
         for (line_no, line) in content_lines(text) {
@@ -153,14 +341,33 @@ impl AuthorizedKeys {
                 );
                 continue;
             };
+            let mut options = KeyOptions::default();
+            if let Err(e) = tokens[..pos]
+                .iter()
+                .try_for_each(|list| options.parse_list(list))
+            {
+                tracing::warn!(source, line = line_no, error = %e, "authorized_keys: skipping entry with malformed options");
+                continue;
+            }
             let key_part = tokens[pos..].join(" ");
             match parse_public_key(&key_part) {
-                Ok((key, comment)) => entries.push(Entry {
-                    key,
-                    comment,
-                    source: source.to_owned(),
-                    line: line_no,
-                }),
+                Ok((key, comment)) => {
+                    let ed25519 = (tokens[pos] == SSH_ED25519_TYPE)
+                        .then(|| {
+                            tokens
+                                .get(pos + 1)
+                                .and_then(|b64| decode_ssh_ed25519_blob(b64).ok())
+                        })
+                        .flatten();
+                    entries.push(Entry {
+                        key,
+                        comment,
+                        source: source.to_owned(),
+                        line: line_no,
+                        options,
+                        ed25519,
+                    });
+                }
                 Err(e) => {
                     tracing::warn!(source, line = line_no, error = %e, "authorized_keys: skipping malformed entry");
                 }
@@ -181,6 +388,11 @@ impl AuthorizedKeys {
 
     pub fn find(&self, key: &PublicKey) -> Option<&Entry> {
         self.entries.iter().find(|e| e.key == *key)
+    }
+
+    /// The entry whose line carried this raw Ed25519 public key, if any.
+    pub fn find_ed25519(&self, pk: &[u8; 32]) -> Option<&Entry> {
+        self.entries.iter().find(|e| e.ed25519.as_ref() == Some(pk))
     }
 
     pub fn extend(&mut self, other: Self) {
@@ -633,6 +845,24 @@ mod tests {
         let e3 = ak.find(&k3).expect("k3");
         assert_eq!(e3.comment.as_deref(), Some("ssh user"));
         assert_eq!(e3.line, 5);
+        assert_eq!(
+            e3.options,
+            KeyOptions {
+                command: Some("echo ssh-ed25519 no".to_owned()),
+                no_pty: true,
+                from: vec!["*.example".to_owned()],
+                ..KeyOptions::default()
+            }
+        );
+        let ed = e3.ed25519.expect("ssh-ed25519 line keeps the raw key");
+        assert_eq!(
+            crate::keys::ed25519_pk_to_x25519(&ed).expect("point"),
+            *k3.as_bytes()
+        );
+        assert!(std::ptr::eq(ak.find_ed25519(&ed).expect("by ed25519"), e3));
+        assert!(ak.find_ed25519(&[0u8; 32]).is_none());
+        assert_eq!(e1.ed25519, None);
+        assert_eq!(e1.options, KeyOptions::default());
         assert_eq!(ak.iter().count(), 3);
 
         let mut all = AuthorizedKeys::new();
@@ -641,6 +871,203 @@ mod tests {
         all.extend(AuthorizedKeys::parse(&key(4).to_line(None), "other"));
         assert_eq!(all.len(), 4);
         assert_eq!(all.find(&key(4)).expect("k4").source, "other");
+    }
+
+    fn options_of(prefix: &str) -> KeyOptions {
+        let text = format!("{prefix} {}", key(7).to_line(None));
+        let ak = AuthorizedKeys::parse(&text, "opts");
+        ak.find(&key(7)).expect("entry parsed").options.clone()
+    }
+
+    #[test]
+    fn key_options_each_option_parses() {
+        assert_eq!(
+            options_of("no-pty"),
+            KeyOptions {
+                no_pty: true,
+                ..KeyOptions::default()
+            }
+        );
+        assert_eq!(
+            options_of("no-files"),
+            KeyOptions {
+                no_files: true,
+                ..KeyOptions::default()
+            }
+        );
+        assert_eq!(
+            options_of("no-forward"),
+            KeyOptions {
+                no_forward: true,
+                ..KeyOptions::default()
+            }
+        );
+        assert_eq!(
+            options_of("No-Port-Forwarding"),
+            KeyOptions {
+                no_forward: true,
+                ..KeyOptions::default()
+            }
+        );
+        assert_eq!(
+            options_of(r#"command="uptime""#),
+            KeyOptions {
+                command: Some("uptime".to_owned()),
+                ..KeyOptions::default()
+            }
+        );
+        assert_eq!(
+            options_of(r#"from="10.0.0.0/8,!10.1.2.3""#),
+            KeyOptions {
+                from: vec!["10.0.0.0/8".to_owned(), "!10.1.2.3".to_owned()],
+                ..KeyOptions::default()
+            }
+        );
+        assert_eq!(
+            options_of("restrict"),
+            KeyOptions {
+                no_pty: true,
+                no_files: true,
+                no_forward: true,
+                ..KeyOptions::default()
+            }
+        );
+        assert_eq!(
+            options_of("restrict,pty,port-forwarding"),
+            KeyOptions {
+                no_files: true,
+                ..KeyOptions::default()
+            }
+        );
+        // Combined, with spaces after commas and a trailing comma.
+        assert_eq!(
+            options_of(r#"no-pty,command="ls -l", no-files,"#),
+            KeyOptions {
+                command: Some("ls -l".to_owned()),
+                no_pty: true,
+                no_files: true,
+                ..KeyOptions::default()
+            }
+        );
+    }
+
+    #[test]
+    fn key_options_quoting() {
+        assert_eq!(
+            options_of(r#"command="echo \"hi, there\" a\\b",no-pty"#).command,
+            Some(r#"echo "hi, there" a\\b"#.to_owned())
+        );
+        assert_eq!(
+            options_of("command=bare,no-pty").command,
+            Some("bare".to_owned())
+        );
+        // Unterminated quote: no key type is found, the line is skipped.
+        let text = format!(r#"command="oops {}"#, key(7).to_line(None));
+        assert!(AuthorizedKeys::parse(&text, "opts").is_empty());
+        // Options needing a value without one skip the line.
+        let text = format!("command,no-pty {}", key(7).to_line(None));
+        assert!(AuthorizedKeys::parse(&text, "opts").is_empty());
+        let text = format!("from {}", key(7).to_line(None));
+        assert!(AuthorizedKeys::parse(&text, "opts").is_empty());
+    }
+
+    #[test]
+    fn key_options_unknown_ignored() {
+        assert_eq!(
+            options_of(r#"environment="FOO=bar,baz",permitopen="host:80",agent-forwarding,no-pty"#),
+            KeyOptions {
+                no_pty: true,
+                ..KeyOptions::default()
+            }
+        );
+    }
+
+    fn from(patterns: &[&str]) -> KeyOptions {
+        KeyOptions {
+            from: patterns.iter().map(|p| (*p).to_owned()).collect(),
+            ..KeyOptions::default()
+        }
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("ip literal")
+    }
+
+    #[test]
+    fn key_options_from_empty_allows_all() {
+        assert!(KeyOptions::default().allows_source(ip("203.0.113.9")));
+        assert!(KeyOptions::default().allows_source(ip("::1")));
+    }
+
+    #[test]
+    fn key_options_from_exact_and_cidr() {
+        let o = from(&["192.0.2.7"]);
+        assert!(o.allows_source(ip("192.0.2.7")));
+        assert!(!o.allows_source(ip("192.0.2.8")));
+
+        let o = from(&["10.0.0.0/8"]);
+        assert!(o.allows_source(ip("10.255.1.2")));
+        assert!(!o.allows_source(ip("11.0.0.1")));
+        assert!(!o.allows_source(ip("::ffff:10.0.0.1")));
+
+        let o = from(&["192.168.1.64/26"]);
+        assert!(o.allows_source(ip("192.168.1.64")));
+        assert!(o.allows_source(ip("192.168.1.127")));
+        assert!(!o.allows_source(ip("192.168.1.128")));
+        assert!(!o.allows_source(ip("192.168.1.63")));
+
+        let o = from(&["0.0.0.0/0"]);
+        assert!(o.allows_source(ip("8.8.8.8")));
+        assert!(!o.allows_source(ip("2001:db8::1")));
+
+        let o = from(&["fd00::/8"]);
+        assert!(o.allows_source(ip("fd12:3456::1")));
+        assert!(!o.allows_source(ip("fe80::1")));
+        assert!(!o.allows_source(ip("10.0.0.1")));
+
+        let o = from(&["2001:db8:abcd::/48"]);
+        assert!(o.allows_source(ip("2001:db8:abcd:ffff::1")));
+        assert!(!o.allows_source(ip("2001:db8:abce::1")));
+
+        // Exact IPv6 compares numerically, not textually.
+        let o = from(&["0:0:0:0:0:0:0:1"]);
+        assert!(o.allows_source(ip("::1")));
+
+        // Malformed CIDR never matches.
+        assert!(!from(&["10.0.0.0/33"]).allows_source(ip("10.0.0.1")));
+        assert!(!from(&["10.0.0/8"]).allows_source(ip("10.0.0.1")));
+        assert!(!from(&["fd00::/129"]).allows_source(ip("fd00::1")));
+    }
+
+    #[test]
+    fn key_options_from_glob_and_negation() {
+        let o = from(&["192.168.1.*"]);
+        assert!(o.allows_source(ip("192.168.1.200")));
+        assert!(!o.allows_source(ip("192.168.2.1")));
+
+        let o = from(&["2001:DB8:*"]);
+        assert!(o.allows_source(ip("2001:db8::1")));
+        assert!(!o.allows_source(ip("2001:db9::1")));
+
+        let o = from(&["10.0.?.1"]);
+        assert!(o.allows_source(ip("10.0.5.1")));
+        assert!(!o.allows_source(ip("10.0.55.1")));
+
+        // Hostname globs match the textual IP only (no reverse DNS).
+        assert!(!from(&["*.lan"]).allows_source(ip("10.0.0.1")));
+
+        // Negation denies even when a positive pattern matches.
+        let o = from(&["10.0.0.0/8", "!10.0.0.0/24"]);
+        assert!(o.allows_source(ip("10.0.1.1")));
+        assert!(!o.allows_source(ip("10.0.0.1")));
+        let o = from(&["!10.0.0.5", "10.0.0.*"]);
+        assert!(!o.allows_source(ip("10.0.0.5")));
+        assert!(o.allows_source(ip("10.0.0.6")));
+
+        // Only negations: nothing positive ever matches, so everything is denied.
+        let o = from(&["!192.0.2.1"]);
+        assert!(!o.allows_source(ip("192.0.2.2")));
+        assert!(!o.allows_source(ip("192.0.2.1")));
     }
 
     #[test]

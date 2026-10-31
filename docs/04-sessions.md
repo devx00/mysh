@@ -18,9 +18,14 @@ up to the per-connection quota in 03-protocol.md §12.
    - `arg0`: `-<basename>` for `Shell` (login shell semantics); `Exec` is
      run as `shell -c "<argv joined with shell quoting>"` when `argv.len() == 1`
      (ssh behaviour, so `mysh host 'ls | wc -l'` works), otherwise directly;
+   - a key with `command="…"` (02-security.md, "Per-key options") always
+     runs `shell -c "<command>"` instead, for `Shell` and `Exec` alike, with
+     `MYSH_ORIGINAL_COMMAND` set to the requested argv joined by spaces
+     (empty for `Shell`); the PTY request is honoured as asked;
    - `env_clear()`, then `HOME`, `USER`, `LOGNAME`, `PATH`, `SHELL`,
      `MYSH_CONNECTION="<client ip> <client port> <server ip> <server port>"`,
-     `MYSH_SESSION=<id>`, plus allow-listed client env (02-security.md);
+     `MYSH_SESSION=<id>`, `MYSH_ORIGINAL_COMMAND` under a forced command,
+     plus allow-listed client env (02-security.md);
    - `current_dir`: `SessionRequest.cwd` if present and a directory (relative
      to home, `~/` expanded), else home. A missing or unusable `cwd` is not
      an error: the session starts in home and the client is told via

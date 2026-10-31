@@ -15,12 +15,12 @@ pub mod forward;
 pub mod session;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicU32, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -32,12 +32,13 @@ use mysh_net::{
     handshake::{HandshakeError, server_handshake},
     keys::{Identity, PublicKey},
     mux::{Incoming, Mode, Mux, Stream, accept_open},
+    trust::KeyOptions,
 };
 use mysh_proto::{
     DEFAULT_PORT,
     control::ControlMsg,
     handshake::ServerHello,
-    limits::{OPEN_REPLY_DEADLINE, SERVER_IDLE},
+    limits::{self, OPEN_REPLY_DEADLINE},
     open::{ErrorCode, Open, OpenReply},
 };
 use tokio::{
@@ -67,11 +68,19 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Pause after a failed `accept` (EMFILE and friends) before retrying.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
+/// Rate-limiter buckets idle for this long are forgotten.
+const BUCKET_TTL: Duration = Duration::from_secs(600);
+
+/// A rate-limited address is logged at most once per this interval.
+const RATE_LIMIT_WARN_EVERY: Duration = Duration::from_secs(10);
+
 /// Session policy derived from `mysh serve` options and the server's own
-/// environment (docs/04-sessions.md, "Shell and home resolution").
+/// environment (docs/04-sessions.md, "Shell and home resolution"), narrowed
+/// per connection by the matched key's options
+/// ([`Policy::with_key_options`]).
 #[derive(Debug, Clone)]
 pub struct Policy {
-    /// Features switched off with `--deny`.
+    /// Features switched off with `--deny` or by the key's options.
     pub deny: HashSet<Feature>,
     /// Extra client environment names accepted (`--accept-env`); an entry
     /// ending in `*` matches by prefix.
@@ -86,6 +95,20 @@ pub struct Policy {
     pub user: String,
     /// `PATH` for session children and for resolving `Exec` programs.
     pub path: String,
+    /// `command="…"` from the matched key: every session runs this instead
+    /// of the requested command (docs/02-security.md, "Per-key options").
+    pub forced_command: Option<String>,
+    /// Handshakes accepted per minute per client address; 0 disables the
+    /// limit (`--handshake-rate`).
+    pub handshakes_per_minute: u32,
+    /// A connection with no control traffic for this long is closed
+    /// (`--idle-timeout`).
+    pub idle_timeout: Duration,
+    /// How long a detached PTY session is kept (`--detach-grace`).
+    pub detach_grace: Duration,
+    /// Accept ssh-ed25519 signature authentication (`--no-signature-auth`
+    /// switches it off).
+    pub signature_auth: bool,
 }
 
 impl Policy {
@@ -95,7 +118,8 @@ impl Policy {
     }
 
     /// Policy for `mysh serve`: `--deny`, `--accept-env`, `--shell`,
-    /// `--name` (default: hostname), and the server's home/user/`PATH`.
+    /// `--name` (default: hostname), the hardening knobs, and the server's
+    /// home/user/`PATH`.
     pub fn from_args(args: &ServeArgs) -> Self {
         Self {
             deny: args.deny.iter().copied().collect(),
@@ -108,7 +132,109 @@ impl Policy {
                 .ok()
                 .filter(|p| !p.is_empty())
                 .unwrap_or_else(|| mysh_pty::process::default_path().to_owned()),
+            forced_command: None,
+            handshakes_per_minute: args.handshake_rate.unwrap_or(limits::HANDSHAKES_PER_MINUTE),
+            idle_timeout: args
+                .idle_timeout
+                .map_or(limits::SERVER_IDLE, Duration::from_secs),
+            detach_grace: args
+                .detach_grace
+                .map_or(limits::DETACH_GRACE, Duration::from_secs),
+            signature_auth: !args.no_signature_auth,
         }
+    }
+
+    /// The effective policy for one connection: this policy narrowed by the
+    /// matched `authorized_keys` options (`no-pty`, `no-files`,
+    /// `no-forward`, `command=`). Options only ever remove permissions.
+    #[must_use]
+    pub fn with_key_options(&self, options: &KeyOptions) -> Self {
+        let mut effective = self.clone();
+        if options.no_pty {
+            effective.deny.insert(Feature::Pty);
+        }
+        if options.no_files {
+            effective.deny.insert(Feature::Files);
+        }
+        if options.no_forward {
+            effective.deny.insert(Feature::ForwardLocal);
+            effective.deny.insert(Feature::ForwardRemote);
+        }
+        if let Some(command) = &options.command {
+            effective.forced_command = Some(command.clone());
+        }
+        effective
+    }
+}
+
+/// One client address in the [`RateLimiter`].
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+    /// When this address was last logged as rate limited.
+    warned: Option<Instant>,
+}
+
+/// Token bucket per client address for handshake admission
+/// (docs/02-security.md, "Limits and hardening"): capacity `rate`, refilled
+/// at `rate` per minute. Addresses not seen for ten minutes are forgotten
+/// when a new one is added.
+#[derive(Debug)]
+pub(crate) struct RateLimiter {
+    rate: u32,
+    buckets: HashMap<IpAddr, Bucket>,
+}
+
+impl RateLimiter {
+    /// `rate` handshakes per minute per address; must be non-zero (a zero
+    /// rate means "no limiter", see [`Shared`]).
+    pub(crate) fn new(rate: u32) -> Self {
+        Self {
+            rate,
+            buckets: HashMap::new(),
+        }
+    }
+
+    /// Admit a handshake from `ip` at `now`, consuming one token; `false`
+    /// when the bucket is empty.
+    pub(crate) fn check(&mut self, ip: IpAddr, now: Instant) -> bool {
+        let capacity = f64::from(self.rate);
+        let per_second = capacity / 60.0;
+        if !self.buckets.contains_key(&ip) {
+            self.buckets
+                .retain(|_, b| now.saturating_duration_since(b.last) < BUCKET_TTL);
+        }
+        let bucket = self.buckets.entry(ip).or_insert(Bucket {
+            tokens: capacity,
+            last: now,
+            warned: None,
+        });
+        let elapsed = now.saturating_duration_since(bucket.last).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * per_second).min(capacity);
+        bucket.last = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// After a rejected [`RateLimiter::check`]: whether to log it (at most
+    /// once per ten seconds per address).
+    pub(crate) fn should_warn(&mut self, ip: IpAddr, now: Instant) -> bool {
+        let Some(bucket) = self.buckets.get_mut(&ip) else {
+            return true;
+        };
+        if bucket
+            .warned
+            .is_some_and(|at| now.saturating_duration_since(at) < RATE_LIMIT_WARN_EVERY)
+        {
+            return false;
+        }
+        bucket.warned = Some(now);
+        true
     }
 }
 
@@ -132,6 +258,27 @@ struct Shared {
     trust: TrustSource,
     policy: Arc<Policy>,
     handshakes: Arc<Semaphore>,
+    /// `None` when `handshakes_per_minute` is 0.
+    limiter: Option<Mutex<RateLimiter>>,
+}
+
+impl Shared {
+    /// Admit or drop a fresh TCP connection from `peer` (before the
+    /// handshake); logs a rejected address at most once per ten seconds.
+    fn admit(&self, peer: SocketAddr) -> bool {
+        let Some(limiter) = &self.limiter else {
+            return true;
+        };
+        let now = Instant::now();
+        let mut limiter = limiter.lock().unwrap_or_else(PoisonError::into_inner);
+        if limiter.check(peer.ip(), now) {
+            return true;
+        }
+        if limiter.should_warn(peer.ip(), now) {
+            warn!(%peer, "handshake rate limit");
+        }
+        false
+    }
 }
 
 /// A bound server; [`Server::run`] serves until the shutdown future resolves.
@@ -169,6 +316,10 @@ impl Server {
                 );
             }
         }
+        let limiter = match cfg.policy.handshakes_per_minute {
+            0 => None,
+            rate => Some(Mutex::new(RateLimiter::new(rate))),
+        };
         Ok(Self {
             listeners,
             shared: Arc::new(Shared {
@@ -176,6 +327,7 @@ impl Server {
                 trust: cfg.trust,
                 policy: Arc::new(cfg.policy),
                 handshakes: Arc::new(Semaphore::new(MAX_HANDSHAKES)),
+                limiter,
             }),
         })
     }
@@ -333,6 +485,9 @@ async fn accept_loop(
                 continue;
             }
         };
+        if !shared.admit(peer) {
+            continue;
+        }
         let Ok(permit) = Arc::clone(&shared.handshakes).try_acquire_owned() else {
             debug!(%peer, "too many concurrent handshakes; closing");
             continue;
@@ -374,13 +529,27 @@ async fn handle_connection(
     };
     let trust = shared.trust.load();
     let mut offered: Option<PublicKey> = None;
+    let mut options = KeyOptions::default();
     let result = server_handshake(stream, &shared.identity.secret, hello, |key, _| {
         offered = Some(*key);
-        if trust.contains(key) {
-            Ok(())
-        } else {
-            Err((ErrorCode::Unauthorized, "key not authorized".to_owned()))
+        let Some(entry) = trust.find(key) else {
+            return Err((ErrorCode::Unauthorized, "key not authorized".to_owned()));
+        };
+        if !entry.options.allows_source(peer.ip()) {
+            warn!(
+                %peer,
+                source = %entry.source,
+                line = entry.line,
+                from = ?entry.options.from,
+                "client key is not allowed from this address"
+            );
+            return Err((
+                ErrorCode::Unauthorized,
+                "key not authorized from this address".to_owned(),
+            ));
         }
+        options = entry.options.clone();
+        Ok(())
     })
     .await;
     drop(permit);
@@ -399,20 +568,21 @@ async fn handle_connection(
     };
     let client_key = hs.remote;
     info!(%peer, fingerprint = %client_key.fingerprint(), version = hs.version, "client connected");
+    let policy = if options == KeyOptions::default() {
+        Arc::clone(&shared.policy)
+    } else {
+        debug!(%peer, ?options, "applying per-key options");
+        Arc::new(shared.policy.with_key_options(&options))
+    };
 
     let (mux, mut incoming) = Mux::new(hs.stream, Mode::Server);
     let Some(control) = take_control(&mut incoming, peer).await else {
         mux.close().await;
         return;
     };
-    let ctx = ConnCtx::new(
-        Arc::clone(&shared.policy),
-        mux.clone(),
-        peer,
-        local,
-        client_key,
-    );
-    let control_task = tokio::spawn(control_loop(control, mux.clone(), shutdown, peer));
+    let idle = policy.idle_timeout;
+    let ctx = ConnCtx::new(policy, mux.clone(), peer, local, client_key);
+    let control_task = tokio::spawn(control_loop(control, mux.clone(), shutdown, peer, idle));
 
     while let Some(stream) = incoming.accept().await {
         tokio::spawn(dispatch(stream, ctx.clone()));
@@ -447,7 +617,7 @@ async fn take_control(incoming: &mut Incoming, peer: SocketAddr) -> Option<Strea
 }
 
 /// Control stream (docs/03-protocol.md §6): answer pings, honour the
-/// client's `Shutdown`, relay the server's, and enforce `SERVER_IDLE`.
+/// client's `Shutdown`, relay the server's, and enforce the idle timeout.
 /// Closes the mux when it ends.
 #[allow(clippy::needless_pass_by_value)] // owned by the spawned task
 async fn control_loop(
@@ -455,6 +625,7 @@ async fn control_loop(
     mux: Mux,
     mut shutdown: watch::Receiver<Option<String>>,
     peer: SocketAddr,
+    idle: Duration,
 ) {
     use tokio::io::AsyncWriteExt as _;
 
@@ -503,8 +674,8 @@ async fn control_loop(
                 break;
             },
             // Recreated on every iteration: any control message restarts it.
-            () = tokio::time::sleep(SERVER_IDLE) => {
-                warn!(%peer, "no control traffic for {}s; closing", SERVER_IDLE.as_secs());
+            () = tokio::time::sleep(idle) => {
+                warn!(%peer, "no control traffic for {:?}; closing", idle);
                 break;
             },
         }
@@ -736,7 +907,114 @@ mod tests {
             home: std::env::temp_dir(),
             user: "tester".to_owned(),
             path: mysh_pty::process::default_path().to_owned(),
+            forced_command: None,
+            handshakes_per_minute: 0,
+            idle_timeout: limits::SERVER_IDLE,
+            detach_grace: limits::DETACH_GRACE,
+            signature_auth: true,
         }
+    }
+
+    #[test]
+    fn policy_from_args_maps_hardening_flags() {
+        let defaults = Policy::from_args(&ServeArgs::default());
+        assert_eq!(
+            defaults.handshakes_per_minute,
+            limits::HANDSHAKES_PER_MINUTE
+        );
+        assert_eq!(defaults.idle_timeout, limits::SERVER_IDLE);
+        assert_eq!(defaults.detach_grace, limits::DETACH_GRACE);
+        assert!(defaults.signature_auth);
+        assert_eq!(defaults.forced_command, None);
+
+        let args = ServeArgs {
+            handshake_rate: Some(0),
+            idle_timeout: Some(7),
+            detach_grace: Some(9),
+            no_signature_auth: true,
+            ..ServeArgs::default()
+        };
+        let custom = Policy::from_args(&args);
+        assert_eq!(custom.handshakes_per_minute, 0);
+        assert_eq!(custom.idle_timeout, Duration::from_secs(7));
+        assert_eq!(custom.detach_grace, Duration::from_secs(9));
+        assert!(!custom.signature_auth);
+    }
+
+    #[test]
+    fn key_options_narrow_policy() {
+        let base = test_policy();
+        let same = base.with_key_options(&KeyOptions::default());
+        assert!(same.deny.is_empty());
+        assert_eq!(same.forced_command, None);
+
+        let options = KeyOptions {
+            command: Some("echo hi".to_owned()),
+            no_pty: true,
+            no_files: true,
+            no_forward: true,
+            from: vec!["10.0.0.0/8".to_owned()],
+        };
+        let narrowed = base.with_key_options(&options);
+        for feature in [
+            Feature::Pty,
+            Feature::Files,
+            Feature::ForwardLocal,
+            Feature::ForwardRemote,
+        ] {
+            assert!(narrowed.denies(feature), "{feature:?}");
+        }
+        assert!(!narrowed.denies(Feature::Exec));
+        assert_eq!(narrowed.forced_command.as_deref(), Some("echo hi"));
+        // `--deny` entries survive.
+        let mut denied = test_policy();
+        denied.deny.insert(Feature::Exec);
+        assert!(denied.with_key_options(&options).denies(Feature::Exec));
+    }
+
+    #[test]
+    fn rate_limiter_bucket_drains_and_refills() {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let other: IpAddr = "::1".parse().unwrap();
+        let t0 = Instant::now();
+        let mut limiter = RateLimiter::new(3);
+        for _ in 0..3 {
+            assert!(limiter.check(ip, t0));
+        }
+        assert!(
+            !limiter.check(ip, t0),
+            "fourth handshake in the same minute"
+        );
+        // Other addresses have their own bucket.
+        assert!(limiter.check(other, t0));
+        // 3/min = one token every 20 s; 10 s in there is only half a token.
+        assert!(!limiter.check(ip, t0 + Duration::from_secs(10)));
+        assert!(limiter.check(ip, t0 + Duration::from_secs(30)));
+        assert!(!limiter.check(ip, t0 + Duration::from_secs(30)));
+        // A full minute refills to capacity, never beyond it.
+        let t1 = t0 + Duration::from_secs(600);
+        for _ in 0..3 {
+            assert!(limiter.check(ip, t1));
+        }
+        assert!(!limiter.check(ip, t1));
+    }
+
+    #[test]
+    fn rate_limiter_warns_once_per_interval_and_prunes() {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let t0 = Instant::now();
+        let mut limiter = RateLimiter::new(1);
+        assert!(limiter.check(ip, t0));
+        assert!(!limiter.check(ip, t0));
+        assert!(limiter.should_warn(ip, t0));
+        assert!(!limiter.should_warn(ip, t0 + Duration::from_secs(9)));
+        assert!(limiter.should_warn(ip, t0 + RATE_LIMIT_WARN_EVERY));
+        assert_eq!(limiter.buckets.len(), 1);
+        // Inserting a new address prunes buckets idle for ten minutes.
+        let newcomer: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(limiter.check(newcomer, t0 + BUCKET_TTL + Duration::from_secs(1)));
+        assert_eq!(limiter.buckets.len(), 1);
+        assert!(limiter.buckets.contains_key(&newcomer));
     }
 
     struct Running {

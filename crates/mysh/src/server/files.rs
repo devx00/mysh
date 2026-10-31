@@ -469,6 +469,11 @@ pub(crate) mod tests {
             home: home.path().to_path_buf(),
             user: "tester".into(),
             path: "/usr/bin:/bin".into(),
+            forced_command: None,
+            handshakes_per_minute: 0,
+            idle_timeout: mysh_proto::limits::SERVER_IDLE,
+            detach_grace: mysh_proto::limits::DETACH_GRACE,
+            signature_auth: true,
         });
         let peer: SocketAddr = "127.0.0.1:1".parse().expect("addr");
         let local: SocketAddr = "127.0.0.1:2".parse().expect("addr");

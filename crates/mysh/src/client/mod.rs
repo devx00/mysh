@@ -5,6 +5,7 @@
 
 pub mod conn;
 pub mod console;
+pub mod editor;
 pub mod files;
 pub mod forward;
 pub mod meta;

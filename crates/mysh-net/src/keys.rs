@@ -231,7 +231,7 @@ fn take_ssh_string<'a>(rest: &mut &'a [u8], what: &str) -> Result<&'a [u8], KeyE
 }
 
 /// Parses the OpenSSH `ssh-ed25519` wire blob: `string "ssh-ed25519" ‖ string key`.
-fn decode_ssh_ed25519_blob(b64: &str) -> Result<[u8; 32], KeyError> {
+pub(crate) fn decode_ssh_ed25519_blob(b64: &str) -> Result<[u8; 32], KeyError> {
     let blob = STANDARD_PAD_INDIFFERENT
         .decode(b64)
         .map_err(|e| KeyError::Format(format!("ssh-ed25519: invalid base64: {e}")))?;

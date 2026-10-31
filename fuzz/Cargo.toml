@@ -1,0 +1,132 @@
+[package]
+name = "mysh-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mysh-proto = { path = "../crates/mysh-proto" }
+mysh-net = { path = "../crates/mysh-net" }
+mysh = { path = "../crates/mysh" }
+
+# Standalone workspace: keeps nightly-only fuzzing out of the root workspace.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "proto_open"
+path = "fuzz_targets/proto_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_open_reply"
+path = "fuzz_targets/proto_open_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_control"
+path = "fuzz_targets/proto_control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_session_in"
+path = "fuzz_targets/proto_session_in.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_session_out"
+path = "fuzz_targets/proto_session_out.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_file_op"
+path = "fuzz_targets/proto_file_op.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_file_replies"
+path = "fuzz_targets/proto_file_replies.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_bound"
+path = "fuzz_targets/proto_bound.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_hellos"
+path = "fuzz_targets/proto_hellos.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_frame"
+path = "fuzz_targets/proto_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keys_secret"
+path = "fuzz_targets/keys_secret.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keys_public"
+path = "fuzz_targets/keys_public.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "trust_authorized"
+path = "fuzz_targets/trust_authorized.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "trust_known_hosts"
+path = "fuzz_targets/trust_known_hosts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_specs"
+path = "fuzz_targets/config_specs.rs"
+test = false
+doc = false
+bench = false

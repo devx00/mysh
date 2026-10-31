@@ -12,6 +12,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
 };
 
 use mysh::{
@@ -68,13 +69,25 @@ pub struct ServerOpts {
     pub accept_env: Vec<String>,
     /// Extra trusted client keys beyond the harness client identity.
     pub extra_authorized: Vec<PublicKey>,
+    /// Raw `authorized_keys` lines (with options), appended verbatim, e.g.
+    /// `format!("no-pty {}", key.to_line(None))`.
+    pub authorized_lines: Vec<String>,
     /// Do not trust the harness client identity (for unauthorized tests).
     pub untrusted_client: bool,
+    /// `Policy.handshakes_per_minute`; `None` keeps the harness default (off).
+    pub handshakes_per_minute: Option<u32>,
+    /// `Policy.idle_timeout`; `None` keeps the protocol default.
+    pub idle_timeout: Option<Duration>,
+    /// Also listen on `[::1]:0` (see [`TestServer::addr_v6`]).
+    pub listen_v6: bool,
 }
 
 /// A running server plus the client-side material needed to reach it.
 pub struct TestServer {
     pub addr: SocketAddr,
+    /// The `[::1]` listener when `listen_v6` was set and IPv6 loopback is
+    /// available on this host.
+    pub addr_v6: Option<SocketAddr>,
     pub dir: TempDir,
     /// `<dir>/client`: identity (`id`, `id.pub`), `known_hosts`, history.
     pub client_dir: PathBuf,
@@ -183,6 +196,12 @@ pub async fn start_server(opts: ServerOpts) -> TestServer {
     for k in &opts.extra_authorized {
         text.push_str(&k.to_line(Some("extra")));
     }
+    for line in &opts.authorized_lines {
+        text.push_str(line);
+        if !line.ends_with('\n') {
+            text.push('\n');
+        }
+    }
     let inline = AuthorizedKeys::parse(&text, "test-inline");
     let trust = TrustSource {
         baked: AuthorizedKeys::new(),
@@ -197,16 +216,29 @@ pub async fn start_server(opts: ServerOpts) -> TestServer {
     policy.shell = opts.shell;
     "test-server".clone_into(&mut policy.name);
     policy.home = home.clone();
+    // Tests open many connections from loopback; only the rate-limit tests
+    // switch the limiter on.
+    policy.handshakes_per_minute = opts.handshakes_per_minute.unwrap_or(0);
+    if let Some(idle) = opts.idle_timeout {
+        policy.idle_timeout = idle;
+    }
 
+    let mut listen: Vec<SocketAddr> = vec!["127.0.0.1:0".parse().expect("addr")];
+    let v6: SocketAddr = "[::1]:0".parse().expect("addr");
+    if opts.listen_v6 && std::net::TcpListener::bind(v6).is_ok() {
+        listen.push(v6);
+    }
     let server = Server::bind(ServerConfig {
-        listen: vec!["127.0.0.1:0".parse().expect("addr")],
+        listen,
         identity: server_identity,
         trust,
         policy,
     })
     .await
     .expect("bind server");
-    let addr = server.local_addrs()[0];
+    let addrs = server.local_addrs();
+    let addr = addrs[0];
+    let addr_v6 = addrs.get(1).copied();
     let (tx, rx) = oneshot::channel();
     let task = tokio::spawn(server.run(async move {
         let _ = rx.await;
@@ -214,6 +246,7 @@ pub async fn start_server(opts: ServerOpts) -> TestServer {
 
     TestServer {
         addr,
+        addr_v6,
         dir,
         client_dir,
         home,

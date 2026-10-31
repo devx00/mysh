@@ -179,6 +179,7 @@ pub enum Feature {
 }
 
 /// `mysh serve` options.
+#[allow(clippy::struct_excessive_bools)] // independent switches, not a state machine
 #[derive(Args, Clone, Debug, Default)]
 pub struct ServeArgs {
     /// Listen address (repeatable; default `[::]:7722`, falling back to
@@ -225,6 +226,22 @@ pub struct ServeArgs {
     /// Ignore key files on disk; use only the compiled-in identity and peers.
     #[arg(long)]
     pub baked_only: bool,
+
+    /// Handshakes accepted per minute from one client address (0 = no limit).
+    #[arg(long, value_name = "N")]
+    pub handshake_rate: Option<u32>,
+
+    /// Close a connection with no control traffic for this many seconds.
+    #[arg(long, value_name = "SECS")]
+    pub idle_timeout: Option<u64>,
+
+    /// Keep a detached PTY session alive for this many seconds.
+    #[arg(long, value_name = "SECS")]
+    pub detach_grace: Option<u64>,
+
+    /// Do not accept ssh-ed25519 signature authentication.
+    #[arg(long)]
+    pub no_signature_auth: bool,
 }
 
 /// `mysh keygen` options.

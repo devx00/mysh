@@ -57,12 +57,15 @@ Workspace, lints, CI, this spec.
 
 ### M4 — hardening and release
 
-- Handshake rate limit per source IP; idle timeouts; stream/listener quotas
-  enforced with tests.
-- Session rekey (`snow` `rekey` on a `Rekey` control message) every 1 GiB or
-  1 h, whichever first.
-- Per-key options in `authorized_keys`: `command=`, `no-pty`, `no-files`,
-  `no-forward`, `from=`.
+- Handshake rate limit per source IP ✔ (`--handshake-rate`, token bucket);
+  idle timeout ✔ (`--idle-timeout`); stream/listener quotas enforced with
+  tests ✔ (`tests/hardening.rs`).
+- Session rekey ✔: in-band empty Noise message below yamux (03 §3) every
+  1 GiB or 1 h per direction, whichever first.
+- Per-key options in `authorized_keys` ✔ (parsing: `command=`, `no-pty`,
+  `no-files`, `no-forward`, `from=`, `restrict`; 02 "Per-key options") and
+  enforcement ✔ (per-connection `Policy`, `from=` at authorization, forced
+  command with `MYSH_ORIGINAL_COMMAND`).
 - Fuzz targets for every postcard decoder and the key/known_hosts parsers.
 - Release workflow: static artifacts for the five targets, checksums,
   `contrib/` systemd unit, launchd plist, Termux:Boot script.
@@ -76,7 +79,9 @@ Workspace, lints, CI, this spec.
 - Signature authentication (`NN` + ed25519 signature over the handshake
   hash) enabling `ssh-agent`, `sk-*` keys, and keys that cannot be exported.
 - Background transfers (`put … &`, `jobs`), parallel recursive transfers.
-- Local path completion and `Ctrl-R` history search at the prompt.
+- Local path completion and `Ctrl-R` history search at the prompt — done
+  (`client::editor`): Tab completes local paths for `put`/`lcd`/`log`/
+  `authorize` and `get`'s destination, `Ctrl-R` incremental search.
 - Post-quantum hybrid (X25519 + ML-KEM) if `snow` or a successor exposes it.
 
 ## Decisions log
@@ -102,6 +107,11 @@ later.
 | 14 | the prompt is the home state; `shell` opens a real shell; `-s` for ssh-like feel | ssh model (shell first, meta via escape) | the connection outlives any one shell; forwards, transfers and several shells are first-class, not escapes |
 | 15 | single-byte meta key `Ctrl-]`, interceptable anywhere; `send` for the literal | ssh `~` line-start sequences | one keystroke, no line-start rule, no held bytes or timers; telnet precedent; collides only with vim tag jump, rebindable |
 | 16 | `put`/`get` use `-P` (preserve) and `-F` (follow symlinks); `put -c` stats the remote and resumes with `truncate:false, atomic:false`; `get` writes `<path>.mysh-tmp` then renames | scp's `-p`/`-L`; always-atomic writes | `-p`/`-L` are the shared `--port`/`-L` CLI options and meta commands share the clap definitions; resume cannot be atomic by definition; `ls -l` times are UTC until a tz dependency is justified |
+| 17 | Tab completion is local-only and per command (`put`, `lcd`, `log`, `authorize`: every argument; `get`: arguments after the first); the editor derives the command from the first word of the line | remote completion via a `ls` round trip; completing every word | no network traffic from a keystroke, no stale remote listings; the per-command rule needs no clap introspection and is documented |
+| 18 | rekey is an empty-plaintext Noise message handled inside `NoiseStream`; nonces keep counting | `Rekey` control message over yamux | the control stream is multiplexed and cannot be ordered against the raw Noise frames of other streams; an in-band marker is ordered by construction, per direction, and needs no timer task |
+| 19 | per-key options narrow a per-connection copy of the server `Policy` (`deny` set + `forced_command`); handlers keep reading `ctx.policy` | option checks inside every handler | one enforcement point; `--deny` and key options compose by set union; nothing in the handlers knows about key options |
+| 20 | the handshake rate limiter is a per-IP token bucket checked on `accept`, before the handshake semaphore; rejected sockets are dropped silently and logged at most once per 10 s per address | reply with a `Denied` verdict; per-connection sleep | a verdict costs a handshake (the thing being limited) and tells a scanner it is being counted; dropping is free and log-rate-limited so a flood cannot fill the log |
+| 21 | the 512-stream cap is yamux's own `max_num_streams` on both ends, counting the control stream; an opener that exceeds it loses the connection (yamux 0.14 poisons it) | a mysh-level counter that rejects with `Limit` before yamux | the hard cap is already enforced below us; the client stays under it by construction (32 sessions + 32 listeners + transient file/forward streams) and the behaviour is documented in 02 and pinned by a test |
 
 ## Testing strategy
 
@@ -115,4 +125,10 @@ later.
   Android builds in the release workflow.
 - Manual Android smoke script in `scripts/` (M2): build, push, serve, connect,
   resize, transfer.
-- Property/fuzz (M4): postcard decoders never panic on arbitrary input.
+- Fuzz (M4): `fuzz/` is a separate cargo-fuzz workspace (excluded from the
+  root workspace; needs nightly). Targets cover every postcard decoder
+  (`proto_*`), `frame::body_len`/`decode`, key parsers (`keys_*`),
+  `authorized_keys`/`known_hosts` (`trust_*`), and the TOML/spec parsers
+  (`config_*`). `scripts/fuzz-all.sh [SECONDS]` builds and runs each target
+  for SECONDS (default 5) and summarises pass/fail; corpus and artifacts are
+  git-ignored.

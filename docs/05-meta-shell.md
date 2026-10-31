@@ -45,14 +45,26 @@ is `Ctrl-Z` at the prompt, `~?` is `help`.
 ## The prompt
 
 - `mysh HOST> ` on the same terminal (HOST as typed, or the alias name). A
-  small built-in line editor (`client::meta`) with history
+  small built-in line editor (`client::editor`) with history
   (`~/.local/state/mysh/history`, last 1000 lines) and the usual keys:
   printable insert, Backspace/Delete, Left/Right, Home/End, `Ctrl-A/E`,
-  `Ctrl-U/K/W`, Up/Down history, `Ctrl-L` redraw. `Ctrl-R` search and
-  local-path completion are roadmap (M5). The terminal stays in raw mode
-  throughout, which is what makes the meta key bindable here; the editor
-  handles echo and editing itself since one stdin reader task owns stdin for
-  the whole run.
+  `Ctrl-U/K/W`, Up/Down history, `Ctrl-L` redraw. The terminal stays in raw
+  mode throughout, which is what makes the meta key bindable here; the
+  editor handles echo and editing itself since one stdin reader task owns
+  stdin for the whole run.
+- Tab completes the local path under the cursor (`~` expanded, relative to
+  the `lcd` directory) for every argument of `put`, `lcd`, `log` and
+  `authorize`, and for `get` arguments after the first (the local
+  destination); everything else is left alone. One match completes it
+  (directories get a `/`); several complete the common prefix and a second
+  Tab lists them in columns above the redrawn prompt. Dot files are offered
+  only when the name starts with `.`.
+- `Ctrl-R` searches history backwards incrementally: the prompt becomes
+  `(reverse-i-search)'query': match`, typing refines (Backspace shortens the
+  query), `Ctrl-R` again moves to the next older match (`failed` appears in
+  the prompt when there is none), Enter runs the match, `Esc` or `Ctrl-G`
+  restores the line you were editing, and any other editing key keeps the
+  match in the line and applies the key.
 - On connect, one line: `connected to HOST (SHA256:…, trusted via
   known_hosts); type "shell" for a shell, "help" for commands` — `-q`
   silences it.
@@ -215,6 +227,10 @@ Server options:
 | `--accept-env NAME`                 | repeatable; extra env names accepted from clients         |
 | `--deny FEATURE`                    | `pty`, `exec`, `files`, `forward-local`, `forward-remote` |
 | `--name NAME`                       | name sent in `ServerHello` (default hostname)             |
+| `--handshake-rate N`                | handshakes per minute per client address (default 10; 0 = off) |
+| `--idle-timeout SECS`               | close a connection with no control traffic (default 120)  |
+| `--detach-grace SECS`               | keep a detached PTY session this long (default 600)       |
+| `--no-signature-auth`               | do not accept ssh-ed25519 signature authentication        |
 | `--baked-only`                      | ignore files on disk                                      |
 | `-v`                                | log level                                                 |
 

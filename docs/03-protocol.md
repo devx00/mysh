@@ -56,6 +56,21 @@ The first transport-mode message is always `Msg<Verdict>`, server → client:
 client reads it before starting the mux, so the two are never ambiguous on
 the wire.
 
+**Rekey.** Either side rotates its *sending* key in-band, below yamux: a
+transport message with empty plaintext (`u16-BE 16 ‖ 16-byte tag`) means
+"every later message from me is under `REKEY(k)`" (Noise §4.2; snow
+`rekey_outgoing` / `rekey_incoming`). The sender emits it right after the
+data message that crosses its policy (`REKEY_BYTES` plaintext sent under the
+key, or `REKEY_INTERVAL` since the key came into use; checked on every
+sealed frame, no timer), then rekeys; the receiver rekeys its receiving
+state and surfaces nothing to the reader. Nonces are **not** reset by a
+rekey: both counters keep running, which keeps the two directions
+independent and needs no message ordering between them. A data message is
+never empty, so there is no ambiguity. Each side's thresholds are its own
+(`NoiseStream::set_rekey_policy`); counts are exposed in `TransferStats`
+(`rekeys_out`, `rekeys_in`). A header of `0` (shorter than the tag) is a
+protocol error.
+
 ## 4. Multiplexing
 
 **yamux** (crate `yamux` 0.14, protocol spec v0.1) runs over `NoiseStream`.
@@ -130,8 +145,9 @@ enum ControlMsg {
 
 Keep-alive: the client pings every 30 s; three consecutive unanswered pings →
 the client declares the connection dead (exit 255). The server closes a
-connection whose control stream has been silent for 120 s. TCP keep-alive is
-not set in v1 (tokio exposes no API for it; the pings cover liveness).
+connection whose control stream has been silent for 120 s (`--idle-timeout`).
+TCP keep-alive is not set in v1 (tokio exposes no API for it; the pings
+cover liveness).
 
 RTT shown by `info`/`ping` is measured here.
 
@@ -267,4 +283,5 @@ pid, then `None` (04-sessions.md). Used by the meta shell so that
 | handshake deadline            | 5 s      |
 | open-reply deadline           | 10 s     |
 | ping interval / dead after    | 30 s / 3 |
-| server idle close             | 120 s    |
+| server idle close             | 120 s (`--idle-timeout`) |
+| rekey (bytes / age of key)    | 1 GiB / 1 h |
