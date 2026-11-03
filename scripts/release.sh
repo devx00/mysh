@@ -17,14 +17,24 @@
 #               case plain `cargo build` is used. Zig prints
 #               `argument unused during compilation: '-nostartfiles'` on
 #               32-bit ARM musl; it is a warning and the link succeeds.
+#   netbsd      `zig cc -target <arch>-netbsd` through a generated wrapper
+#   openbsd     (cargo-zigbuild does not know the BSDs besides FreeBSD)
 #   android     NDK clang (API 24) through scripts/android-build.sh
 #               (ANDROID_NDK_HOME or the Homebrew cask path)
+#
+# Tier-3 rows (no prebuilt `std`) build with `cargo +nightly … -Z
+# build-std=std,panic_abort` (rustup toolchain install nightly --component
+# rust-src). MIPS musl additionally links `+crt-static` with
+# `-C link-self-contained=no`: rustc's MIPS musl specs default to dynamic
+# linking, which trips over zig's static-only libzigc, and nightly has no
+# self-contained crt objects for a target without `rust-std`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # target  family  tier  set
-# `family` selects the linker; `tier` is the rustc tier (2 = std ships);
-# `set` is `required` (built by default) or `stretch` (`--stretch`).
+# `family` selects the linker; `tier` is the rustc tier (2 = std ships,
+# 3 = build-std on nightly); `set` is `required` (built by default) or
+# `stretch` (`--stretch`).
 TARGETS=(
   "x86_64-unknown-linux-musl         linux-musl 2 required"
   "aarch64-unknown-linux-musl        linux-musl 2 required"
@@ -39,10 +49,18 @@ TARGETS=(
   "x86_64-linux-android              android    2 required"
   "aarch64-apple-darwin              darwin     1 required"
   "x86_64-apple-darwin               darwin     1 required"
-  "powerpc64le-unknown-linux-musl    linux-musl 2 stretch"
-  "loongarch64-unknown-linux-musl    linux-musl 2 stretch"
-  "s390x-unknown-linux-gnu           linux-gnu  2 stretch"
   "i686-linux-android                android    2 stretch"
+  "armv5te-unknown-linux-musleabi    linux-musl 2 stretch"
+  "powerpc64le-unknown-linux-musl    linux-musl 2 stretch"
+  "s390x-unknown-linux-gnu           linux-gnu  2 stretch"
+  "s390x-unknown-linux-musl          linux-musl 3 stretch"
+  "loongarch64-unknown-linux-musl    linux-musl 2 stretch"
+  "mipsel-unknown-linux-musl         linux-musl 3 stretch"
+  "mips-unknown-linux-musl           linux-musl 3 stretch"
+  "x86_64-unknown-netbsd             netbsd     2 stretch"
+  "aarch64-unknown-netbsd            netbsd     3 stretch"
+  "x86_64-unknown-openbsd            openbsd    3 stretch"
+  "aarch64-unknown-openbsd           openbsd    3 stretch"
 )
 
 stretch="${MYSH_STRETCH:-0}"
@@ -50,7 +68,7 @@ targets=()
 for arg in "$@"; do
   case "$arg" in
     --stretch) stretch=1 ;;
-    -h | --help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) targets+=("$arg") ;;
   esac
 done
@@ -82,6 +100,15 @@ need_zig() {
   fi
 }
 
+need_nightly() {
+  if ! rustup run nightly rustc --print sysroot >/dev/null 2>&1 \
+      || [ ! -d "$(rustup run nightly rustc --print sysroot)/lib/rustlib/src/rust/library" ]; then
+    echo "release: tier-3 target $1 needs nightly with rust-src:" >&2
+    echo "  rustup toolchain install nightly --component rust-src" >&2
+    exit 2
+  fi
+}
+
 # Linker env override for the two original musl targets (musl cross gcc).
 musl_override() {
   case "$1" in
@@ -91,11 +118,30 @@ musl_override() {
   esac
 }
 
+# `zig cc -target <triple>` as a linker executable for the BSDs that
+# cargo-zigbuild does not handle; written under target/ once per target.
+zig_cc_wrapper() {
+  local target="$1" triple="$2" path="target/zig-cc/$1"
+  mkdir -p target/zig-cc
+  printf '#!/bin/sh\nexec zig cc -target %s "$@"\n' "$triple" > "$path"
+  chmod +x "$path"
+  echo "$path"
+}
+
+env_name() { echo "CARGO_TARGET_$(echo "$1" | tr 'a-z-' 'A-Z_')_$2"; }
+
+# $1 = target, $2 = family, $3 = tier. Tier 3 swaps in nightly + build-std
+# (`$tc` and `$std` are expanded unquoted on purpose: empty or words).
 build_one() {
-  local target="$1" family="$2" override
+  local target="$1" family="$2" tier="$3" override tc="" std="" rustflags=""
+  if [ "$tier" = 3 ]; then
+    need_nightly "$target"
+    tc=+nightly
+    std="-Z build-std=std,panic_abort"
+  fi
   case "$family" in
     darwin)
-      cargo build --release --target "$target" -p mysh
+      cargo $tc build $std --release --target "$target" -p mysh
       ;;
     linux-musl | linux-gnu | freebsd)
       override=$(musl_override "$target")
@@ -104,12 +150,21 @@ build_one() {
           echo "release: linker for $target not found: $override" >&2
           exit 2
         fi
-        env "CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER=$override" \
-          cargo build --release --target "$target" -p mysh
+        env "$(env_name "$target" LINKER)=$override" \
+          cargo $tc build $std --release --target "$target" -p mysh
       else
         need_zig "$target"
-        cargo zigbuild --release --target "$target" -p mysh
+        case "$target" in
+          mips*) rustflags="-C target-feature=+crt-static -C link-self-contained=no" ;;
+        esac
+        env ${rustflags:+"$(env_name "$target" RUSTFLAGS)=$rustflags"} \
+          cargo $tc zigbuild $std --release --target "$target" -p mysh
       fi
+      ;;
+    netbsd | openbsd)
+      need_zig "$target"
+      env "$(env_name "$target" LINKER)=$(zig_cc_wrapper "$target" "${target%%-*}-$family")" \
+        cargo $tc build $std --release --target "$target" -p mysh
       ;;
     android)
       scripts/android-build.sh "$target" "${ANDROID_API:-24}"
@@ -130,7 +185,7 @@ for target in "${targets[@]}"; do
   fi
   set -- $row
   echo "==> $target ($2, tier $3, $4)"
-  build_one "$target" "$2"
+  build_one "$target" "$2" "$3"
   cp "target/$target/release/mysh" "dist/mysh-$version-$target"
   built+=("mysh-$version-$target")
 done

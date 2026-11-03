@@ -94,11 +94,33 @@ pub fn open_pty(size: WinSize) -> io::Result<(PtyMaster, PtySlave)> {
 
 /// Path of the slave side of `master`.
 ///
-/// rustix has no `ptsname` for NetBSD, so that target calls libc's
-/// reentrant `ptsname_r` instead; everywhere else rustix's wrapper is used.
-#[cfg(not(target_os = "netbsd"))]
+/// rustix has no `ptsname` for NetBSD or OpenBSD: NetBSD calls libc's
+/// reentrant `ptsname_r`, OpenBSD (which has no `ptsname_r`) copies out of
+/// `ptsname(3)`'s static buffer; everywhere else rustix's wrapper is used.
+#[cfg(not(any(target_os = "netbsd", target_os = "openbsd")))]
 fn slave_name(master: &OwnedFd) -> io::Result<std::ffi::CString> {
     Ok(rustix::pty::ptsname(master, Vec::new())?)
+}
+
+/// OpenBSD: `ptsname(3)` returns a pointer into a per-process static buffer
+/// (there is no `ptsname_r`), so the name is copied out immediately; the
+/// race window is two threads calling `ptsname` concurrently, which the
+/// kernel-side lookup and the copy keep to a few instructions. Compiled
+/// only on OpenBSD; statically inspected, not run — see `docs/04-sessions.md`.
+#[cfg(target_os = "openbsd")]
+fn slave_name(master: &OwnedFd) -> io::Result<std::ffi::CString> {
+    use std::ffi::CStr;
+
+    // SAFETY: `master` is an open fd owned by the caller; `ptsname` only
+    // reads it.
+    let ptr = unsafe { libc::ptsname(master.as_raw_fd()) };
+    if ptr.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a non-null return is a NUL-terminated string in libc's static
+    // buffer; it is copied before any other libc call can overwrite it.
+    let name = unsafe { CStr::from_ptr(ptr) };
+    Ok(name.to_owned())
 }
 
 /// NetBSD: `ptsname_r(3)` into a `PATH_MAX` buffer (compiled only on NetBSD;

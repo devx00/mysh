@@ -318,6 +318,36 @@ Suggested order: M6 → M7 (they make everything else scriptable), M8, then
 M9 and M10 in either order; pairing is the only item that needs a design
 sign-off before code.
 
+### M11 — build matrix ✔
+
+Every supportable platform builds out of the box; the table in
+`scripts/release.sh` and `docs/08-platform-matrix.md` are the source of
+truth. Windows is out of scope by design.
+
+- Required set ✔ (13 targets + a macOS universal binary): Linux musl static
+  `x86_64`, `aarch64`, `i686`, `armv7`, `armv6`, `riscv64`; FreeBSD
+  `x86_64`, `aarch64` (new `mysh-pty` cwd probe via `KERN_PROC_CWD`); Android
+  `aarch64`, `armv7`, `x86_64`; macOS `aarch64`, `x86_64`, `lipo` universal.
+- Tooling ✔: `cargo-zigbuild` + zig as the one cross-linker for Linux and
+  the BSDs (decision 55), the NDK for Android, host clang + `lipo` for
+  macOS; `scripts/release.sh` picks the linker per family and verifies
+  `SHA256SUMS`; `scripts/validate-dist.sh` runs every Linux artifact under
+  qemu-user (docker binfmt) through `--version`, `keygen`, a loopback
+  `serve` and an `exec` round trip (decision 57).
+- Stretch set ✔ (12 more ship with `--stretch`): `i686` Android;
+  `armv5te`, `powerpc64le`, `loongarch64`, `s390x` (glibc and, tier 3,
+  musl), 32-bit MIPS (tier 3) Linux; NetBSD and OpenBSD `x86_64`/`aarch64`
+  (OpenBSD tier 3). Source changes: `portable-atomic` for `AtomicU64` on
+  32-bit targets without 64-bit atomics (decision 58), `ptsname` fallbacks
+  and an OpenBSD `KERN_PROC_CWD` probe in `mysh-pty`.
+- Not shipped, documented in 08: `mips64el` (libc 0.2.191 socket constants
+  wrong for mips64 — fixed upstream, unreleased), `illumos` (no sysroot for
+  any linker here).
+- Tests ✔: 13 Linux artifacts pass the qemu-user round trip; aarch64 Linux
+  and macOS arm64 run the full suite natively; everything else is link +
+  static inspection (`docs/08-platform-matrix.md` lists the targets lacking
+  runtime validation).
+
 ## Decisions log
 
 Defaults chosen without asking; each is cheap to change now and expensive
@@ -382,6 +412,10 @@ later.
 | 55 | zig (`cargo zigbuild`) is the one linker for every Linux musl/gnu and FreeBSD target, from any host; `scripts/release.sh` keeps a single target table (target, family, tier, required/stretch) and picks the linker by family (host clang for darwin, NDK clang for android); `MUSL_LINKER_*` still select a musl cross gcc for the two original musl targets | `cross` (docker images per target); one musl-cross gcc per architecture; per-target `[target.*] linker` entries in `.cargo/config.toml` | there are no C dependencies, so only a linker is needed, and zig ships every libc/CRT for every target in one package — the `cross` images are x86_64-only and need emulation on Apple silicon, and a dozen gcc toolchains would be a dozen install steps that differ per host; one table means CI, docs and the local script cannot drift |
 | 56 | macOS ships a third artifact, `mysh-<v>-universal-apple-darwin`, made with `lipo -create` from the two single-arch binaries, which also ship | universal only; single-arch only | a user downloading for a Mac should not need to know the arch, while fleet install scripts that already key on `uname -m` keep the small single-arch files; `lipo` is in every Xcode command-line tools install and the step is one line |
 | 57 | `scripts/validate-dist.sh` runs each Linux artifact under `docker run --platform <p>` (qemu-user via binfmt) and does a keygen + loopback `serve`/`exec` round trip inside the container; darwin, FreeBSD and Android artifacts are `SKIP`ped as having no emulator here | trusting `cargo check` + a successful link; a VM per architecture; `qemu-user` on the host without docker | a binary that links can still fault on a wrong atomic width, syscall number or struct layout, and the round trip exercises the handshake, the exec path and the key files on the real libc of that arch; docker + binfmt is one install and the same command for all eight platforms, a VM per arch is not; FreeBSD needs a real kernel and Android a device, so those stay cross-compiled and statically inspected only |
+| 58 | `AtomicU64` in product code comes from `portable-atomic` (`fallback` feature) instead of `std::sync::atomic`; the uses are the transfer stats (`mysh-net::noise`), nonce/byte counters (`mysh-client`) and the `put` temp-file counter (`mysh` server) | `AtomicUsize`/`AtomicU32` with wraparound; a `Mutex<u64>`; dropping the sub-64-bit-atomic targets | std has no `AtomicU64` on armv5te and mips32, and the counters are genuinely 64-bit (bytes transferred, nonces); `portable-atomic` is the std type on every target that has one and a lock-emulated one only where it must be, so the stretch targets cost nothing on the required matrix |
+| 59 | tier-3 stretch targets (no prebuilt `std`: s390x/mips/mipsel musl, aarch64 NetBSD, OpenBSD) are rows of the same `scripts/release.sh` table with tier `3` and build with `cargo +nightly … -Z build-std=std,panic_abort`; NetBSD/OpenBSD link through a generated `zig cc -target` wrapper because cargo-zigbuild only knows FreeBSD; MIPS musl adds `+crt-static` and `-C link-self-contained=no`; `scripts/check-tier3.sh` is the `check-matrix` equivalent (a cargo alias cannot pick a toolchain) | a second toolchain pin for nightly; `cargo-xbuild`; a musl-cross gcc per MIPS arch; leaving tier 3 out | the stable pin stays the only toolchain the required set needs, and nightly is only reached for rows that cannot build any other way; the generated wrapper is what cargo-zigbuild does internally, so there is no second linker story; `+crt-static` is what every other musl row already is, and the self-contained switch only matters because nightly has no crt objects for a target without `rust-std` |
+| 60 | a stretch target ships only after the full `validate-dist` round trip (Linux) or a clean link (BSD); `mips64el` is left out because libc 0.2.191 selects the asm-generic socket constants for `target_arch = "mips64"` and `bind` fails with `ENOPROTOOPT` under qemu, and illumos because neither zig nor this host has an illumos libc to link against — both are recorded with the blocker in `docs/08-platform-matrix.md` | shipping link-only MIPS64 binaries; a `[patch.crates-io]` on libc from git; a hand-built illumos sysroot | a binary that links but cannot open a socket is worse than none, and a git patch on libc would change every target's dependency graph for one stretch row; the blockers are small and upstream (a libc release, an illumos sysroot), so the rows stay documented and are one line to turn on |
+| 61 | `validate-dist` maps targets without a registry image to `native`: the artifact runs inside the host-arch image through the kernel's binfmt handler (mips64le) or an explicit Alpine `qemu-<arch>` package (32-bit MIPS, which binfmt does not cover); `armv5te` reuses the `arm/v6` image since qemu-arm executes ARMv5 code; `MYSH_DOCKER_LIBRARY` re-points the official images at a mirror | skipping those targets; building a local image per arch; `qemu-user-static` from Debian in every run | the binary is static and only needs a `sh`, so the host image plus an emulator is the same round trip at no image cost; the mirror variable exists because Docker Hub's unauthenticated pull limit was hit mid-validation and the script should not depend on an account |
 
 ## Testing strategy
 

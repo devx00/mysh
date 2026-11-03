@@ -9,7 +9,7 @@ use std::fs::{FileTimes, Permissions};
 use std::io::{self, SeekFrom};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use blake2::{Blake2s256, Digest as _};
@@ -18,6 +18,7 @@ use mysh_net::mux::Stream;
 use mysh_proto::file::{Attrs, DirEntry, FileHash, FileKind, FileOp, HashAlgo, ListPage, PutDone};
 use mysh_proto::limits;
 use mysh_proto::open::{ErrorCode, OpenReply};
+use portable_atomic::AtomicU64;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tracing::debug;

@@ -12,7 +12,6 @@ mysh-proto.workspace = true
 rustix.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 
 # `getpwuid_r` (shell/home/user fallbacks) everywhere except Android, where
 # bionic's passwd data is synthetic and the spec skips it; `proc_pidinfo` on

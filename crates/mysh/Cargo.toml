@@ -25,8 +25,8 @@ base64.workspace = true
 blake2.workspace = true
 clap.workspace = true
 dirs.workspace = true
-indicatif.workspace = true
 postcard.workspace = true
+portable-atomic.workspace = true
 rpassword.workspace = true
 # `system` adds `uname` for `Open::Info`.
 rustix = { workspace = true, features = ["system"] }

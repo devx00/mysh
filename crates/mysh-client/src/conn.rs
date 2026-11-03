@@ -16,10 +16,7 @@ use std::{
     net::SocketAddr,
     path::Path,
     pin::Pin,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, atomic::Ordering},
     time::{Duration, Instant},
 };
 
@@ -39,6 +36,7 @@ use mysh_proto::{
     limits,
     open::{ErrorCode, Open, OpenReply},
 };
+use portable_atomic::AtomicU64;
 use tokio::{
     io::{AsyncWriteExt as _, ReadHalf, WriteHalf},
     net::TcpStream,

@@ -28,11 +28,13 @@ curve25519-dalek = "4"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 dirs = "7"
 futures = "0.3"
-indicatif = "0.18"
 # HMAC-SHA1 for OpenSSH `|1|salt|hash` hashed known_hosts entries (mysh-net::trust).
 hmac = "0.12"
 libc = "0.2"
 postcard = { version = "1", features = ["use-std"] }
+# `AtomicU64` on targets without native 64-bit atomics (armv5te, mips32):
+# `fallback` emulates them with a global lock; elsewhere it is the std type.
+portable-atomic = { version = "1", features = ["fallback"] }
 rpassword = "7"
 # rand_core 0.6 matches ssh-key 0.6; `getrandom` provides `OsRng` for key generation.
 rand_core = { version = "0.6", features = ["getrandom"] }

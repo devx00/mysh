@@ -23,12 +23,11 @@ and Android.
 - Embeddable: the `mysh-client` crate is the same client code behind a
   Rust API with no terminal dependencies (`docs/07-embedding.md`).
 
-**Status:** milestones M1–M10 of [docs/06-roadmap.md](docs/06-roadmap.md)
-are implemented and tested on Linux, macOS and Android; static release
-binaries are built by `scripts/release.sh`. M6–M10 turned mysh into a
-remote process API for agents and orchestrators (`--json` everywhere, a
-session read/write API with offsets, file primitives, fleet fan-out, the
-`mysh-client` crate, an MCP server) — see the roadmap.
+**Status:** milestones M1–M11 of [docs/06-roadmap.md](docs/06-roadmap.md)
+are implemented. M6–M10 turned mysh into a remote process API for agents and
+orchestrators (`--json` everywhere, a session read/write API with offsets,
+file primitives, fleet fan-out, the `mysh-client` crate, an MCP server); M11
+made it build for 25 targets out of the box — see "Targets" below.
 
 | doc                                              | contents                                  |
 | ------------------------------------------------ | ----------------------------------------- |
@@ -39,6 +38,7 @@ session read/write API with offsets, file primitives, fleet fan-out, the
 | [05-meta-shell](docs/05-meta-shell.md)           | meta key, prompt, commands, CLI, config   |
 | [06-roadmap](docs/06-roadmap.md)                 | milestones, decisions log, testing        |
 | [07-embedding](docs/07-embedding.md)             | `mysh-client` library API, MCP server tools and schemas |
+| [08-platform-matrix](docs/08-platform-matrix.md) | every target, how it was validated, what does not ship |
 
 ## Quickstart
 
@@ -79,9 +79,10 @@ println!("{} exit={:?}", out.stdout.as_bytes().escape_ascii(), out.exit);
 cargo build --release        # native
 cargo lint                   # clippy, -D warnings
 cargo test --workspace       # unit + integration (loopback, real ptys)
-cargo check-matrix           # type-check every supported target
-scripts/release.sh           # all five release binaries + SHA256SUMS in dist/
-scripts/android-build.sh     # link an Android binary with the NDK clang
+cargo check-matrix           # type-check the required targets (check-matrix-stretch, scripts/check-tier3.sh for the rest)
+scripts/release.sh           # required set: 13 targets + universal, SHA256SUMS in dist/ (needs zig + cargo-zigbuild, the NDK)
+scripts/release.sh --stretch # plus the 12 stretch targets (nightly + rust-src for tier 3)
+scripts/validate-dist.sh     # run every Linux artifact under qemu-user (docker + binfmt)
 scripts/lima-test.sh         # run the suite on Linux in a lima VM
 scripts/fuzz-all.sh 60       # every fuzz target for 60 s (needs nightly + cargo-fuzz)
 ```
@@ -89,8 +90,27 @@ scripts/fuzz-all.sh 60       # every fuzz target for 60 s (needs nightly + cargo
 Deploy as a service with the files in [`contrib/`](contrib/) (systemd,
 launchd, Termux:Boot).
 
-Cross-compilation and baked (keyless) builds: see `docs/01-architecture.md`
+Cross-compilation details and baked (keyless) builds: `docs/01-architecture.md`
 and `docs/02-security.md`.
+
+## Targets
+
+One `scripts/release.sh` run produces the required set; `--stretch` adds the
+rest. Full table, validation method per artifact, and the two targets that
+do not ship (`mips64el`, illumos) are in
+[docs/08-platform-matrix.md](docs/08-platform-matrix.md).
+
+| OS | required | stretch |
+| --- | --- | --- |
+| Linux (static musl) | x86_64, aarch64, i686, armv7, armv6, riscv64 | armv5te, ppc64le, loongarch64, s390x (musl + glibc), mips, mipsel |
+| macOS | aarch64, x86_64, universal | — |
+| Android (bionic, API 24) | aarch64, armv7, x86_64 | i686 |
+| FreeBSD | x86_64, aarch64 | — |
+| NetBSD / OpenBSD | — | x86_64, aarch64 each |
+
+Every Linux artifact is exercised under qemu-user by `scripts/validate-dist.sh`
+(`--version`, `keygen`, a loopback `serve` + `exec`); macOS arm64 and aarch64
+Linux run the full test suite natively. Windows is out of scope.
 
 ## License
 

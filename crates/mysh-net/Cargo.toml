@@ -16,6 +16,7 @@ curve25519-dalek.workspace = true
 ed25519-dalek.workspace = true
 futures.workspace = true
 postcard.workspace = true
+portable-atomic.workspace = true
 serde.workspace = true
 hmac.workspace = true
 rand_core.workspace = true

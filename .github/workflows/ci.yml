@@ -58,6 +58,41 @@ jobs:
           key: ${{ matrix.target }}
       - run: cargo check --workspace --target ${{ matrix.target }}
 
+  # Stretch targets (scripts/release.sh `stretch` rows), never blocking.
+  # Tier-2 rows are `cargo check`; tier-3 rows have no prebuilt std and go
+  # through scripts/check-tier3.sh (nightly + `-Z build-std`).
+  cross-check-stretch:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: i686-linux-android, tier: 2 }
+          - { target: armv5te-unknown-linux-musleabi, tier: 2 }
+          - { target: powerpc64le-unknown-linux-musl, tier: 2 }
+          - { target: s390x-unknown-linux-gnu, tier: 2 }
+          - { target: loongarch64-unknown-linux-musl, tier: 2 }
+          - { target: x86_64-unknown-netbsd, tier: 2 }
+          - { target: s390x-unknown-linux-musl, tier: 3 }
+          - { target: mipsel-unknown-linux-musl, tier: 3 }
+          - { target: mips-unknown-linux-musl, tier: 3 }
+          - { target: aarch64-unknown-netbsd, tier: 3 }
+          - { target: x86_64-unknown-openbsd, tier: 3 }
+          - { target: aarch64-unknown-openbsd, tier: 3 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - if: matrix.tier == 3
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: stretch-${{ matrix.target }}
+      - if: matrix.tier == 2
+        run: cargo check --workspace --target ${{ matrix.target }}
+      - if: matrix.tier == 3
+        run: scripts/check-tier3.sh ${{ matrix.target }}
+
   deny:
     runs-on: ubuntu-latest
     steps:

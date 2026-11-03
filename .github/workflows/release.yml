@@ -8,6 +8,8 @@ name: release
 #   darwin   macOS runner, host clang, `lipo` universal binary
 #   zig      ubuntu runner, zig + cargo-zigbuild for linux-musl and freebsd
 #   android  ubuntu runner, the preinstalled NDK (ANDROID_NDK_LATEST_HOME)
+#   stretch  ubuntu runner, zig + NDK + nightly (build-std for tier 3); the
+#            `stretch` rows of the table, never blocking the release
 
 on:
   push:
@@ -94,8 +96,46 @@ jobs:
           name: mysh-${{ matrix.target }}
           path: dist/mysh-*
 
+  stretch:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - i686-linux-android
+          - armv5te-unknown-linux-musleabi
+          - powerpc64le-unknown-linux-musl
+          - s390x-unknown-linux-gnu
+          - s390x-unknown-linux-musl
+          - loongarch64-unknown-linux-musl
+          - mipsel-unknown-linux-musl
+          - mips-unknown-linux-musl
+          - x86_64-unknown-netbsd
+          - aarch64-unknown-netbsd
+          - x86_64-unknown-openbsd
+          - aarch64-unknown-openbsd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - run: rustup toolchain install nightly --profile minimal --component rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: stretch-${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: cargo install cargo-zigbuild --locked
+      - run: scripts/release.sh ${{ matrix.target }}
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mysh-${{ matrix.target }}
+          path: dist/mysh-*
+
   release:
-    needs: [darwin, zig, android]
+    needs: [darwin, zig, android, stretch]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

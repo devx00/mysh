@@ -27,11 +27,12 @@ use std::fmt;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 
 use mysh_proto::{NOISE_MAX_MESSAGE, NOISE_TAG_LEN, limits};
+use portable_atomic::AtomicU64;
 use snow::StatelessTransportState;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 

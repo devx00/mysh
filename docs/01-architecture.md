@@ -167,11 +167,11 @@ crates/mysh/src/
 | `ssh-key`                      | OpenSSH key/authorized_keys/known_hosts parsing | `encryption` feature for passphrase-protected keys |
 | `curve25519-dalek`, `sha2`     | ed25519 → X25519 conversion, fingerprints | same majors as `snow`/`ssh-key`                          |
 | `rustix`                       | pty, termios, ioctls, process          | one API for Linux/macOS/Android; no `nix`                  |
-| `libc` (macOS only)            | `proc_pidinfo` for cwd probe           |                                                            |
+| `libc` (BSDs + macOS)          | `proc_pidinfo` (macOS), `sysctl` cwd probes (FreeBSD, OpenBSD), `ptsname`/`ptsname_r` (OpenBSD/NetBSD) |                                                            |
+| `portable-atomic` (`fallback`) | `AtomicU64` in transfer stats and counters | std's `AtomicU64` does not exist on targets without native 64-bit atomics (armv5te, mips32); `fallback` emulates it with a global lock there and is the std type everywhere else |
 | `clap`                         | CLI                                    | derive; `mysh-client` derives `Args` on its request structs (`args`) so the binary, the control socket and the library share one definition |
 | `shlex`                        | meta shell tokenizer                   |                                                            |
 | (built-in line editor)         | prompt line editing, history           | `client::meta` owns a small editor fed by the stdin reader task; `rustyline` was dropped because it would compete with that task for stdin |
-| `indicatif`                    | transfer progress bars                 |                                                            |
 | `rpassword`                    | passphrase and TOFU prompts            |                                                            |
 | `dirs`                         | XDG / platform directories             |                                                            |
 | `tracing`                      | logging                                | `-v` raises level; never logs key material                 |
@@ -188,14 +188,14 @@ ssh, not reimplementing it), `crossterm` (too much for raw mode + winsize),
 | --------------- | ---------------------------------- | ------------------------------ | ------------------------------------------------------ | ----------------------------- |
 | client          | yes                                | yes                            | Termux                                                 | yes (static inspection only, no BSD runtime in CI) |
 | server          | yes                                | yes                            | Termux, `adb shell` (shell uid), rooted                | yes (same caveat)             |
-| targets         | musl, static: `x86_64`, `aarch64`, `i686`, `armv7` (eabihf), `arm` (v6 eabihf), `riscv64gc`; stretch `powerpc64le`, `loongarch64` (musl), `s390x` (gnu) | `aarch64`, `x86_64` + `universal` (`lipo`) | `aarch64`, `armv7`, `x86_64` (API 24); stretch `i686` | `{x86_64,aarch64}-unknown-freebsd` |
-| pty open        | `posix_openpt`/`/dev/ptmx`         | same                           | same (bionic); needs `devpts`, present in Termux/adb   | same (`pts(4)`; rustix `ptsname` works; NetBSD uses `libc::ptsname_r` behind cfg) |
-| cwd probe       | `/proc/<pid>/cwd`                  | `proc_pidinfo(PROC_PIDVNODEPATHINFO)` | `/proc/<pid>/cwd` (may be denied cross-uid; same uid is fine) | `sysctl(kern.proc.cwd.<pid>)` → one `kinfo_file`, `kf_path` |
+| targets         | musl, static: `x86_64`, `aarch64`, `i686`, `armv7` (eabihf), `arm` (v6 eabihf), `riscv64gc`; stretch `armv5te`, `powerpc64le`, `loongarch64`, `s390x` (musl, tier 3), `mipsel`/`mips` (musl, tier 3), `s390x` (gnu) | `aarch64`, `x86_64` + `universal` (`lipo`) | `aarch64`, `armv7`, `x86_64` (API 24); stretch `i686` | `{x86_64,aarch64}-unknown-freebsd`; stretch NetBSD `x86_64` (`aarch64` tier 3) and OpenBSD `x86_64`/`aarch64` (tier 3) |
+| pty open        | `posix_openpt`/`/dev/ptmx`         | same                           | same (bionic); needs `devpts`, present in Termux/adb   | same (`pts(4)`; rustix `ptsname` works; NetBSD uses `libc::ptsname_r`, OpenBSD `libc::ptsname` (no `ptsname_r`), both behind cfg) |
+| cwd probe       | `/proc/<pid>/cwd`                  | `proc_pidinfo(PROC_PIDVNODEPATHINFO)` | `/proc/<pid>/cwd` (may be denied cross-uid; same uid is fine) | `sysctl(kern.proc.cwd.<pid>)` → one `kinfo_file`, `kf_path`; OpenBSD `sysctl(kern.proc_cwd.<pid>)` → path string; NetBSD `Unsupported` |
 | shell detection | `--shell` → `$SHELL` → passwd → `/bin/sh` | same                   | `--shell` → `$SHELL` → `/system/bin/sh`                | same as Linux                 |
 | home            | `$HOME` → passwd → `/`             | same                           | `$HOME` → `/data/local/tmp` → `/`                      | same as Linux                 |
 | config dir      | `$XDG_CONFIG_HOME/mysh` → `~/.config/mysh` | `~/.config/mysh` (not `~/Library`, keep one path) | `~/.config/mysh` under Termux `$HOME`    | `~/.config/mysh`              |
 | run as service  | systemd unit (`contrib/`)          | launchd plist (`contrib/`)     | Termux:Boot script; or `adb shell nohup ... &`         | `rc.d` script (not shipped)   |
-| notes           | `getpwuid` via libc                | SIP irrelevant; no sandbox     | PIE required (Rust default); no `getpwnam` data; SELinux may block `/proc` of other uids | default `PATH` adds `/usr/local/sbin:/usr/sbin:/sbin`; linked dynamically against base libc via `cargo zigbuild`; NetBSD is a stretch target (`/usr/pkg` on `PATH`) |
+| notes           | `getpwuid` via libc                | SIP irrelevant; no sandbox     | PIE required (Rust default); no `getpwnam` data; SELinux may block `/proc` of other uids | default `PATH` adds `/usr/local/sbin:/usr/sbin:/sbin`; linked dynamically against base libc via `cargo zigbuild`; NetBSD (`/usr/pkg` on `PATH`) and OpenBSD (tier 3, `/usr/X11R6/bin` on `PATH`) are stretch targets |
 
 ## Build
 
@@ -208,6 +208,7 @@ MYSH_BAKED_IDENTITY=fleet.secret MYSH_BAKED_PEERS=fleet.pub \
   cargo build --release --features baked                 # baked
 cargo check-matrix                                       # type-check every required target, no linkers needed
 cargo check-matrix-stretch                               # the stretch targets that ship std
+scripts/check-tier3.sh [TARGET...]                       # tier-3 stretch targets: nightly + -Z build-std
 cargo lint                                               # clippy -D warnings
 scripts/lima-test.sh                                     # full test suite on Linux in a lima VM (scripts/lima.yaml)
 ```
@@ -221,24 +222,44 @@ required/stretch) and picks the linker by family:
 | darwin                 | host clang (`cargo build`)                               | both archs, then `lipo -create` → `mysh-<v>-universal-apple-darwin`     |
 | linux-musl, linux-gnu  | zig (`cargo zigbuild`)                                   | `brew install zig && cargo install cargo-zigbuild`; musl output is static |
 | freebsd                | zig (`cargo zigbuild`)                                   | dynamic against FreeBSD libc; zig's `-nostartfiles` warning on 32-bit ARM musl is harmless |
+| netbsd, openbsd        | `zig cc -target <arch>-<os>` via a wrapper in `target/zig-cc/` | cargo-zigbuild knows no BSD but FreeBSD; dynamic against the libc zig ships for that OS (NetBSD 10.1, OpenBSD 7.8 — OpenBSD binaries are tied to that release) |
 | android                | NDK clang, API 24 (`scripts/android-build.sh`)           | `ANDROID_NDK_HOME` or the Homebrew cask; `armv7a-` clang name mapping   |
+
+Tier-3 rows (no prebuilt `std`: `s390x` musl, `mipsel`/`mips` musl,
+`aarch64` NetBSD, both OpenBSD targets) build with `cargo +nightly … -Z
+build-std=std,panic_abort` (`rustup toolchain install nightly --component
+rust-src`); the same table drives `scripts/check-tier3.sh`. MIPS musl also
+gets `-C target-feature=+crt-static -C link-self-contained=no`: rustc's
+MIPS musl specs default to dynamic linking, which zig's static-only
+`libzigc` cannot satisfy, and nightly has no self-contained crt objects
+for a target without `rust-std`.
 
 `MUSL_LINKER_AARCH64`/`MUSL_LINKER_X86_64` name a musl cross gcc instead of
 zig for those two targets. `cross` is not used: its images are x86_64-only
 and would need emulation on Apple silicon, while zig links every target
 from any host. The required set is 13 targets plus the universal binary;
-`--stretch` (or `MYSH_STRETCH=1`) adds the stretch rows.
+`--stretch` (or `MYSH_STRETCH=1`) adds the 12 stretch rows. Stretch
+targets that were tried and not shipped, with the blocker, are listed in
+`docs/08-platform-matrix.md`.
 
 `scripts/validate-dist.sh` runs each Linux artifact in `dist/` under
 `docker run --platform <p>` (qemu-user via binfmt, `alpine:3.20` for musl,
-`debian:bookworm-slim` for glibc): `--version`, `keygen`, a loopback
-`serve` and an `exec` round trip, reporting `PASS`/`FAIL` per target and
-`SKIP` for darwin, FreeBSD and Android, which have no emulator here.
-FreeBSD binaries are cross-compiled and statically inspected only.
+`debian:trixie-slim` for glibc — bookworm no longer publishes s390x —
+and `ghcr.io/loong64/debian:trixie-slim` for loong64, which Docker Hub
+does not carry): `--version`, `keygen`, a loopback `serve` and an `exec`
+round trip, reporting `PASS`/`FAIL` per target and `SKIP` for darwin,
+FreeBSD, NetBSD, OpenBSD and Android, which have no emulator here.
+`armv5te` runs on the `arm/v6` image (qemu-arm executes ARMv5 code);
+32-bit MIPS has no binfmt handler, so those run through the Alpine
+`qemu-mipsel`/`qemu-mips` package installed in a host-arch container.
+`MYSH_DOCKER_LIBRARY=mirror.gcr.io/library` sidesteps Docker Hub's
+unauthenticated pull limit. BSD binaries are cross-compiled and
+statically inspected only.
 
 The release workflow runs the same script per runner: macOS for darwin and
 the universal binary, ubuntu + zig for linux-musl/freebsd, ubuntu + the
-preinstalled NDK for android; a final job merges the artifacts, writes
+preinstalled NDK for android, and a non-blocking `stretch` job (zig + NDK
++ nightly) for the stretch rows; a final job merges the artifacts, writes
 `SHA256SUMS` and uploads. Android binaries are pushed with
 `adb push target/aarch64-linux-android/release/mysh /data/local/tmp/`.
 

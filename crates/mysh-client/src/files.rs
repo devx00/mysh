@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -28,6 +28,7 @@ use mysh_proto::{
     file::{Attrs, DirEntry, FileHash, FileKind, FileOp, HashAlgo, ListPage, PutDone},
     open::{ErrorCode, Open},
 };
+use portable_atomic::AtomicU64;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
     sync::Semaphore,

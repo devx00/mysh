@@ -5,7 +5,7 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-Milestones M1–M10 of `docs/06-roadmap.md` are implemented: mysh connects,
+Milestones M1–M11 of `docs/06-roadmap.md` are implemented: mysh connects,
 authenticates, runs interactive and non-interactive sessions that survive a
 disconnect, transfers files and forwards ports on Linux, macOS and Android,
 ships as static release binaries, and exposes everything to programs through
@@ -140,20 +140,27 @@ server.
 - **Release** (M4): `scripts/release.sh` links all five targets and writes
   `SHA256SUMS`; `.github/workflows/release.yml` does the same on tags;
   `contrib/` has a systemd unit, a launchd plist and a Termux:Boot script.
-- **Build matrix** (M11, in progress): `scripts/release.sh` builds the
+- **Build matrix** (M11): `scripts/release.sh` builds the
   required set from one target table — Linux musl `x86_64`, `aarch64`,
   `i686`, `armv7`, `arm` (v6), `riscv64gc` (static, via zig /
   `cargo zigbuild`), FreeBSD `x86_64`, `aarch64` (zig), Android `aarch64`,
   `armv7`, `x86_64` (NDK clang, API 24), macOS `aarch64`, `x86_64` and a
   `lipo` universal binary — 14 artifacts plus a verified `SHA256SUMS` and a
-  summary table; `--stretch` adds `powerpc64le`/`loongarch64` musl,
-  `s390x` gnu and `i686` android. `scripts/validate-dist.sh` runs every
-  Linux artifact under docker + qemu-user with a keygen and loopback
-  serve/exec round trip (`PASS`/`FAIL`/`SKIP` per target). `cargo
-  check-matrix` / `check-matrix-stretch`, `rust-toolchain.toml` and the CI
-  `cross-check` matrix list the same targets; the release workflow builds
-  darwin on macOS, musl/FreeBSD with zig and Android with the NDK on
-  ubuntu (docs/01 "Build", "Platform matrix").
+  summary table; `--stretch` adds 12 rows: `i686` android, `armv5te`,
+  `powerpc64le`, `loongarch64`, `s390x` musl, `mipsel`/`mips` musl,
+  `s390x` gnu, NetBSD `x86_64`/`aarch64` and OpenBSD `x86_64`/`aarch64`
+  (tier-3 rows build std on nightly, the BSDs link through a `zig cc`
+  wrapper; `mips64el` and illumos are documented as not shipped).
+  `scripts/validate-dist.sh` runs every Linux artifact under docker +
+  qemu-user with a keygen and loopback serve/exec round trip
+  (`PASS`/`FAIL`/`SKIP` per target; 32-bit MIPS through Alpine's
+  `qemu-<arch>`, `MYSH_DOCKER_LIBRARY` for a registry mirror). `cargo
+  check-matrix` / `check-matrix-stretch` / `scripts/check-tier3.sh`,
+  `rust-toolchain.toml` and the CI `cross-check` (+ non-blocking
+  `cross-check-stretch`) matrices list the same targets; the release
+  workflow builds darwin on macOS, musl/FreeBSD with zig and Android with
+  the NDK on ubuntu, plus a non-blocking `stretch` job (docs/01 "Build",
+  "Platform matrix").
 - **Verification**: 441 tests (unit plus integration against an in-process
   loopback server, including real-pty interactive, persistence,
   control-socket, JSON, session-API, fleet, audit, pairing, library-API and

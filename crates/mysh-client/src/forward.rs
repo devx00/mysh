@@ -13,7 +13,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU32, Ordering},
     },
     time::Duration,
 };
@@ -27,6 +27,7 @@ use mysh_proto::{
     forward::Bound,
     open::{ErrorCode, Open, OpenReply},
 };
+use portable_atomic::AtomicU64;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},

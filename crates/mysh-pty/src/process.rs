@@ -12,7 +12,10 @@ use rustix::process::Pid;
 ///
 /// Linux/Android: `readlink("/proc/<pid>/cwd")` (may be denied across uids
 /// under `SELinux`). macOS: `proc_pidinfo(PROC_PIDVNODEPATHINFO)`. FreeBSD:
-/// `sysctl(kern.proc.cwd.<pid>)` returning one `kinfo_file`.
+/// `sysctl(kern.proc.cwd.<pid>)` returning one `kinfo_file`. OpenBSD:
+/// `sysctl(kern.proc_cwd.<pid>)` returning a NUL-terminated path. NetBSD:
+/// `Unsupported` (its `kern.proc_args.<pid>.cwd` sub-op is not exposed by
+/// the libc crate).
 pub fn process_cwd(pid: u32) -> io::Result<PathBuf> {
     imp::process_cwd(pid)
 }
@@ -150,11 +153,52 @@ mod imp {
     }
 }
 
+/// OpenBSD: `sysctl([CTL_KERN, KERN_PROC_CWD, pid])` fills a NUL-terminated
+/// path (sysctl(2)). Compiled only on OpenBSD; statically inspected, not run.
+#[cfg(target_os = "openbsd")]
+mod imp {
+    use std::ffi::{OsStr, c_int, c_void};
+    use std::io;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+
+    pub(super) fn process_cwd(pid: u32) -> io::Result<PathBuf> {
+        let pid = c_int::try_from(pid)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid out of range"))?;
+        let mib: [c_int; 3] = [libc::CTL_KERN, libc::KERN_PROC_CWD, pid];
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        let mut len = buf.len();
+        // SAFETY: `mib` is a valid array of 3 ints, `buf` is a writable
+        // buffer of `len` bytes and `len` is a valid in/out pointer; no new
+        // value is passed (null/0).
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_ptr(),
+                3,
+                buf.as_mut_ptr().cast::<c_void>(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        buf.truncate(len);
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        if end == 0 {
+            return Err(io::Error::other("kern.proc_cwd returned an empty path"));
+        }
+        Ok(PathBuf::from(OsStr::from_bytes(&buf[..end])))
+    }
+}
+
 #[cfg(not(any(
     target_os = "linux",
     target_os = "android",
     target_os = "macos",
-    target_os = "freebsd"
+    target_os = "freebsd",
+    target_os = "openbsd"
 )))]
 mod imp {
     use std::io;
@@ -345,6 +389,10 @@ pub fn default_path() -> &'static str {
     } else if cfg!(target_os = "netbsd") {
         // pkgsrc lives under `/usr/pkg`.
         "/usr/pkg/bin:/usr/local/bin:/usr/bin:/bin:/usr/pkg/sbin:/usr/sbin:/sbin"
+    } else if cfg!(target_os = "openbsd") {
+        // Packages live under `/usr/local`, X under `/usr/X11R6`; same
+        // sbin reasoning as FreeBSD.
+        "/usr/local/bin:/usr/bin:/bin:/usr/X11R6/bin:/usr/local/sbin:/usr/sbin:/sbin"
     } else {
         "/usr/local/bin:/usr/bin:/bin"
     }

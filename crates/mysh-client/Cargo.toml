@@ -19,9 +19,9 @@ blake2.workspace = true
 # library; clap is a parser, not a terminal dependency.
 clap.workspace = true
 dirs.workspace = true
+portable-atomic.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-shlex.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 toml.workspace = true

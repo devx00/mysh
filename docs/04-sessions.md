@@ -78,7 +78,7 @@ the whole group later if needed (`kill(-pgid)` is a one-line change).
 
 ### Shell and home resolution
 
-| step | Linux/macOS/FreeBSD/NetBSD            | Android                        |
+| step | Linux/macOS/FreeBSD/NetBSD/OpenBSD    | Android                        |
 | ---- | ------------------------------------- | ------------------------------ |
 | 1    | `--shell PATH`                        | same                           |
 | 2    | `$SHELL`                              | same (Termux sets it)          |
@@ -90,7 +90,8 @@ the server's own `PATH` if set, else `/usr/local/bin:/usr/bin:/bin`
 (`/system/bin:/system/xbin` on Android;
 `/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin` on FreeBSD;
 `/usr/pkg/bin:/usr/local/bin:/usr/bin:/bin:/usr/pkg/sbin:/usr/sbin:/sbin` on
-NetBSD — BSD base tools such as `ifconfig` live in the sbin dirs and are
+NetBSD; `/usr/local/bin:/usr/bin:/bin:/usr/X11R6/bin:/usr/local/sbin:/usr/sbin:/sbin`
+on OpenBSD — BSD base tools such as `ifconfig` live in the sbin dirs and are
 usable unprivileged).
 
 ### Cwd probe
@@ -104,20 +105,24 @@ group leader), fallback shell pid.
 | Android  | same; may fail under SELinux for other uids, not ours    |
 | macOS    | `proc_pidinfo(pid, PROC_PIDVNODEPATHINFO)` → `pvi_cdir.vip_path` |
 | FreeBSD  | `sysctl({CTL_KERN, KERN_PROC, KERN_PROC_CWD, pid})` → one `kinfo_file`, `kf_structsize` bounds the record, `kf_path` is the cwd (`mysh_pty::process::cwd_from_kinfo`, unit-tested on a synthetic buffer on every host) |
-| NetBSD   | unsupported (`ErrorKind::Unsupported`; stretch target)   |
+| OpenBSD  | `sysctl({CTL_KERN, KERN_PROC_CWD, pid})` → NUL-terminated path (sysctl(2) `kern.proc_cwd`; `PATH_MAX` buffer) |
+| NetBSD   | unsupported (`ErrorKind::Unsupported`; stretch target). The kernel has `kern.proc_args.<pid>.cwd` (`KERN_PROC_CWD = 6` under `KERN_PROC_ARGS` in `sys/sysctl.h`) but the libc crate does not expose that sub-op; wire it once it does |
 | other    | unsupported (`ErrorKind::Unsupported`)                   |
 
 Failure → `None`; the meta shell falls back to the server home and says so.
 
-FreeBSD and NetBSD support in `mysh-pty` is cross-compiled
+FreeBSD, NetBSD and OpenBSD support in `mysh-pty` is cross-compiled
 (`cargo check`/`clippy --target {x86_64,aarch64}-unknown-freebsd`,
-`x86_64-unknown-netbsd`) and statically inspected only; there is no BSD
-runtime in CI or on the dev host. Inferred, not run: the `kern.proc.cwd`
-reply shape (one `kinfo_file`, `kf_path` NUL-terminated), the NetBSD
-`ptsname_r` fallback in `open_pty` (rustix has no `ptsname` there), and the
-rustix `openpt`/`grantpt`/`unlockpt`/`ioctl_tiocsctty`/`tcgetpgrp` path on
-both BSDs. The `kf_path` offset is a `const` assertion against libc's layout
-under `cfg(target_os = "freebsd")`.
+`x86_64-unknown-netbsd`; OpenBSD is tier 3, so
+`cargo +nightly check -Z build-std=std,panic_abort --target {x86_64,aarch64}-unknown-openbsd`)
+and statically inspected only; there is no BSD runtime in CI or on the dev
+host. Inferred, not run: the `kern.proc.cwd` reply shape (one `kinfo_file`,
+`kf_path` NUL-terminated), the OpenBSD `kern.proc_cwd` string reply, the
+NetBSD `ptsname_r` and OpenBSD `ptsname` (static buffer, no `ptsname_r`)
+fallbacks in `open_pty` (rustix has no `ptsname` on either), and the rustix
+`openpt`/`grantpt`/`unlockpt`/`ioctl_tiocsctty`/`tcgetpgrp` path on all three
+BSDs. The `kf_path` offset is a `const` assertion against libc's layout under
+`cfg(target_os = "freebsd")`.
 
 ## Client terminal driver
 
