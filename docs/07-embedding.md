@@ -1,9 +1,11 @@
 # Embedding mysh (M10)
 
-Two ways to drive a mysh server from a program: the `mysh-client` library
-crate (a Rust API with no terminal dependencies) and `mysh mcp`, a Model
+Three ways to drive a mysh server from a program: the `mysh-client` library
+crate (a Rust API with no terminal dependencies), `mysh mcp`, a Model
 Context Protocol server over stdio that any MCP client can use as a set of
-tools. Both run the same client code as the `mysh` binary, so behaviour,
+tools, and — for an agent that already has a shell — the plain CLI with
+`--json`, described for that audience in [`skills/mysh/SKILL.md`](../skills/mysh/SKILL.md).
+All three run the same client code as the `mysh` binary, so behaviour,
 error codes and JSON shapes match the CLI (05-meta-shell.md "Agent
 interface").
 

@@ -39,6 +39,7 @@ made it build for 25 targets out of the box — see "Targets" below.
 | [06-roadmap](docs/06-roadmap.md)                 | milestones, decisions log, testing        |
 | [07-embedding](docs/07-embedding.md)             | `mysh-client` library API, MCP server tools and schemas |
 | [08-platform-matrix](docs/08-platform-matrix.md) | every target, how it was validated, what does not ship |
+| [skills/mysh](skills/mysh/SKILL.md)              | agent skill: driving a running server from the CLI with `--json` |
 
 ## Quickstart
 
