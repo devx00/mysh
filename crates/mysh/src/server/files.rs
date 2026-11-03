@@ -392,10 +392,10 @@ pub(crate) mod tests {
     use std::os::unix::fs::DirBuilderExt as _;
     use std::sync::Arc;
 
-    use mysh_net::handshake::{client_handshake, server_handshake};
+    use mysh_net::handshake::{ClientAuth, Peer, client_handshake, server_handshake};
     use mysh_net::keys::SecretKey;
     use mysh_net::mux::{Incoming, Mode, Mux, OpenError, accept_open};
-    use mysh_proto::handshake::{ClientHello, ServerHello};
+    use mysh_proto::handshake::ServerHello;
     use mysh_proto::open::Open;
     use tokio::io::AsyncReadExt as _;
 
@@ -445,7 +445,7 @@ pub(crate) mod tests {
         let client_key = SecretKey::generate();
         let server_key = SecretKey::generate();
         let (a, b) = tokio::io::duplex(64 * 1024);
-        let client = client_handshake(a, &client_key, ClientHello { caps: 0 }, |_, _| Ok(()));
+        let client = client_handshake(a, &client_key, 0, |_, _| Ok(()), ClientAuth::Static);
         let server = server_handshake(
             b,
             &server_key,
@@ -477,7 +477,13 @@ pub(crate) mod tests {
         });
         let peer: SocketAddr = "127.0.0.1:1".parse().expect("addr");
         let local: SocketAddr = "127.0.0.1:2".parse().expect("addr");
-        let ctx = ConnCtx::for_tests(policy, server_mux.clone(), peer, local, client_key.public());
+        let ctx = ConnCtx::for_tests(
+            policy,
+            server_mux.clone(),
+            peer,
+            local,
+            Peer::Static(client_key.public()),
+        );
         tokio::spawn(async move {
             while let Some(mut stream) = server_in.accept().await {
                 let open = match accept_open(&mut stream).await {

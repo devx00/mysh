@@ -11,11 +11,16 @@ use std::io::{self, IsTerminal as _, Read as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use mysh_net::agent::{Agent, AgentKey, parse_ed25519_blob};
 use mysh_net::keys::{
-    Fingerprint, Identity, PublicKey, SECRET_KEY_TYPE, SecretKey, load_secret_key,
-    parse_public_key, parse_secret_key, write_public_key, write_secret_key,
+    Fingerprint, Identity, PUBLIC_KEY_TYPE, PublicKey, SECRET_KEY_TYPE, SSH_ED25519_TYPE,
+    SecretKey, load_secret_key, parse_public_key, parse_secret_key, write_public_key,
+    write_secret_key,
 };
 use mysh_net::trust::{AuthorizedKeys, HostMatch, KnownHosts, Pin};
+use mysh_proto::limits::MAX_AGENT_KEYS;
 use tracing::{debug, info, warn};
 
 use crate::cli::{FingerprintArgs, KeygenArgs, ServeArgs};
@@ -148,15 +153,187 @@ fn load_first(
     Ok(None)
 }
 
-/// Resolve the client identity: `-i` → `$MYSH_IDENTITY` → baked →
-/// `~/.config/mysh/id` → `~/.ssh/id_ed25519` (files skipped with
-/// `--baked-only`).
-pub fn load_client_identity(target: &Target, paths: &Paths, baked: &Baked) -> Result<Identity> {
+/// Who the client authenticates as (docs/02-security.md, "Identity
+/// resolution" and "Signature authentication").
+#[derive(Debug, Clone)]
+pub enum ClientIdentity {
+    /// A loaded private key: the Noise static is the identity.
+    Static(Identity),
+    /// An ed25519 key held by the `ssh-agent` at `socket`: the Noise static
+    /// is fresh per connection and the agent signs the handshake hash.
+    Agent { socket: PathBuf, key: AgentKey },
+}
+
+impl ClientIdentity {
+    pub fn fingerprint(&self) -> Fingerprint {
+        match self {
+            Self::Static(id) => id.public.fingerprint(),
+            Self::Agent { key, .. } => Fingerprint::of_ssh_ed25519(&key.public),
+        }
+    }
+
+    /// The public key as an `authorized_keys` line (for `authorize`):
+    /// `mysh-x25519 …` for a key file, `ssh-ed25519 …` for an agent key.
+    pub fn public_line(&self) -> String {
+        match self {
+            Self::Static(id) => id.public.to_line(id.comment.as_deref()),
+            Self::Agent { key, .. } => {
+                let b64 = STANDARD.encode(&key.blob);
+                match key.comment.trim() {
+                    "" => format!("{SSH_ED25519_TYPE} {b64}\n"),
+                    comment => format!("{SSH_ED25519_TYPE} {b64} {comment}\n"),
+                }
+            }
+        }
+    }
+
+    /// `x25519 SHA256:… (path)` or `ssh-ed25519 SHA256:… (agent: comment)`.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Static(id) => format!("x25519 {} ({})", id.public.fingerprint(), id.source),
+            Self::Agent { key, .. } => format!(
+                "{SSH_ED25519_TYPE} {} (agent: {})",
+                self.fingerprint(),
+                key.comment
+            ),
+        }
+    }
+}
+
+/// `Some(pk)` when `path` holds an `ssh-ed25519` public key line (an OpenSSH
+/// `.pub` file), naming a key the agent must hold. `None` for a private key
+/// (loaded by the caller) and for unreadable files (the caller's loader
+/// reports those). A public key of another type is an error: nothing can
+/// authenticate with it.
+fn ssh_ed25519_public_file(path: &Path) -> Result<Option<[u8; 32]>> {
+    let is_pub = path.extension().is_some_and(|e| e == "pub");
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if is_pub => return Err(e).with_context(|| format!("reading {}", path.display())),
+        Err(_) => return Ok(None),
+    };
+    let Some(line) = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+    else {
+        if is_pub {
+            bail!("{}: empty public key file", path.display());
+        }
+        return Ok(None);
+    };
+    let mut tokens = line.split_whitespace();
+    match tokens.next() {
+        Some(SSH_ED25519_TYPE) => {
+            let pk = tokens
+                .next()
+                .and_then(|b64| STANDARD.decode(b64).ok())
+                .and_then(|blob| parse_ed25519_blob(&blob))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{}: malformed {SSH_ED25519_TYPE} public key",
+                        path.display()
+                    )
+                })?;
+            Ok(Some(pk))
+        }
+        Some(PUBLIC_KEY_TYPE) => bail!(
+            "{}: a {PUBLIC_KEY_TYPE} public key cannot authenticate; pass the private key file",
+            path.display()
+        ),
+        _ if is_pub => bail!("{}: not an {SSH_ED25519_TYPE} public key", path.display()),
+        _ => Ok(None),
+    }
+}
+
+/// The agent identity for the ed25519 key `pk` named by `path`.
+async fn agent_key_named(paths: &Paths, path: &Path, pk: [u8; 32]) -> Result<ClientIdentity> {
+    let fingerprint = Fingerprint::of_ssh_ed25519(&pk);
+    let Some(socket) = &paths.agent_socket else {
+        bail!(
+            "{}: a public key selects an ssh-agent key, but $SSH_AUTH_SOCK is not set",
+            path.display()
+        );
+    };
+    let mut agent = Agent::connect(socket)
+        .await
+        .with_context(|| format!("connecting to ssh-agent at {}", socket.display()))?;
+    let keys = agent
+        .list_ed25519()
+        .await
+        .context("listing ssh-agent keys")?;
+    let key = keys.into_iter().find(|k| k.public == pk).ok_or_else(|| {
+        anyhow!(
+            "{}: key {fingerprint} not in agent ({})",
+            path.display(),
+            socket.display()
+        )
+    })?;
+    debug!(%fingerprint, comment = %key.comment, "using ssh-agent key named by -i");
+    Ok(ClientIdentity::Agent {
+        socket: socket.clone(),
+        key,
+    })
+}
+
+/// Up to [`MAX_AGENT_KEYS`] ed25519 keys from `$SSH_AUTH_SOCK`, in agent
+/// order. An unreachable or failing agent is skipped with a `debug` log.
+async fn agent_identities(paths: &Paths) -> Vec<ClientIdentity> {
+    let Some(socket) = &paths.agent_socket else {
+        return Vec::new();
+    };
+    let mut agent = match Agent::connect(socket).await {
+        Ok(agent) => agent,
+        Err(e) => {
+            debug!(socket = %socket.display(), error = %e, "ssh-agent unreachable; skipping agent keys");
+            return Vec::new();
+        }
+    };
+    let keys = match agent.list_ed25519().await {
+        Ok(keys) => keys,
+        Err(e) => {
+            debug!(socket = %socket.display(), error = %e, "ssh-agent listing failed; skipping agent keys");
+            return Vec::new();
+        }
+    };
+    if keys.len() > MAX_AGENT_KEYS {
+        debug!(
+            held = keys.len(),
+            limit = MAX_AGENT_KEYS,
+            "ssh-agent holds more ed25519 keys than will be tried"
+        );
+    }
+    keys.into_iter()
+        .take(MAX_AGENT_KEYS)
+        .map(|key| ClientIdentity::Agent {
+            socket: socket.clone(),
+            key,
+        })
+        .collect()
+}
+
+/// Resolve the identities the client offers, in order.
+///
+/// `-i PATH` alone: a private key as before, or a `.pub` / `ssh-ed25519`
+/// public line naming a key the agent must hold. Otherwise the first
+/// existing key (`$MYSH_IDENTITY` → baked → `~/.config/mysh/id` →
+/// `~/.ssh/id_ed25519`) followed by up to [`MAX_AGENT_KEYS`] agent keys;
+/// `--baked-only` offers the baked identity only.
+pub async fn client_identities(
+    target: &Target,
+    paths: &Paths,
+    baked: &Baked,
+) -> Result<Vec<ClientIdentity>> {
     let home = home_dir(paths);
     let flag = target.identity.as_ref().map(|p| match (p.to_str(), &home) {
         (Some(s), Some(home)) => expand_tilde(s, home),
         _ => p.clone(),
     });
+    if let Some(path) = &flag
+        && let Some(pk) = ssh_ed25519_public_file(path)?
+    {
+        return Ok(vec![agent_key_named(paths, path, pk).await?]);
+    }
     let candidates = client_identity_candidates(
         flag.as_deref(),
         paths,
@@ -164,18 +341,32 @@ pub fn load_client_identity(target: &Target, paths: &Paths, baked: &Baked) -> Re
         target.baked_only,
     );
     let mut missing = None;
+    let mut identities = Vec::new();
     if let Some(id) = load_first(&candidates, baked, &mut missing)? {
-        return Ok(id);
+        identities.push(ClientIdentity::Static(id));
     }
-    let tried: Vec<String> = candidates.iter().map(describe).collect();
-    bail!(
-        "no client identity found (tried: {}); run `mysh keygen` or pass -i PATH",
-        if tried.is_empty() {
-            "nothing".to_owned()
-        } else {
-            tried.join(", ")
+    let use_agent = flag.is_none() && !target.baked_only;
+    if use_agent {
+        identities.extend(agent_identities(paths).await);
+    }
+    if identities.is_empty() {
+        let mut tried: Vec<String> = candidates.iter().map(describe).collect();
+        if use_agent {
+            tried.push(match &paths.agent_socket {
+                Some(socket) => format!("ssh-agent at {}", socket.display()),
+                None => "ssh-agent ($SSH_AUTH_SOCK unset)".to_owned(),
+            });
         }
-    )
+        bail!(
+            "no client identity found (tried: {}); run `mysh keygen`, pass -i PATH, or add a key to ssh-agent",
+            if tried.is_empty() {
+                "nothing".to_owned()
+            } else {
+                tried.join(", ")
+            }
+        )
+    }
+    Ok(identities)
 }
 
 /// Resolve the server identity: `--key` → `$MYSH_HOST_KEY` → baked →
@@ -589,6 +780,8 @@ mod tests {
     fn paths_in(dir: &TempDir) -> Paths {
         let mut paths = Paths::with_config_dir(dir.path("config"));
         paths.ssh_dir = Some(dir.path("ssh"));
+        // Never consult the developer's real agent from a unit test.
+        paths.agent_socket = None;
         paths
     }
 
@@ -798,22 +991,117 @@ mod tests {
         assert_eq!(second.source, paths.host_key.display().to_string());
     }
 
-    #[test]
-    fn client_identity_uses_first_existing_file() {
+    #[tokio::test]
+    async fn client_identity_uses_first_existing_file() {
         let dir = TempDir::new("clientid");
         let paths = paths_in(&dir);
         let baked = Baked::default();
         let t = target();
-        assert!(load_client_identity(&t, &paths, &baked).is_err());
+        let err = client_identities(&t, &paths, &baked)
+            .await
+            .expect_err("no identity");
+        assert!(
+            err.to_string().contains("$SSH_AUTH_SOCK unset"),
+            "names the agent: {err}"
+        );
         let secret = SecretKey::generate();
         write_secret_key(&paths.identity, &secret).expect("write");
-        let id = load_client_identity(&t, &paths, &baked).expect("load");
+        let ids = client_identities(&t, &paths, &baked).await.expect("load");
+        assert_eq!(ids.len(), 1);
+        let ClientIdentity::Static(id) = &ids[0] else {
+            panic!("expected a static identity, got {:?}", ids[0]);
+        };
         assert_eq!(id.public, secret.public());
+        assert_eq!(ids[0].fingerprint(), secret.public().fingerprint());
+        assert_eq!(ids[0].public_line(), secret.public().to_line(None));
+        assert!(ids[0].describe().starts_with("x25519 SHA256:"));
         let missing = Target {
             identity: Some(dir.path("nope")),
-            ..t
+            ..t.clone()
         };
-        assert!(load_client_identity(&missing, &paths, &baked).is_err());
+        assert!(client_identities(&missing, &paths, &baked).await.is_err());
+
+        // An unreachable agent socket is skipped, not fatal.
+        let mut dead = paths.clone();
+        dead.agent_socket = Some(dir.path("no-such-agent"));
+        let ids = client_identities(&t, &dead, &baked).await.expect("load");
+        assert_eq!(ids.len(), 1);
+
+        // `.pub` files name agent keys and need an agent.
+        let pubfile = dir.path("k.pub");
+        let ed = [7u8; 32];
+        write(
+            &pubfile,
+            &format!(
+                "{SSH_ED25519_TYPE} {} it\n",
+                STANDARD.encode(mysh_net::agent::ed25519_blob(&ed))
+            ),
+        );
+        let with_pub = Target {
+            identity: Some(pubfile.clone()),
+            ..t.clone()
+        };
+        let err = client_identities(&with_pub, &paths, &baked)
+            .await
+            .expect_err("no agent");
+        assert!(
+            err.to_string().contains("$SSH_AUTH_SOCK"),
+            "unexpected: {err}"
+        );
+        let err = client_identities(&with_pub, &dead, &baked)
+            .await
+            .expect_err("agent down");
+        assert!(
+            format!("{err:#}").contains("connecting to ssh-agent"),
+            "unexpected: {err:#}"
+        );
+        write(&pubfile, &secret.public().to_line(None));
+        let err = client_identities(&with_pub, &paths, &baked)
+            .await
+            .expect_err("x25519 public key");
+        assert!(
+            err.to_string().contains("cannot authenticate"),
+            "unexpected: {err}"
+        );
+        write(&pubfile, "garbage\n");
+        assert!(client_identities(&with_pub, &paths, &baked).await.is_err());
+    }
+
+    #[test]
+    fn agent_identity_lines_and_descriptions() {
+        // The ed25519 basepoint (compressed y = 4/5): a valid curve point,
+        // so the authorized_keys parser accepts the line.
+        let mut ed = [0x66u8; 32];
+        ed[0] = 0x58;
+        let id = ClientIdentity::Agent {
+            socket: PathBuf::from("/tmp/agent"),
+            key: AgentKey {
+                public: ed,
+                blob: mysh_net::agent::ed25519_blob(&ed),
+                comment: "me@box".to_owned(),
+            },
+        };
+        assert_eq!(id.fingerprint(), Fingerprint::of_ssh_ed25519(&ed));
+        let line = id.public_line();
+        assert!(line.starts_with(&format!("{SSH_ED25519_TYPE} ")));
+        assert!(line.ends_with(" me@box\n"));
+        // The line round-trips through the authorized_keys parser as an
+        // ed25519 entry.
+        let set = AuthorizedKeys::parse(&line, "t");
+        assert_eq!(set.find_ed25519(&ed).map(|e| e.line), Some(1));
+        assert_eq!(
+            id.describe(),
+            format!("{SSH_ED25519_TYPE} {} (agent: me@box)", id.fingerprint())
+        );
+        let no_comment = ClientIdentity::Agent {
+            socket: PathBuf::from("/tmp/agent"),
+            key: AgentKey {
+                public: ed,
+                blob: mysh_net::agent::ed25519_blob(&ed),
+                comment: String::new(),
+            },
+        };
+        assert!(!no_comment.public_line().trim_end().ends_with(' '));
     }
 
     #[test]

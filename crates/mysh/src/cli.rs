@@ -67,7 +67,8 @@ pub struct ConnectOpts {
     #[arg(short = 'p', long, value_name = "PORT")]
     pub port: Option<u16>,
 
-    /// Identity file (see docs/02-security.md for the resolution order).
+    /// Identity: a private key file, or a `.pub` naming an ssh-agent key
+    /// (see docs/02-security.md for the resolution order).
     #[arg(short = 'i', long, value_name = "PATH")]
     pub identity: Option<PathBuf>,
 

@@ -57,6 +57,10 @@ pub struct Paths {
     pub runtime_dir: PathBuf,
     /// `~/.ssh` when the home directory is known.
     pub ssh_dir: Option<PathBuf>,
+    /// `$SSH_AUTH_SOCK` (empty = unset): the `ssh-agent` whose ed25519 keys
+    /// the client may authenticate with (02-security.md, "Signature
+    /// authentication").
+    pub agent_socket: Option<PathBuf>,
 }
 
 impl Paths {
@@ -84,11 +88,12 @@ impl Paths {
             .or_else(|| home.as_ref().map(|h| h.join(".cache")))
             .map_or_else(|| config_dir.join("run"), |d| d.join("mysh"));
         let ssh_dir = home.map(|h| h.join(".ssh"));
-        Self::build(config_dir, history, runtime_dir, ssh_dir)
+        let agent_socket = env_path(env, "SSH_AUTH_SOCK");
+        Self::build(config_dir, history, runtime_dir, ssh_dir, agent_socket)
     }
 
-    /// Use an explicit config directory; history, the runtime dir and
-    /// `~/.ssh` still come from the environment.
+    /// Use an explicit config directory; history, the runtime dir, `~/.ssh`
+    /// and the agent socket still come from the environment.
     #[must_use]
     pub fn with_config_dir(dir: PathBuf) -> Self {
         let env_paths = Self::from_env();
@@ -97,6 +102,7 @@ impl Paths {
             env_paths.history,
             env_paths.runtime_dir,
             env_paths.ssh_dir,
+            env_paths.agent_socket,
         )
     }
 
@@ -105,6 +111,7 @@ impl Paths {
         history: PathBuf,
         runtime_dir: PathBuf,
         ssh_dir: Option<PathBuf>,
+        agent_socket: Option<PathBuf>,
     ) -> Self {
         Self {
             identity: config_dir.join("id"),
@@ -116,6 +123,7 @@ impl Paths {
             history,
             runtime_dir,
             ssh_dir,
+            agent_socket,
         }
     }
 }
@@ -789,6 +797,18 @@ mod tests {
         );
         assert_eq!(p.runtime_dir, PathBuf::from("/home/u/.cache/mysh"));
         assert_eq!(p.ssh_dir, Some(PathBuf::from("/home/u/.ssh")));
+        assert_eq!(p.agent_socket, None);
+    }
+
+    #[test]
+    fn paths_take_agent_socket_from_env_ignoring_empty() {
+        let env = env_from(&[("HOME", "/home/u"), ("SSH_AUTH_SOCK", "/tmp/agent.sock")]);
+        assert_eq!(
+            Paths::from_env_with(&env).agent_socket,
+            Some(PathBuf::from("/tmp/agent.sock"))
+        );
+        let env = env_from(&[("HOME", "/home/u"), ("SSH_AUTH_SOCK", "")]);
+        assert_eq!(Paths::from_env_with(&env).agent_socket, None);
     }
 
     #[test]
@@ -1212,6 +1232,7 @@ shell = true           # `mysh pi` goes straight to a shell
             PathBuf::from("/h"),
             PathBuf::from("/run"),
             Some(PathBuf::from("/home/u/.ssh")),
+            None,
         );
         let none = env_from(&[]);
         let got = client_identity_candidates_with(None, &paths, false, false, &none);
@@ -1248,6 +1269,7 @@ shell = true           # `mysh pi` goes straight to a shell
             PathBuf::from("/cfg"),
             PathBuf::from("/h"),
             PathBuf::from("/run"),
+            None,
             None,
         );
         let none = env_from(&[]);

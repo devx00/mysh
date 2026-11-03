@@ -29,8 +29,8 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use mysh_net::{
     framing::{read_msg, write_msg, write_reply},
-    handshake::{HandshakeError, server_handshake},
-    keys::{Identity, PublicKey},
+    handshake::{HandshakeError, Peer, server_handshake},
+    keys::Identity,
     mux::{Incoming, Mode, Mux, Stream, accept_open},
     trust::KeyOptions,
 };
@@ -528,20 +528,27 @@ async fn handle_connection(
     if let Err(e) = stream.set_nodelay(true) {
         debug!(%peer, error = %e, "set_nodelay failed");
     }
+    let mut hello_caps = 0;
+    if !shared.policy.detach_grace.is_zero() {
+        hello_caps |= caps::PERSIST;
+    }
+    if shared.policy.signature_auth {
+        hello_caps |= caps::SIG_AUTH;
+    }
     let hello = ServerHello {
         name: shared.policy.name.clone(),
-        caps: if shared.policy.detach_grace.is_zero() {
-            0
-        } else {
-            caps::PERSIST
-        },
+        caps: hello_caps,
     };
     let trust = shared.trust.load();
-    let mut offered: Option<PublicKey> = None;
+    let mut offered: Option<Peer> = None;
     let mut options = KeyOptions::default();
-    let result = server_handshake(stream, &shared.identity.secret, hello, |key, _| {
-        offered = Some(*key);
-        let Some(entry) = trust.find(key) else {
+    let result = server_handshake(stream, &shared.identity.secret, hello, |client, _| {
+        offered = Some(*client);
+        let entry = match client {
+            Peer::Static(key) => trust.find(key),
+            Peer::Ed25519(pk) => trust.find_ed25519(pk),
+        };
+        let Some(entry) = entry else {
             return Err((ErrorCode::Unauthorized, "key not authorized".to_owned()));
         };
         if !entry.options.allows_source(peer.ip()) {
@@ -565,9 +572,8 @@ async fn handle_connection(
     let hs = match result {
         Ok(hs) => hs,
         Err(HandshakeError::Denied { .. }) => {
-            let fingerprint =
-                offered.map_or_else(|| "?".to_owned(), |k| k.fingerprint().to_string());
-            warn!(%peer, %fingerprint, "unauthorized client key");
+            let client = offered.map_or_else(|| "?".to_owned(), |c| c.to_string());
+            warn!(%peer, %client, "unauthorized client key");
             return;
         }
         Err(e) => {
@@ -575,8 +581,14 @@ async fn handle_connection(
             return;
         }
     };
-    let client_key = hs.remote;
-    info!(%peer, fingerprint = %client_key.fingerprint(), version = hs.version, "client connected");
+    let client = hs.peer;
+    info!(
+        %peer,
+        fingerprint = %client.fingerprint(),
+        auth = client.kind(),
+        version = hs.version,
+        "client connected"
+    );
     let policy = if options == KeyOptions::default() {
         Arc::clone(&shared.policy)
     } else {
@@ -595,7 +607,7 @@ async fn handle_connection(
         mux.clone(),
         peer,
         local,
-        client_key,
+        client,
         shared.registry.clone(),
     );
     let control_task = tokio::spawn(control_loop(control, mux.clone(), shutdown, peer, idle));
@@ -759,7 +771,8 @@ pub struct ConnCtx {
     pub mux: Mux,
     pub peer: SocketAddr,
     pub local: SocketAddr,
-    pub client_key: PublicKey,
+    /// Who the client proved to be; owns the sessions it opens.
+    pub client: Peer,
     pub sessions: Sessions,
     /// Server-wide session ids and detached sessions.
     pub registry: Registry,
@@ -774,7 +787,7 @@ impl ConnCtx {
         mux: Mux,
         peer: SocketAddr,
         local: SocketAddr,
-        client_key: PublicKey,
+        client: Peer,
         registry: Registry,
     ) -> Self {
         Self {
@@ -782,7 +795,7 @@ impl ConnCtx {
             mux,
             peer,
             local,
-            client_key,
+            client,
             sessions: Sessions::new(registry.clone()),
             registry,
             listeners: Arc::new(AtomicUsize::new(0)),
@@ -797,9 +810,9 @@ impl ConnCtx {
         mux: Mux,
         peer: SocketAddr,
         local: SocketAddr,
-        client_key: PublicKey,
+        client: Peer,
     ) -> Self {
-        Self::new(policy, mux, peer, local, client_key, Registry::default())
+        Self::new(policy, mux, peer, local, client, Registry::default())
     }
 
     /// Next listener id (starts at 1, never reused within a connection).
@@ -840,14 +853,11 @@ pub fn resolve_remote_path(path: &str, cwd: Option<&str>, home: &Path) -> PathBu
 #[cfg(test)]
 mod tests {
     use mysh_net::{
-        handshake::client_handshake,
-        keys::{KeyFormat, SecretKey},
+        handshake::{ClientAuth, client_handshake},
+        keys::{KeyFormat, PublicKey, SecretKey},
         trust::AuthorizedKeys,
     };
-    use mysh_proto::{
-        handshake::ClientHello,
-        session::{ExitStatus, SessionKind, SessionOut, SessionRequest},
-    };
+    use mysh_proto::session::{ExitStatus, SessionKind, SessionOut, SessionRequest};
     use tokio::sync::oneshot;
 
     use super::*;
@@ -1062,9 +1072,9 @@ mod tests {
 
     async fn connect(addr: SocketAddr, key: &SecretKey) -> Result<Mux, HandshakeError> {
         let tcp = TcpStream::connect(addr).await?;
-        let (hs, hello) =
-            client_handshake(tcp, key, ClientHello { caps: 0 }, |_, _| Ok(())).await?;
+        let (hs, hello) = client_handshake(tcp, key, 0, |_, _| Ok(()), ClientAuth::Static).await?;
         assert_eq!(hello.name, "testhost");
+        assert_eq!(hello.caps & caps::SIG_AUTH, caps::SIG_AUTH);
         let (mux, _incoming) = Mux::new(hs.stream, Mode::Client);
         Ok(mux)
     }

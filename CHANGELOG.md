@@ -52,6 +52,14 @@ and ships as static release binaries.
   `--detach-grace` (default 10 min) with a 1 MiB server-side output ring;
   `mysh --attach[=ID] HOST`, prompt commands `attach`, `detach`,
   `sessions -a`; a session can only be reattached by the key that opened it.
+- **Signature authentication** (M5): ed25519 keys held by an `ssh-agent`
+  log in without ever leaving the agent — the client uses a fresh Noise
+  static per connection and the agent signs the handshake hash
+  (`ClientHello.auth`, `caps::SIG_AUTH`, `--no-signature-auth` on the
+  server); `-i key.pub` picks an agent key, otherwise the key file is tried
+  first and then up to five agent keys from `$SSH_AUTH_SOCK`; the server
+  authorizes the ed25519 key against its `ssh-ed25519` entries and owns
+  detached sessions by it. `info` shows which identity was accepted.
 - **Control socket, background jobs, parallel transfers** (M5): an
   interactive client listens on `$XDG_RUNTIME_DIR/mysh/<host>_<port>.sock`
   and `mysh put|get|forward|authorize HOST …` reuse its connection when the
@@ -64,7 +72,7 @@ and ships as static release binaries.
 - **Release** (M4): `scripts/release.sh` links all five targets and writes
   `SHA256SUMS`; `.github/workflows/release.yml` does the same on tags;
   `contrib/` has a systemd unit, a launchd plist and a Termux:Boot script.
-- **Verification**: 300 tests (unit plus integration against an in-process
+- **Verification**: 317 tests (unit plus integration against an in-process
   loopback server, including real-pty interactive, persistence and
   control-socket tests); `scripts/android-build.sh` links an Android binary
   with the NDK clang; `scripts/lima-test.sh` runs the suite on Linux in a

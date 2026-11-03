@@ -12,8 +12,10 @@
 
 use std::{
     collections::HashMap,
-    fmt,
+    fmt, io,
     net::SocketAddr,
+    path::Path,
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -23,16 +25,17 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use mysh_net::{
+    agent::{Agent, AgentKey},
     framing::{read_msg, write_msg, write_reply},
-    handshake::{HandshakeError, Handshaken, client_handshake},
-    keys::{Fingerprint, Identity, PublicKey},
+    handshake::{ClientAuth, HandshakeError, Handshaken, Signer, client_handshake},
+    keys::{Fingerprint, PublicKey, SecretKey},
     mux::{Incoming, Mode, Mux, OpenError, Stream, accept_open},
     noise::TransferStats,
     trust::KnownHosts,
 };
 use mysh_proto::{
     control::ControlMsg,
-    handshake::{ClientHello, ServerHello},
+    handshake::ServerHello,
     limits,
     open::{ErrorCode, Open, OpenReply},
 };
@@ -47,7 +50,7 @@ use tracing::{debug, info, warn};
 use crate::{
     client::console::Console,
     config::{Paths, Target},
-    identity::{Baked, ClientTrust, TrustDecision, load_client_identity},
+    identity::{Baked, ClientIdentity, ClientTrust, TrustDecision, client_identities},
 };
 
 /// Per-address TCP connect budget.
@@ -103,8 +106,7 @@ struct Inner {
     hello: ServerHello,
     remote: PublicKey,
     via: String,
-    identity_fp: Fingerprint,
-    identity_line: String,
+    identity: ClientIdentity,
     connected_at: Instant,
     version: u16,
     peer_addr: SocketAddr,
@@ -158,13 +160,18 @@ impl Connection {
         &self.inner.via
     }
 
-    pub fn identity_fingerprint(&self) -> Fingerprint {
-        self.inner.identity_fp.clone()
+    /// The identity the server accepted.
+    pub fn identity(&self) -> &ClientIdentity {
+        &self.inner.identity
     }
 
-    /// Our public key as a `mysh-x25519 …` line (for `authorize`).
-    pub fn identity_line(&self) -> &str {
-        &self.inner.identity_line
+    pub fn identity_fingerprint(&self) -> Fingerprint {
+        self.inner.identity.fingerprint()
+    }
+
+    /// Our public key as an `authorized_keys` line (for `authorize`).
+    pub fn identity_line(&self) -> String {
+        self.inner.identity.public_line()
     }
 
     pub fn connected_at(&self) -> Instant {
@@ -340,6 +347,12 @@ enum Attempt {
     Done(Box<AttemptDone>),
     /// Unknown key; ask the user.
     Unknown(PublicKey),
+    /// `Denied { Unauthorized }` with the server's message; try the next
+    /// identity.
+    Refused(String),
+    /// The server does not advertise `caps::SIG_AUTH`; agent identities
+    /// cannot be used against it. Nothing identifying was sent.
+    SigAuthUnsupported,
 }
 
 struct AttemptDone {
@@ -348,7 +361,55 @@ struct AttemptDone {
     via: String,
 }
 
-async fn attempt(target: &Target, identity: &Identity, trust: &ClientTrust) -> Result<Attempt> {
+/// [`Signer`] backed by one `ssh-agent` key: the agent signs
+/// `SIG_AUTH_LABEL ‖ h2`; the private key never leaves it.
+#[derive(Debug)]
+struct AgentSigner {
+    agent: Agent,
+    key: AgentKey,
+}
+
+impl AgentSigner {
+    async fn connect(socket: &Path, key: AgentKey) -> Result<Self> {
+        let agent = Agent::connect(socket)
+            .await
+            .with_context(|| format!("connecting to ssh-agent at {}", socket.display()))?;
+        Ok(Self { agent, key })
+    }
+}
+
+impl Signer for AgentSigner {
+    fn sign<'a>(
+        &'a mut self,
+        message: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = io::Result<[u8; 64]>> + Send + 'a>> {
+        Box::pin(self.agent.sign(&self.key, message))
+    }
+}
+
+async fn attempt(
+    target: &Target,
+    identity: &ClientIdentity,
+    trust: &ClientTrust,
+) -> Result<Attempt> {
+    // Per-connection material: a key file is the Noise static itself; an
+    // agent key gets a fresh static and proves itself by signature.
+    let fresh;
+    let mut signer;
+    let (static_key, auth) = match identity {
+        ClientIdentity::Static(id) => (&id.secret, ClientAuth::Static),
+        ClientIdentity::Agent { socket, key } => {
+            signer = AgentSigner::connect(socket, key.clone()).await?;
+            fresh = SecretKey::generate();
+            (
+                &fresh,
+                ClientAuth::Ed25519 {
+                    public: key.public,
+                    sign: &mut signer,
+                },
+            )
+        }
+    };
     let tcp = dial(&target.host, target.port).await?;
     let mut via = String::new();
     let verify = |key: &PublicKey,
@@ -383,7 +444,7 @@ async fn attempt(target: &Target, identity: &Identity, trust: &ClientTrust) -> R
     };
     let result = timeout(
         HANDSHAKE_TIMEOUT,
-        client_handshake(tcp, &identity.secret, ClientHello { caps: 0 }, verify),
+        client_handshake(tcp, static_key, 0, verify, auth),
     )
     .await;
     match result {
@@ -407,11 +468,9 @@ async fn attempt(target: &Target, identity: &Identity, trust: &ClientTrust) -> R
         },
         Ok(Err(HandshakeError::Denied {
             code: ErrorCode::Unauthorized,
-            ..
-        })) => Err(anyhow!(
-            "server refused our key {}: not authorized",
-            identity.public.fingerprint()
-        )),
+            message,
+        })) => Ok(Attempt::Refused(message)),
+        Ok(Err(HandshakeError::SigAuthUnsupported)) => Ok(Attempt::SigAuthUnsupported),
         Ok(Err(HandshakeError::Denied { code, message })) => {
             Err(anyhow!("server refused the connection: {code}: {message}"))
         }
@@ -471,68 +530,136 @@ async fn tofu_prompt(target: &Target, key: &PublicKey, console: &Console) -> Res
     Ok(answer.trim().eq_ignore_ascii_case("yes"))
 }
 
-/// Dial, verify the server, handshake, and start the connection tasks.
+/// Accept an unknown server key: `--accept-new` is handled inside the
+/// handshake callback, so reaching here means a console prompt is needed.
+/// Returns after the key is appended; the caller reconnects.
+async fn accept_unknown(
+    target: &Target,
+    trust: &ClientTrust,
+    key: PublicKey,
+    console: &Console,
+) -> Result<()> {
+    let stdin_tty = mysh_pty::terminal::is_terminal(std::io::stdin());
+    if !(console.is_tty() && stdin_tty) {
+        bail!(
+            "host key verification failed: {}:{} is not in known_hosts (key {}); \
+             use --accept-new or add it to {}",
+            target.host,
+            target.port,
+            key.fingerprint(),
+            trust.write_to.display()
+        );
+    }
+    if !tofu_prompt(target, &key, console).await? {
+        bail!("host key verification failed");
+    }
+    KnownHosts::append(&trust.write_to, &target.host, target.port, &key)
+        .with_context(|| format!("writing {}", trust.write_to.display()))?;
+    console.println(&format!(
+        "Warning: permanently added {}:{} ({}) to {}.",
+        target.host,
+        target.port,
+        key.fingerprint(),
+        trust.write_to.display()
+    ));
+    Ok(())
+}
+
+/// Resolve the identities, verify the server, and handshake with each
+/// identity in turn until one is accepted; then start the connection
+/// tasks. Only `Denied { Unauthorized }` moves on to the next identity; a
+/// server without signature authentication ends the agent attempts.
 pub async fn connect(
     target: &Target,
     paths: &Paths,
     baked: &Baked,
     console: &Console,
 ) -> Result<Connection> {
-    let identity = load_client_identity(target, paths, baked)?;
+    let identities = client_identities(target, paths, baked).await?;
     let trust = ClientTrust::for_target(target, paths, baked)?;
     let mut accepted: Option<PublicKey> = None;
-    loop {
-        match attempt(target, &identity, &trust).await? {
-            Attempt::Done(done) => {
-                let AttemptDone {
-                    handshaken,
-                    hello,
-                    via,
-                } = *done;
-                return establish(target.clone(), &identity, handshaken, hello, via, console).await;
-            }
-            Attempt::Unknown(key) => {
-                if accepted == Some(key) {
-                    bail!(
-                        "server key {} still unknown after accepting it",
-                        key.fingerprint()
+    let mut refused: Vec<String> = Vec::new();
+    let mut last_message = String::new();
+    let mut agent_unsupported = false;
+    for identity in &identities {
+        if agent_unsupported && matches!(identity, ClientIdentity::Agent { .. }) {
+            continue;
+        }
+        loop {
+            match attempt(target, identity, &trust).await? {
+                Attempt::Done(done) => {
+                    let AttemptDone {
+                        handshaken,
+                        hello,
+                        via,
+                    } = *done;
+                    return establish(
+                        target.clone(),
+                        identity.clone(),
+                        handshaken,
+                        hello,
+                        via,
+                        console,
+                    )
+                    .await;
+                }
+                Attempt::Unknown(key) => {
+                    if accepted == Some(key) {
+                        bail!(
+                            "server key {} still unknown after accepting it",
+                            key.fingerprint()
+                        );
+                    }
+                    accept_unknown(target, &trust, key, console).await?;
+                    accepted = Some(key);
+                    // Reconnect: the aborted handshake never sent our
+                    // identity, and `evaluate` re-reads known_hosts, so the
+                    // next attempt finds the key.
+                }
+                Attempt::Refused(message) => {
+                    debug!(identity = %identity.describe(), %message, "identity refused");
+                    refused.push(identity.describe());
+                    last_message = message;
+                    break;
+                }
+                Attempt::SigAuthUnsupported => {
+                    let agent_keys = identities
+                        .iter()
+                        .filter(|i| matches!(i, ClientIdentity::Agent { .. }))
+                        .count();
+                    warn!(
+                        server = %format_args!("{}:{}", target.host, target.port),
+                        agent_keys,
+                        "server does not support agent keys (signature authentication is disabled); skipping them"
                     );
+                    agent_unsupported = true;
+                    break;
                 }
-                let stdin_tty = mysh_pty::terminal::is_terminal(std::io::stdin());
-                if !(console.is_tty() && stdin_tty) {
-                    bail!(
-                        "host key verification failed: {}:{} is not in known_hosts (key {}); \
-                         use --accept-new or add it to {}",
-                        target.host,
-                        target.port,
-                        key.fingerprint(),
-                        trust.write_to.display()
-                    );
-                }
-                if !tofu_prompt(target, &key, console).await? {
-                    bail!("host key verification failed");
-                }
-                KnownHosts::append(&trust.write_to, &target.host, target.port, &key)
-                    .with_context(|| format!("writing {}", trust.write_to.display()))?;
-                console.println(&format!(
-                    "Warning: permanently added {}:{} ({}) to {}.",
-                    target.host,
-                    target.port,
-                    key.fingerprint(),
-                    trust.write_to.display()
-                ));
-                accepted = Some(key);
-                // Reconnect: the aborted handshake never sent our identity,
-                // and `evaluate` re-reads known_hosts, so the next attempt
-                // finds the key.
             }
         }
+    }
+    let agent_note = if agent_unsupported {
+        "; the server does not support agent keys (signature authentication is disabled), use a key file"
+    } else {
+        ""
+    };
+    match refused.as_slice() {
+        [] => bail!(
+            "no usable identity for {}:{}{agent_note}",
+            target.host,
+            target.port
+        ),
+        [only] => bail!("server refused our key {only}: {last_message}{agent_note}"),
+        many => bail!(
+            "server refused every identity: {last_message} (tried {}){agent_note}",
+            many.join(", ")
+        ),
     }
 }
 
 async fn establish(
     target: Target,
-    identity: &Identity,
+    identity: ClientIdentity,
     handshaken: Handshaken<TcpStream>,
     hello: ServerHello,
     via: String,
@@ -541,10 +668,18 @@ async fn establish(
     let Handshaken {
         stream,
         remote,
+        peer: _,
         version,
     } = handshaken;
     let peer_addr = stream.get_ref().peer_addr().context("peer address")?;
-    info!(peer = %peer_addr, fingerprint = %remote.fingerprint(), via, version, "connected");
+    info!(
+        peer = %peer_addr,
+        fingerprint = %remote.fingerprint(),
+        via,
+        version,
+        identity = %identity.describe(),
+        "connected"
+    );
     let (mux, incoming) = Mux::new(stream, Mode::Client);
     let (control_tx, control_rx) = mpsc::channel(32);
     let (closed, _) = watch::channel(None);
@@ -554,8 +689,7 @@ async fn establish(
         hello,
         remote,
         via,
-        identity_fp: identity.public.fingerprint(),
-        identity_line: identity.public.to_line(identity.comment.as_deref()),
+        identity,
         connected_at: Instant::now(),
         version,
         peer_addr,

@@ -238,7 +238,7 @@ Connection options (shared by every HOST-taking command):
 | option                | meaning                                                   |
 | --------------------- | --------------------------------------------------------- |
 | `-p PORT`             | port (default 7722, or from `HOST:PORT`)                  |
-| `-i PATH`             | identity file (02-security.md order)                      |
+| `-i PATH`             | identity: a private key file, or a `.pub` naming an `ssh-agent` key (02-security.md order; without `-i` the key file is tried first, then agent keys from `$SSH_AUTH_SOCK`) |
 | `--pin KEY`           | expected server key or fingerprint                        |
 | `--accept-new` / `--strict` | TOFU policy                                         |
 | `-s`                  | run `shell` on connect; auto-exit when the last session ends |
@@ -270,7 +270,7 @@ Server options:
 | `--handshake-rate N`                | handshakes per minute per client address (default 10; 0 = off) |
 | `--idle-timeout SECS`               | close a connection with no control traffic (default 120)  |
 | `--detach-grace SECS`               | keep a detached PTY session this long (default 600)       |
-| `--no-signature-auth`               | do not accept ssh-ed25519 signature authentication        |
+| `--no-signature-auth`               | do not accept ssh-ed25519 signature authentication (agent keys); clears `caps::SIG_AUTH` |
 | `--baked-only`                      | ignore files on disk                                      |
 | `-v`                                | log level                                                 |
 

@@ -21,7 +21,7 @@ use std::{
 
 use mysh_net::{
     framing::{read_msg, write_msg, write_reply},
-    keys::PublicKey,
+    handshake::Peer,
     mux::Stream,
 };
 use mysh_proto::{
@@ -146,8 +146,8 @@ impl Sessions {
 /// What `ListSessions` reports about a PTY session.
 #[derive(Debug, Clone)]
 struct Meta {
-    /// Client key the session was opened with; only it may list or attach.
-    owner: PublicKey,
+    /// Who opened the session; only that peer may list or attach it.
+    owner: Peer,
     pid: u32,
     /// `shell` or the exec command line.
     kind: String,
@@ -219,7 +219,7 @@ impl Registry {
     }
 
     /// `owner`'s sessions, detached ones first (then by id).
-    fn list(&self, owner: &PublicKey) -> Vec<DetachedSession> {
+    fn list(&self, owner: &Peer) -> Vec<DetachedSession> {
         let table = self.pty();
         let mut rows: Vec<DetachedSession> = table
             .iter()
@@ -248,8 +248,8 @@ impl Registry {
     }
 
     /// Take `id` out of the grace window for `owner`; the slot stays
-    /// registered as attached. Sessions of other keys do not exist.
-    fn claim(&self, id: u32, owner: &PublicKey) -> Result<Parked, (ErrorCode, String)> {
+    /// registered as attached. Sessions of other peers do not exist.
+    fn claim(&self, id: u32, owner: &Peer) -> Result<Parked, (ErrorCode, String)> {
         let mut table = self.pty();
         match table.get(&id) {
             Some(Slot::Detached(parked)) if parked.meta.owner == *owner => {}
@@ -598,7 +598,7 @@ async fn run_session(mut stream: Stream, req: &SessionRequest, ctx: &ConnCtx, id
     match &req.pty {
         Some(pty) => {
             let meta = Meta {
-                owner: ctx.client_key,
+                owner: ctx.client,
                 pid: 0,
                 kind: kind_label(&req.kind),
                 started: unix_now(),
@@ -972,7 +972,7 @@ pub async fn handle_attach(mut stream: Stream, id: u32, ctx: ConnCtx) {
         .await;
         return;
     }
-    let parked = match ctx.registry.claim(id, &ctx.client_key) {
+    let parked = match ctx.registry.claim(id, &ctx.client) {
         Ok(parked) => parked,
         Err((code, message)) => {
             ctx.sessions.remove(id);
@@ -1055,7 +1055,7 @@ pub async fn handle_list_sessions(mut stream: Stream, ctx: ConnCtx) {
     if write_reply(&mut stream, &OpenReply::Ok).await.is_err() {
         return;
     }
-    let rows = ctx.registry.list(&ctx.client_key);
+    let rows = ctx.registry.list(&ctx.client);
     let _ = write_msg(&mut stream, &rows).await;
     let _ = stream.shutdown().await;
 }
@@ -1527,8 +1527,8 @@ mod tests {
     #[test]
     fn registry_lists_and_claims_per_owner() {
         let registry = Registry::default();
-        let alice = mysh_net::keys::SecretKey::generate().public();
-        let bob = mysh_net::keys::SecretKey::generate().public();
+        let alice = Peer::Static(mysh_net::keys::SecretKey::generate().public());
+        let bob = Peer::Ed25519([3u8; 32]);
         let meta = Meta {
             owner: alice,
             pid: 7,

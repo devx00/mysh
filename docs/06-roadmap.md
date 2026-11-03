@@ -92,8 +92,20 @@ Workspace, lints, CI, this spec.
   `tests/persist_cli.rs` (binary under a pty: `SIGKILL` + `--attach`,
   `disconnect` + `--attach=ID`, prompt `detach`/`attach`, no-persistence
   error).
-- Signature authentication (`NN` + ed25519 signature over the handshake
-  hash) enabling `ssh-agent`, `sk-*` keys, and keys that cannot be exported.
+- Signature authentication ✔ (02 "Signature authentication", 03 §2):
+  `ssh-agent`-held ed25519 keys log in through the same `XX` handshake
+  with a fresh per-connection Noise static and an agent signature over
+  `SIG_AUTH_LABEL ‖ h2` carried in `ClientHello.auth`; advertised by
+  `caps::SIG_AUTH`, `--no-signature-auth` disables; `-i key.pub` names an
+  agent key, otherwise the key file is tried before up to five agent keys;
+  the server authorizes the ed25519 key against its `ssh-ed25519` entries
+  and owns sessions by it (`handshake::Peer`). Tests: `mysh-net`
+  handshake unit tests (happy path, bad signature, replay into another
+  handshake, server without the cap) and `tests/sigauth.rs` (throwaway
+  `ssh-agent` through the binary: login with no key file, refusal,
+  `--no-signature-auth`, `-i key.pub`, key file before agent, and detached
+  session ownership by the ed25519 peer). `sk-*` keys remain unsupported
+  (the agent only lists ed25519).
 - Background transfers ✔ (`CMD &`, `jobs [-w] [ID]`, `kill %ID`;
   `client::jobs`, capture-mode `Console`) and parallel recursive transfers ✔
   (`put -r`/`get -r` run `-j` files at a time, default 4; 04 "File
@@ -143,6 +155,7 @@ later.
 | 27 | the control request carries prompt words (`argv`) plus the requester's cwd, and the reply is the capture console's event stream; the dispatcher's `Ctx` is split into shared state (`Arc<Shared>`: connection, forwards, jobs, a session snapshot) and prompt-only state (stack, events, history, terminal), so a request or job runs `execute` on a detached `Ctx` of its own | serializing `MetaCommand`; a message to the prompt loop asking it to run the command | one grammar and one dispatcher serve all three frontends; the prompt keeps serving while a transfer runs on another task; `sessions`/`kill` from a request read a snapshot the prompt refreshes after every command and event instead of locking the stack |
 | 28 | `&` is recognised only as a final whole token; jobs are limited to `put get ls exec authorize`; a cancelled job's `exec` session gets `SIGTERM`; completion prints the notice and the captured output (64 KiB cap) in one go | shell-style `&` anywhere, backgrounding any command, output streamed live above the prompt | a glued `&` is a legal file name; the other commands need the terminal; interleaving a job's output with the prompt and foreground sessions would defeat the capture console |
 | 29 | parallel recursive transfers walk first and then run files `-j` at a time behind a semaphore; the first error aborts the rest; progress is one aggregate line | pipelining the walk with the transfers; continuing past errors and summarising | directories exist before any file stream opens and `-P` post-order attributes stay correct; an aborted tree is reported as one error the user can act on, and `-c` resumes it |
+| 30 | signature authentication stays inside Noise `XX`: the client's static is a fresh random key, message 3's payload carries `AuthProof::Ed25519 { public_key, signature }` over `SIG_AUTH_LABEL ‖ h2` (the handshake hash after message 2), and the server authorizes the ed25519 key directly; `ClientHello` grew the `auth` field without a protocol version bump (pre-release, no deployed peers) | a separate `NN` handshake plus an `Auth` message after it; a new protocol version | one handshake code path and one `Verdict`; `h2` already binds both ephemerals and the server static so the signature cannot be replayed; the identity stays hidden from an unverified server exactly as for static keys; a cap bit is enough for a client to know whether to try an agent key before revealing anything |
 
 ## Testing strategy
 

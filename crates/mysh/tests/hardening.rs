@@ -11,13 +11,12 @@ use common::{ServerOpts, TestServer};
 use mysh::cli::ConnectOpts;
 use mysh_net::{
     framing::read_msg,
-    handshake::{HandshakeError, client_handshake},
+    handshake::{ClientAuth, HandshakeError, client_handshake},
     keys::SecretKey,
     mux::{Mode, Mux, OpenError},
 };
 use mysh_proto::{
     file::FileOp,
-    handshake::ClientHello,
     limits,
     open::{ErrorCode, Open},
     session::{ExitStatus, PtyRequest, SessionKind, SessionOut, SessionRequest, WinSize},
@@ -28,7 +27,7 @@ use tokio::{net::TcpStream, time::timeout};
 /// machinery (the server key is accepted blindly: this is loopback).
 async fn raw_connect(addr: SocketAddr, key: &SecretKey) -> Result<Mux, HandshakeError> {
     let tcp = TcpStream::connect(addr).await?;
-    let (hs, _hello) = client_handshake(tcp, key, ClientHello { caps: 0 }, |_, _| Ok(())).await?;
+    let (hs, _hello) = client_handshake(tcp, key, 0, |_, _| Ok(()), ClientAuth::Static).await?;
     let (mux, _incoming) = Mux::new(hs.stream, Mode::Client);
     Ok(mux)
 }

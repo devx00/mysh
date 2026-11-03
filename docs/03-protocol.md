@@ -19,14 +19,35 @@ rather than a silent downgrade. Unknown magic → close without reply.
 
 `Noise_XX_25519_ChaChaPoly_BLAKE2s`, client = initiator.
 
-| msg | dir | tokens          | payload (postcard)                          |
-| --- | --- | --------------- | ------------------------------------------- |
-| 1   | →   | `e`             | empty                                       |
-| 2   | ←   | `e, ee, s, es`  | `ServerHello { name: String, caps: u32 }`   |
-| 3   | →   | `s, se`         | `ClientHello { caps: u32 }`                 |
+| msg | dir | tokens          | payload (postcard)                                     |
+| --- | --- | --------------- | ------------------------------------------------------ |
+| 1   | →   | `e`             | empty                                                  |
+| 2   | ←   | `e, ee, s, es`  | `ServerHello { name: String, caps: u32 }`              |
+| 3   | →   | `s, se`         | `ClientHello { caps: u32, auth: AuthProof }`           |
+
+```rust
+enum AuthProof {
+    Static,                                                // the Noise static is the identity
+    Ed25519 { public_key: [u8; 32], signature: Vec<u8> },  // 64-byte signature
+}
+```
 
 Between 2 and 3 the client runs the server-trust check (02-security.md) on
 `get_remote_static()`. On failure it closes without sending 3.
+
+**Signature authentication** (02-security.md "Signature authentication"):
+with `AuthProof::Ed25519` the client's `s` is a fresh random key for this
+connection and the proof is `signature = Ed25519(sk, SIG_AUTH_LABEL ‖ h2)`
+where `SIG_AUTH_LABEL = "mysh-sig-auth-v1"` and `h2` is the Noise handshake
+hash (`get_handshake_hash()`) after message 2 has been processed and before
+message 3 is written — the same value on both sides, committing to the
+prologue, both ephemerals and the server static. The server snapshots `h2`
+before reading 3, requires `signature.len() == 64`, decodes `public_key`
+with `ed25519-dalek` and checks `verify_strict`; a failure is
+`Denied { Unauthorized, "bad signature" }`. A proof sent to a server whose
+`ServerHello.caps` lacks `SIG_AUTH` is `Denied { Unsupported }`; the client
+checks the bit first and never sends 3 in that case. The authorized identity
+is then the ed25519 key (`Peer::Ed25519`), not the Noise static.
 
 After 3 the server runs authorization. Then both sides call
 `into_stateless_transport_mode()` and maintain independent send/recv nonce
@@ -34,10 +55,11 @@ counters, which is what lets the read and write halves run concurrently
 without a lock.
 
 `caps` is a bitfield of optional features that need no version bump
-(`mysh_proto::caps`): `SIG_AUTH` (1) and `PERSIST` (2, server → client:
-detached PTY sessions are kept, see §10bis; set when `--detach-grace` is
-not 0). Unknown bits are ignored. `name` is the server's hostname
-(informational, shown by `info`).
+(`mysh_proto::caps`): `SIG_AUTH` (1, server → client: `AuthProof::Ed25519`
+is accepted; set unless `--no-signature-auth`) and `PERSIST` (2, server →
+client: detached PTY sessions are kept, see §10bis; set when
+`--detach-grace` is not 0). Unknown bits are ignored. `name` is the
+server's hostname (informational, shown by `info`).
 
 Timeouts: the server allows 5 s from TCP accept to the end of message 3.
 

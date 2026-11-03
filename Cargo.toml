@@ -21,6 +21,8 @@ base64 = "0.23"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 curve25519-dalek = "4"
+# Signature verification for sig-auth (agent-held ed25519 keys).
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 dirs = "7"
 futures = "0.3"
 indicatif = "0.18"

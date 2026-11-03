@@ -28,7 +28,8 @@ not an SSH implementation and does not aim at multi-tenant hosts.
   `~user` switching. (Runs fine as root under systemd/launchd if that is the
   intended user.)
 - SSH wire compatibility, `scp`/`sftp` compatibility, X11/agent forwarding.
-- ssh-agent and hardware-backed keys (see tradeoff in 02-security.md).
+- Non-ed25519 agent keys (`sk-*`, RSA, ECDSA). ed25519 keys held by an
+  `ssh-agent` are supported via signature authentication (02-security.md).
 - Windows.
 - Post-quantum key exchange, session persistence across disconnects,
   connection multiplexing between client processes (roadmap, 06).

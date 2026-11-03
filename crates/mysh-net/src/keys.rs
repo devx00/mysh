@@ -133,6 +133,15 @@ impl Fingerprint {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Fingerprint of an OpenSSH ed25519 public key: SHA256 over the wire
+    /// blob (`string "ssh-ed25519" ‖ string pk`), matching `ssh-add -l` and
+    /// `ssh-keygen -lf`.
+    #[must_use]
+    pub fn of_ssh_ed25519(public: &[u8; 32]) -> Self {
+        let digest = Sha256::digest(crate::agent::ed25519_blob(public));
+        Self(format!("SHA256:{}", STANDARD_NO_PAD.encode(digest)))
+    }
 }
 
 impl fmt::Debug for Fingerprint {

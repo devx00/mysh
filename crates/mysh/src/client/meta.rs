@@ -693,7 +693,7 @@ fn cmd_info(ctx: &Ctx) {
         conn.version(),
         conn.remote_key().fingerprint(),
         conn.trusted_via(),
-        conn.identity_fingerprint(),
+        conn.identity().describe(),
         mysh_proto::NOISE_PATTERN,
         format_duration(conn.connected_at().elapsed()),
         human(stats.bytes_in),

@@ -97,6 +97,8 @@ pub struct ServerOpts {
     /// `Policy.detach_grace`; `None` keeps the protocol default (10 min),
     /// `Some(ZERO)` switches persistence off.
     pub detach_grace: Option<Duration>,
+    /// `Policy.signature_auth`; `None` keeps the default (on).
+    pub signature_auth: Option<bool>,
     /// Also listen on `[::1]:0` (see [`TestServer::addr_v6`]).
     pub listen_v6: bool,
 }
@@ -127,9 +129,24 @@ impl TestServer {
         format!("127.0.0.1:{}", self.addr.port())
     }
 
-    /// Client `Paths` rooted at the temp client dir.
+    /// Client `Paths` rooted at the temp client dir. The agent socket is
+    /// cleared so an in-process client never consults the developer's real
+    /// `ssh-agent`; tests that need one set `agent_socket` themselves.
     pub fn client_paths(&self) -> Paths {
-        Paths::with_config_dir(self.client_dir.clone())
+        let mut paths = Paths::with_config_dir(self.client_dir.clone());
+        paths.agent_socket = None;
+        paths
+    }
+
+    /// Connect with an explicit `Paths` (for an agent socket of the test's
+    /// own) and the harness trust settings.
+    pub async fn connect_with_paths(
+        &self,
+        opts: ConnectOpts,
+        paths: &Paths,
+    ) -> anyhow::Result<Connection> {
+        let console = Console::new();
+        mysh::client::conn::connect(&self.target(opts), paths, &Baked::default(), &console).await
     }
 
     /// A `Target` for this server with `--accept-new` plus `opts` overrides.
@@ -142,14 +159,7 @@ impl TestServer {
 
     /// Connect with the harness identity.
     pub async fn connect(&self, opts: ConnectOpts) -> anyhow::Result<Connection> {
-        let console = Console::new();
-        mysh::client::conn::connect(
-            &self.target(opts),
-            &self.client_paths(),
-            &Baked::default(),
-            &console,
-        )
-        .await
+        self.connect_with_paths(opts, &self.client_paths()).await
     }
 
     /// Stop the server and wait for it.
@@ -244,6 +254,9 @@ pub async fn start_server(opts: ServerOpts) -> TestServer {
     if let Some(grace) = opts.detach_grace {
         policy.detach_grace = grace;
     }
+    if let Some(sig) = opts.signature_auth {
+        policy.signature_auth = sig;
+    }
 
     let mut listen: Vec<SocketAddr> = vec!["127.0.0.1:0".parse().expect("addr")];
     let v6: SocketAddr = "[::1]:0".parse().expect("addr");
@@ -286,7 +299,9 @@ pub fn mysh_bin() -> PathBuf {
 
 /// Environment for a child `mysh` client: config dir, HOME and the runtime
 /// dir (control sockets) under the temp tree so nothing in the real home or
-/// `$XDG_RUNTIME_DIR` is read or written.
+/// `$XDG_RUNTIME_DIR` is read or written. `SSH_AUTH_SOCK` is cleared (an
+/// empty value means "no agent") so the child never talks to a real
+/// `ssh-agent`; agent tests override it.
 pub fn client_env(server: &TestServer) -> Vec<(String, String)> {
     vec![
         (
@@ -300,5 +315,6 @@ pub fn client_env(server: &TestServer) -> Vec<(String, String)> {
         ),
         ("TERM".into(), "xterm".into()),
         ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
+        ("SSH_AUTH_SOCK".into(), String::new()),
     ]
 }

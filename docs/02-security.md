@@ -58,14 +58,61 @@ does for `ssh-ed25519` recipients:
 Using one ed25519 key for both signing (ssh) and X25519 DH (mysh) is a
 cross-protocol use; it has been analysed and found safe
 (Thormarker, *On using the same key pair for Ed25519 and an X25519 based
-KEM*, IACR ePrint 2021/509). mysh never signs with the key.
+KEM*, IACR ePrint 2021/509). mysh never signs with a key it has loaded
+itself; it only asks an `ssh-agent` to sign (below).
 
-**Not supported:** `ssh-rsa`, `ecdsa-*`, `sk-*` (FIDO), and `ssh-agent`.
-Agent keys only sign; they cannot do DH. Supporting them means a different
-authentication method (ephemeral-only Noise `NN` plus an ed25519 signature
-over the handshake hash, TLS-1.3 style). That is a clean addition later — an
-`Auth` message after the handshake with a method enum — and is tracked in
-06-roadmap.md. v1 chooses the single-mechanism design.
+**Not supported:** `ssh-rsa`, `ecdsa-*`, `sk-*` (FIDO). Keys that cannot
+be exported (agent-only, hardware-backed) are usable through the agent via
+signature authentication, ed25519 only.
+
+### Signature authentication (`ssh-agent`)
+
+An agent holds a key but never reveals it, so it cannot take part in the
+Noise DH. For an agent-held ed25519 key the client therefore proves its
+identity by **signature**, inside the same `XX` handshake:
+
+- the client's Noise static is a **fresh random X25519 key per connection**
+  (no long-term secret on the client side at all);
+- after message 2, once the server is verified, the client snapshots the
+  Noise handshake hash `h2` and asks the agent to sign
+  `"mysh-sig-auth-v1" ‖ h2` (`SIG_AUTH_LABEL`);
+- message 3 carries `ClientHello { caps, auth: Ed25519 { public_key, signature } }`
+  (03-protocol.md §2); the server takes the same `h2` snapshot before
+  reading message 3, verifies the signature (`ed25519-dalek`,
+  `verify_strict`) and authorizes the **ed25519 key** directly against the
+  `ssh-ed25519` entries of `authorized_keys` (no X25519 conversion is
+  involved; the Noise static is discarded).
+
+Properties: `h2` commits to both ephemerals, the server's static and the
+prologue, so a signature is bound to one handshake and cannot be replayed
+into another; the signature travels encrypted in message 3, so the client's
+identity is still hidden from an unverified server; forward secrecy is
+unchanged (`ee` is still mixed in). The signature does not cover the Noise
+static because that key is ephemeral and carries no identity. Static-key
+authentication (`auth: Static`) is the default for key files and is
+unchanged.
+
+Capability: the server advertises `caps::SIG_AUTH` in its `ServerHello`
+(on by default, `--no-signature-auth` switches it off). A client with only
+agent keys against a server without the bit stops before sending anything
+identifying and reports that the server does not support agent keys; a
+server that receives an `Ed25519` proof while the bit is off refuses it
+with `Denied { Unsupported }` without consulting `authorized_keys`.
+
+Client order: `-i PATH` is the only identity when given; a `.pub` file (or
+any file whose first line is `ssh-ed25519 …`) names the agent key to use
+and is an error if the agent does not hold it. Otherwise the first existing
+key file (table below) is tried first and then up to five ed25519 keys from
+`$SSH_AUTH_SOCK`, in the agent's order; a key is only skipped on
+`Denied { Unauthorized }`, any other failure stops the attempt. Each
+identity is one TCP connection and handshake (the rate limiter counts
+them). `--baked-only` never consults the agent. `info` shows which identity
+was accepted (`x25519 SHA256:… (path)` or `ssh-ed25519 SHA256:… (agent:
+comment)`), and `authorize` installs an `ssh-ed25519` line for an agent
+identity. Fingerprints of agent keys are the OpenSSH ones (`ssh-add -l`).
+
+The server logs `ssh-ed25519 SHA256:…` for such a peer and treats that key
+as the owner of its detached sessions, exactly like an X25519 static.
 
 ### Baked keys
 
@@ -103,7 +150,7 @@ First match wins.
 
 | role   | order                                                                                   |
 | ------ | --------------------------------------------------------------------------------------- |
-| client | `-i PATH` → `$MYSH_IDENTITY` → baked → `~/.config/mysh/id` → `~/.ssh/id_ed25519`           |
+| client | `-i PATH` (a private key, or a `.pub` naming an agent key) → first of `$MYSH_IDENTITY` → baked → `~/.config/mysh/id` → `~/.ssh/id_ed25519`, then ed25519 keys from `$SSH_AUTH_SOCK` (above) |
 | server | `--key PATH` → `$MYSH_HOST_KEY` → baked → `~/.config/mysh/host_key` (auto-generated 0600 on first `serve`) |
 
 `--key /etc/ssh/ssh_host_ed25519_key` lets the server present the same
@@ -126,7 +173,8 @@ Files are re-read on every connection; no reload signal needed. A server
 whose trusted set is empty refuses to start (fail closed).
 
 The check runs after the Noise handshake completes, on the authenticated
-remote static. An unauthorized client receives
+remote static — or, for signature authentication, on the ed25519 key whose
+signature was just verified (above). An unauthorized client receives
 `Verdict::Denied { code: Unauthorized }` as the first transport message and
 the connection is closed; the fingerprint is logged at `warn`. Authorization
 precedes every service: no stream is accepted from an unauthenticated peer.
@@ -191,7 +239,8 @@ Protects against:
 - passive and active network attackers: confidentiality, integrity, replay
   protection (AEAD nonces), forward secrecy per session;
 - server impersonation (pinning / known_hosts / TOFU);
-- unauthorized clients (authorization on the authenticated static key);
+- unauthorized clients (authorization on the authenticated static key, or
+  on the ed25519 key behind a verified handshake-bound signature);
 - disclosure of client identity to unverified servers.
 
 Does not protect against:

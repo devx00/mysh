@@ -14,11 +14,31 @@ pub struct ServerHello {
     pub caps: u32,
 }
 
+/// Domain-separation label prefixed to the handshake hash when signing
+/// an [`AuthProof::Ed25519`] proof.
+pub const SIG_AUTH_LABEL: &[u8] = b"mysh-sig-auth-v1";
+
 /// Payload of Noise message 3 (client → server).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientHello {
     /// Reserved capability bits; zero in v1.
     pub caps: u32,
+    /// How the client proves its identity.
+    pub auth: AuthProof,
+}
+
+/// Client identity proof carried in [`ClientHello`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthProof {
+    /// The Noise static key is the identity (default).
+    Static,
+    /// `signature` = Ed25519(sk, [`SIG_AUTH_LABEL`] ‖ h2) where h2 is the
+    /// Noise handshake hash after message 2; 64 bytes (a `Vec` because
+    /// serde's array support stops at 32).
+    Ed25519 {
+        public_key: [u8; 32],
+        signature: Vec<u8>,
+    },
 }
 
 /// First transport-mode message, server → client, sent as `Msg<Verdict>`
