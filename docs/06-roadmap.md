@@ -55,7 +55,7 @@ Workspace, lints, CI, this spec.
   primary under `-s`, `exit` refused while sessions run, client exit code
   follows the primary, `cwd` honoured and `cwd_fallback` reported.
 
-### M4 — hardening and release
+### M4 — hardening and release ✔
 
 - Handshake rate limit per source IP ✔ (`--handshake-rate`, token bucket);
   idle timeout ✔ (`--idle-timeout`); stream/listener quotas enforced with
@@ -73,7 +73,7 @@ Workspace, lints, CI, this spec.
   tags; `contrib/` has the systemd unit (verified with
   `systemd-analyze`), launchd plist (`plutil -lint`) and Termux:Boot script.
 
-### M5 — quality of life
+### M5 — quality of life ✔
 
 - Control socket ✔ (05-meta-shell.md "Control socket"): an interactive
   client listens on `$XDG_RUNTIME_DIR/mysh/<host>_<port>.sock`; `mysh
