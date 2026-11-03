@@ -142,6 +142,9 @@ pub struct AcceptArgs {
     /// One JSON event per line instead of human-readable lines.
     #[arg(long)]
     pub json: bool,
+
+    #[command(flatten)]
+    pub detach: crate::daemon::DaemonArgs,
 }
 
 /// `mysh run [-j N] (--hosts a,b | --group NAME)… [--json] -- CMD…`.
@@ -357,6 +360,9 @@ pub struct ServeArgs {
     /// (`ControlMsg::Bind`, the client's `bind` command).
     #[arg(long)]
     pub allow_bind_request: bool,
+
+    #[command(flatten)]
+    pub detach: crate::daemon::DaemonArgs,
 }
 
 /// `mysh keygen` options.

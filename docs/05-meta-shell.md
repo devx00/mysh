@@ -327,11 +327,32 @@ Server options:
 | `--audit PATH`                      | append one JSON line per audited event to PATH (created 0600; `-` = stderr). See 02-security.md "Audit log" |
 | `--baked-only`                      | ignore files on disk                                      |
 | `-v`                                | log level                                                 |
+| `--daemon`                          | detach: re-run in the background and exit 0 once listening (see "Running without a supervisor") |
+| `--log PATH`                        | with `--daemon`: append the log to PATH (default `$XDG_STATE_HOME/mysh/serve.log`) |
+| `--pid-file PATH`                   | write the pid once up, remove it at a clean exit; with or without `--daemon` |
 
 Signals: `SIGTERM`/`SIGINT` → send `Shutdown` on every connection, wait up
 to 5 s for sessions to end, hang up detached sessions, exit. `SIGHUP` is
-ignored (files are re-read per connection anyway). `SIGUSR1` → open a new
-pairing window (5 min, replacing any) and print its code to stderr.
+ignored (a handler is registered and never acted on, so a closed terminal
+does not end a backgrounded server; files are re-read per connection
+anyway). `SIGUSR1` → open a new pairing window (5 min, replacing any) and
+print its code to stderr.
+
+### Running without a supervisor
+
+`mysh serve --daemon …` and `mysh accept --daemon …` detach: the process
+re-executes itself with the same arguments minus `--daemon`, in its own
+process group, standard input from `/dev/null`, standard output and error
+appended to the `--log` file (created 0600), and the parent waits for the
+child to report that it is listening (accepting) before printing
+`mysh serve: started, pid N, log PATH` (`{"pid","log"}` with `accept
+--json`) and exiting 0. A child that fails first makes the parent exit 1
+with the child's log lines, so a script can trust the exit status. There
+is no `fork(2)`: `unsafe` stays in `mysh-pty`; the re-exec gives the same
+detachment. The child reports through `MYSH_READY_FILE`, a path the parent
+sets and removes; it is not inherited by sessions (their environment is
+built from scratch). Where a supervisor exists, use it instead — the
+`contrib/` units run the foreground form and give restart and logging.
 
 ## Config file (v1, minimal)
 

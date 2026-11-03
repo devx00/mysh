@@ -109,6 +109,28 @@ Sessions are not sandboxed: a client that can open a shell has everything the se
 
 The log is the server's view only: no session output, no file contents. Every line carries the authenticated key, so `jq 'select(.key == "SHA256:…")' audit.log` reconstructs one client's activity. There is no rotation; use copy-truncate, or restart with a new path.
 
+## Running without a supervisor
+
+On a machine with no service manager at hand, `--daemon` detaches the
+server and returns only once it is listening:
+
+```
+$ mysh serve --daemon --listen 0.0.0.0:7722 --pid-file /run/user/1000/mysh.pid
+mysh serve: started, pid 40971, log /home/me/.local/state/mysh/serve.log
+$ kill "$(cat /run/user/1000/mysh.pid)"      # SIGTERM: clean shutdown, pid file removed
+```
+
+| option | meaning |
+| --- | --- |
+| `--daemon` | re-run in the background (own process group, no terminal, stdin from `/dev/null`); exit 0 once up, 1 with the log lines if it failed first |
+| `--log PATH` | where the detached server's log goes (appended, mode 0600); default `$XDG_STATE_HOME/mysh/serve.log` |
+| `--pid-file PATH` | write the pid once up and remove it at a clean exit; works without `--daemon` too |
+
+`SIGHUP` (a closed terminal) is ignored, so a plain `mysh serve … &` under
+`nohup` or `setsid` also survives logout; `--daemon` just does that for you
+and tells you when the port is open. `mysh accept` takes the same three
+options (`accept.log` by default). Prefer a real unit where one exists:
+
 ## Running as a service
 
 Ready-made units are in `contrib/`. Each runs `mysh serve --listen [::]:7722` and relies on the host key being generated on first start; authorize clients in the config directory's `authorized_keys` before or after.

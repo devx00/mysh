@@ -6,6 +6,7 @@
 pub mod cli;
 pub mod client;
 pub mod config;
+pub mod daemon;
 pub mod identity;
 pub mod mcp;
 pub mod output;

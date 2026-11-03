@@ -546,6 +546,8 @@ pub async fn serve(args: ServeArgs, paths: Paths) -> Result<()> {
     for addr in server.connect_back_addrs() {
         info!(%addr, period = ?server.connect_back.period, "connecting back");
     }
+    // Up: tell a `--daemon` parent and write the pid file (removed at exit).
+    let _pid_file = crate::daemon::ready(&args.detach)?;
     if args.allow_bind_request {
         info!("bind requests from authorized clients are allowed");
     }
@@ -572,6 +574,10 @@ fn parse_listen(values: &[String]) -> Result<Vec<SocketAddr>> {
 /// Resolves on SIGTERM or SIGINT. Meanwhile each `SIGUSR1` on `usr1` opens
 /// a fresh pairing window on `pairing` (docs/02-security.md "Pairing").
 async fn shutdown_signal(pairing: Arc<pair::PairState>, mut usr1: Option<Signal>) {
+    // A registered handler that is never read: SIGHUP (a closed terminal
+    // after `--daemon` or `&`) must not end the server, whose default
+    // disposition would.
+    let _hangup = signal(SignalKind::hangup());
     let mut term = match signal(SignalKind::terminate()) {
         Ok(term) => Some(term),
         Err(e) => {

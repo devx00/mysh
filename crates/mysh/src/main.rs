@@ -181,6 +181,9 @@ async fn run(cli: Cli) -> ExitCode {
     };
 
     match cli.command {
+        Some(Command::Serve(args)) if args.detach.daemon => {
+            detach(&args.detach, &paths, "serve", mode)
+        }
         Some(Command::Serve(args)) => match mysh::server::serve(args, paths).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, EXIT_SERVE, mode),
@@ -194,6 +197,9 @@ async fn run(cli: Cli) -> ExitCode {
             Err(e) => fail(&e, EXIT_USAGE, mode),
         },
         Some(Command::Pair(h)) => pair(&h, &config, &paths, &baked, mode).await,
+        Some(Command::Accept(args)) if args.detach.daemon => {
+            detach(&args.detach, &paths, "accept", mode)
+        }
         Some(Command::Accept(args)) => exit_code(
             mysh::client::accept::run(&args, &paths, &baked, mode).await,
             mode,
@@ -229,6 +235,30 @@ async fn run(cli: Cli) -> ExitCode {
             }
             Err(e) => fail(&e, EXIT_USAGE, mode),
         },
+    }
+}
+
+/// `--daemon`: re-exec detached, wait for readiness, report the pid and
+/// log path (`{"pid","log"}` in a JSON mode), exit.
+fn detach(args: &mysh::daemon::DaemonArgs, paths: &Paths, command: &str, mode: Mode) -> ExitCode {
+    let default_log = mysh::daemon::default_log(&paths.history, command);
+    match mysh::daemon::spawn(args, &default_log) {
+        Ok(started) => {
+            if mode.is_json() {
+                println!(
+                    "{}",
+                    serde_json::to_string(&started).unwrap_or_else(|_| "{}".to_owned())
+                );
+            } else {
+                println!(
+                    "mysh {command}: started, pid {}, log {}",
+                    started.pid,
+                    started.log.display()
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e, EXIT_SERVE, mode),
     }
 }
 

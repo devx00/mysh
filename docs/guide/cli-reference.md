@@ -82,6 +82,9 @@ Run the server
 | `--connect-jitter <PERCENT>` | Spread each connect-back period by ± this percentage (default 10) |
 | `--connect-max <DURATION>` | Close a connect-back connection the client has held for this long (default `30m`) |
 | `--allow-bind-request` | Let authorized clients ask the server to bind a listener (`ControlMsg::Bind`, the client's `bind` command) |
+| `--daemon` | Detach: re-run in the background (own process group, no terminal) and exit 0 once it is up; `--log` and `--pid-file` say where it writes. Prefer a service unit from `contrib/` where one exists |
+| `--log <PATH>` | With `--daemon`: append the log to PATH (default `$XDG_STATE_HOME/mysh/<command>.log`) |
+| `--pid-file <PATH>` | Write the process id to PATH once up (removed on exit); with `--daemon` or without |
 | `-v, --verbose` | Increase log verbosity; `-vv` includes handshake and stream events |
 
 ## `mysh keygen`
@@ -428,6 +431,9 @@ Accept connections from servers that dial this client (`serve --connect-back`)
 | `--accept-new` | Record an unknown server key in the callers file and accept it |
 | `--handshakes-per-minute <N>` | Per-address limit on inbound handshakes (0: no limit) (default `30`) |
 | `--json` | One JSON event per line instead of human-readable lines |
+| `--daemon` | Detach: re-run in the background (own process group, no terminal) and exit 0 once it is up; `--log` and `--pid-file` say where it writes. Prefer a service unit from `contrib/` where one exists |
+| `--log <PATH>` | With `--daemon`: append the log to PATH (default `$XDG_STATE_HOME/mysh/<command>.log`) |
+| `--pid-file <PATH>` | Write the process id to PATH once up (removed on exit); with `--daemon` or without |
 | `-v, --verbose` | Increase log verbosity; `-vv` includes handshake and stream events |
 
 ## `mysh bind`

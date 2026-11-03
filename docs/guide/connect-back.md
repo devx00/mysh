@@ -76,6 +76,12 @@ An unknown key is refused *before* the client reveals its own key, so
 anything that port-scans the accepting port learns nothing. Without
 `--accept-new` and with an empty callers file, `accept` refuses to start.
 
+To leave it running without a terminal, `mysh accept … --daemon
+[--log PATH] [--pid-file PATH]` detaches and returns once it is accepting
+(`{"pid","log"}` on stdout with `--json`); see
+[server](server.md#running-without-a-supervisor) for the details, which are
+the same for `serve`.
+
 ## Working with accepted connections
 
 `mysh accept` holds every accepted connection open and serves a control

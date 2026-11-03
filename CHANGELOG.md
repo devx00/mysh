@@ -208,6 +208,11 @@ server.
   lines go to stderr unless drawn on a terminal, and a command failing
   through a master keeps the requester's `--json` shape; `mysh master
   --daemon` detaches instead of running in the foreground.
+- **`--daemon` for `serve` and `accept`**: detach (own process group, no
+  terminal, log appended to `--log` or `$XDG_STATE_HOME/mysh/<cmd>.log`,
+  `--pid-file`) and exit 0 only once the child is listening/accepting — or
+  1 with the child's log lines if it failed first. `SIGHUP` is now really
+  ignored by both (the docs said so; no handler was installed).
 
 ### Changed
 

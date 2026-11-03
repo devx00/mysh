@@ -78,7 +78,11 @@ pub async fn run(args: &AcceptArgs, paths: &Paths, baked: &Baked, mode: Mode) ->
         acceptor.local_addr(),
         callers_path.display()
     ));
+    // Up: tell a `--daemon` parent and write the pid file (removed at exit).
+    let _pid_file = crate::daemon::ready(&args.detach)?;
 
+    // Registered and never read: a hangup must not end a detached acceptor.
+    let _hangup = signal(SignalKind::hangup());
     let mut sigterm = signal(SignalKind::terminate()).context("SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("SIGINT handler")?;
     let (shutdown, _) = watch::channel(false);
