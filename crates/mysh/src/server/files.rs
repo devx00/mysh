@@ -611,6 +611,7 @@ pub(crate) mod tests {
             idle_timeout: mysh_proto::limits::SERVER_IDLE,
             detach_grace: mysh_proto::limits::DETACH_GRACE,
             signature_auth: true,
+            authorized_keys: home.path().join("authorized_keys"),
         });
         let peer: SocketAddr = "127.0.0.1:1".parse().expect("addr");
         let local: SocketAddr = "127.0.0.1:2".parse().expect("addr");

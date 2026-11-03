@@ -354,6 +354,24 @@ async fn mkdir_rm_mv_realpath() {
     ok(&run(sub(&server, "mkdir").arg("-P").arg("~/a/b/c")));
     let out = run(sub(&server, "mkdir").arg("~/x/y"));
     assert_eq!(out.status.code(), Some(1));
+    // A parent that is a symlink to a directory is a directory for `-P`
+    // (`/tmp` -> `/private/tmp` on macOS); a link to a file is not.
+    std::os::unix::fs::symlink(server.home.join("a"), server.home.join("link")).expect("symlink");
+    ok(&run(sub(&server, "mkdir")
+        .arg("-P")
+        .arg("~/link/via-link/deeper")));
+    assert!(server.home.join("a/via-link/deeper").is_dir());
+    std::fs::write(server.home.join("file"), b"").expect("write");
+    std::os::unix::fs::symlink(server.home.join("file"), server.home.join("filelink"))
+        .expect("symlink");
+    let out = run(sub(&server, "mkdir").arg("-P").arg("~/filelink/sub"));
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("not a directory"),
+        "stdout: {}\nstderr: {}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
     // `-m` sets the mode.
     ok(&run(sub(&server, "mkdir")
         .arg("-m")

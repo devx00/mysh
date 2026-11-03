@@ -348,6 +348,87 @@ truth. Windows is out of scope by design.
   static inspection (`docs/08-platform-matrix.md` lists the targets lacking
   runtime validation).
 
+### M12 — connect-back ✔
+
+A server may open the TCP connection itself to a client that accepts such
+connections; after TCP nothing changes (03-protocol.md §1, "Direction is
+independent of roles").
+
+- Server ✔ (`server/connect_back.rs`, decisions 62–63): `mysh serve
+  --connect-back ADDR` (repeatable, `host[:port]`), `--connect-period`
+  (default `5m`, start-to-start), `--connect-jitter` (default 10 %),
+  `--connect-max` (default `30m`: the server ends the connection with
+  `Shutdown { reason: "connect-back: max connection time" }`); `--listen`
+  stays optional and nothing is bound without it. One strictly sequential
+  loop per address — dial (5 s timeout) → `handle_connection` → sleep until
+  `attempt_start + period ± jitter` — so a loop never has two connections
+  open; dial and handshake failures back off 5 s doubling up to the period
+  (logged at `warn` once, then `debug`). Shutdown ends each loop after its
+  current connection. Audit lines carry `direction: inbound|outbound`.
+- Bind on request ✔ (03-protocol.md §6): `ControlMsg::{Bind, Bound,
+  Unbound, Unbind}` appended; with `--allow-bind-request` an authorized
+  client makes the server bind a listener that runs the normal accept loop
+  until `idle_secs` without a connection, `Unbind`, or exit; the listener
+  belongs to the server process, one at a time. Refused with `Unbound {
+  reason: "bind requests are not allowed" }` by default.
+- `RateLimiter` moved to `mysh-net::ratelimit` so the accepting client
+  reuses it; `contrib/mysh-connect-back.service` is a second systemd unit.
+- Tests ✔ (`crates/mysh/tests/connect_back.rs`, through the binary with an
+  in-test acceptor): one handshake per period and none while a connection
+  is held; period measured from the previous start; exec and pings on a
+  dialed connection; `--connect-max 1s`; a refused handshake retried with
+  backoff and the log lines; `Bind` refused / bound (a plain `mysh
+  HOST 'echo ok'` through the requested listener, idle expiry, `Unbind`).
+  Units: `Addr` parsing, jitter and backoff schedule, flag parsing.
+- Client ✔ (`mysh-client/src/accept.rs`, `client/accept.rs`, decisions
+  64–66): `Acceptor::bind(addr, identity, callers, reporter, AcceptOpts
+  { accept_new, handshakes_per_minute })` listens, handshakes concurrently
+  (bounded at 10 s, per-address token bucket) and yields `Inbound
+  { client, caller, peer, name }` in arrival order; refused and failed
+  handshakes never reach `next()`. `conn::accept_connection` turns an
+  accepted `TcpStream` into a `Connection` through the one existing
+  handshake path, and `Client::from_connection` wraps it (no `reconnect`).
+- Callers ✔ (02-security.md "Callers"): `~/.config/mysh/callers` in
+  `authorized_keys` line format, looked up by fingerprint; the comment is
+  the name, an unnamed key is addressed by the first twelve base64
+  characters of its fingerprint, baked peers count. `--accept-new` records
+  unknown keys; anything else is refused with `trust_unknown` before
+  message 3 and reported (`accepted`/`closed`/`refused` events).
+- `mysh accept [ADDR] [--callers PATH] [--accept-new]
+  [--handshakes-per-minute N] [--json]` ✔ serves a control socket per
+  connection at `<runtime>/mysh/@NAME.sock` (the master's `CtlServer`) and
+  exits on SIGTERM/SIGINT after closing every connection. `@NAME` is a
+  `Target` with `via_socket_only`, so `mysh @NAME CMD`, `put/get`,
+  `session`, `run --hosts @a,@b` all route through the socket and fail
+  with `connect_failed` when it is absent — never dialing.
+- `bind [ADDR|off] [--for D]` ✔ (prompt, CLI, control socket):
+  `Connection::bind`/`unbind` with a 10 s wait for `Bound`/`Unbound`,
+  `BindOut { bound }` as its document, `denied` when the server has no
+  `--allow-bind-request`.
+- Tests ✔ (`crates/mysh/tests/accept.rs`, real `serve --connect-back`
+  processes): one connection per period with none while the first is held
+  and exec on it; two callers queued and consumed; an unknown key refused
+  (event, nothing yielded, nothing recorded) and recorded with
+  `--accept-new`; `mysh accept --json` printing `accepted`, creating
+  `@alpha.sock`, `mysh --json @alpha 'echo ok'`, `@missing` →
+  `connect_failed`, `bind` through the socket then a plain dialed client
+  on the new listener; `bind` denied without the server flag. Units:
+  `@NAME` parsing, callers parse/lookup/append/record, socket-name
+  sanitization, `accept`'s address forms.
+- Fixed while documenting (decisions 67–69): `authorize` writes to the
+  `authorized_keys` the server reports in `Info` (a non-default
+  `MYSH_CONFIG_DIR` used to leave the key untrusted); `mkdir -P` follows a
+  symlinked parent (`/tmp` on macOS); `error: …` lines go to stderr off a
+  terminal and keep the requester's `--json` shape through a master;
+  `master --daemon` actually detaches. Regression tests in
+  `tests/files.rs`, `tests/fileprims.rs`, `tests/ctl.rs`.
+- Smoke (two `serve --connect-back` processes, one `mysh accept --json`,
+  loopback): both accepted and named from `callers`, worked through by
+  `@NAME` (`exec`, `put`, `cat`, `session new/read`, `run --hosts`),
+  `@missing` never dials, one handshake per server while held, re-dial
+  after the acceptor exits, `bind` denied/bound/off with a plain dial in
+  between, `--connect-max` closing from the server side.
+
 ## Decisions log
 
 Defaults chosen without asking; each is cheap to change now and expensive
@@ -416,6 +497,14 @@ later.
 | 59 | tier-3 stretch targets (no prebuilt `std`: s390x/mips/mipsel musl, aarch64 NetBSD, OpenBSD) are rows of the same `scripts/release.sh` table with tier `3` and build with `cargo +nightly … -Z build-std=std,panic_abort`; NetBSD/OpenBSD link through a generated `zig cc -target` wrapper because cargo-zigbuild only knows FreeBSD; MIPS musl adds `+crt-static` and `-C link-self-contained=no`; `scripts/check-tier3.sh` is the `check-matrix` equivalent (a cargo alias cannot pick a toolchain) | a second toolchain pin for nightly; `cargo-xbuild`; a musl-cross gcc per MIPS arch; leaving tier 3 out | the stable pin stays the only toolchain the required set needs, and nightly is only reached for rows that cannot build any other way; the generated wrapper is what cargo-zigbuild does internally, so there is no second linker story; `+crt-static` is what every other musl row already is, and the self-contained switch only matters because nightly has no crt objects for a target without `rust-std` |
 | 60 | a stretch target ships only after the full `validate-dist` round trip (Linux) or a clean link (BSD); `mips64el` is left out because libc 0.2.191 selects the asm-generic socket constants for `target_arch = "mips64"` and `bind` fails with `ENOPROTOOPT` under qemu, and illumos because neither zig nor this host has an illumos libc to link against — both are recorded with the blocker in `docs/08-platform-matrix.md` | shipping link-only MIPS64 binaries; a `[patch.crates-io]` on libc from git; a hand-built illumos sysroot | a binary that links but cannot open a socket is worse than none, and a git patch on libc would change every target's dependency graph for one stretch row; the blockers are small and upstream (a libc release, an illumos sysroot), so the rows stay documented and are one line to turn on |
 | 61 | `validate-dist` maps targets without a registry image to `native`: the artifact runs inside the host-arch image through the kernel's binfmt handler (mips64le) or an explicit Alpine `qemu-<arch>` package (32-bit MIPS, which binfmt does not cover); `armv5te` reuses the `arm/v6` image since qemu-arm executes ARMv5 code; `MYSH_DOCKER_LIBRARY` re-points the official images at a mirror | skipping those targets; building a local image per arch; `qemu-user-static` from Debian in every run | the binary is static and only needs a `sh`, so the host image plus an emulator is the same round trip at no image cost; the mirror variable exists because Docker Hub's unauthenticated pull limit was hit mid-validation and the script should not depend on an account |
+| 62 | a connect-back loop is one task per address that *awaits* `handle_connection` inline and only then sleeps until `attempt_start + period ± jitter`; `--connect-max` and the server's shutdown are raced against it and delivered as the connection's own shutdown `watch` reason; failed attempts back off from 5 s doubling to the period | a timer that dials every period and a counter guarding against overlap; aborting the connection at `--connect-max` | the "one connection per address, never dial while one is open" rule is the shape of the loop rather than a check that can drift, the existing shutdown path (`Shutdown` + 5 s grace) ends the connection cleanly instead of cutting a session mid-write, and a next attempt measured from the previous *start* keeps the cadence steady whether the client held the connection for a second or an hour |
+| 63 | a listener bound on `Bind` is owned by the server process (`Shared.requested`, one at a time) and runs the same `accept_one` body as a `--listen` listener with an idle timer, a stop watch and the shutdown watch; `Bind` is answered by exactly one of `Bound`/`Unbound`, `Unbind` is always answered, and the requesting connection is told `Unbound` when the listener later closes | a listener tied to the requesting connection's lifetime; several listeners per connection; silently closing | the point of the request is to let *other* clients dial in after the requesting (connect-back) connection has gone back to its period, so the listener cannot die with it; one per process keeps `Unbind` unambiguous, and a single reply per request is what a client waiting 10 s for `Bound` needs |
+| 64 | an accepting client identifies a connecting-back server through a `callers` store (`~/.config/mysh/callers`, `authorized_keys` line format) keyed by **key**, with the line's comment as the connection's name; baked peers count, `--accept-new` records an unknown key unnamed, everything else is refused before Noise message 3 | reusing `known_hosts` with the source address as the host; a `callers` file of its own format; naming unknown callers from `ServerHello.name` | the address a server dialed from says nothing about who it is (NAT, DHCP, a second server behind the same router), so a host-keyed file would either match everything or nothing; `authorized_keys` lines are the format both trust files already use, and a name that decides a socket path must come from the operator's file, never from the peer |
+| 65 | an accepted connection is a `Target { host: "@NAME", via_socket_only: true }` served by the same `CtlServer` a master uses, at `<runtime>/mysh/@NAME.sock`; every HOST-taking command reaches it as `@NAME` through the existing socket-first path and fails with `connect_failed` when the socket is absent | a new address scheme (`accepted://NAME`) with its own routing; a long-lived `mysh accept` API with a protocol of its own; letting `@NAME` dial as a fallback | the socket path is the one mechanism the CLI already uses for "a connection somebody else holds", so `put`, `get`, `session`, `run --hosts` and the prompt work on accepted connections with no code of their own; dialing as a fallback would contact *some* server at a name that denotes a connection, which is exactly the confusion the `@` prefix exists to prevent |
+| 66 | `Acceptor` runs handshakes in tasks and releases them through a queue of per-connection slots, so they are concurrent but reach `next()` in arrival order, and each accepted connection carries its own `Client` (`Client::from_connection`, no `reconnect`) | handshaking inline in the accept loop; forwarding in completion order; handing out bare `Connection`s | a slow or hostile peer must not hold the listener or eat another connection's handshake deadline, while arrival order is what an operator reading the log expects; an accepted connection cannot be re-dialed (the server owns the schedule), so the facade says so instead of silently opening a new connection to an address that was never ours |
+| 67 | `Info` carries the server's `authorized_keys` path and `mysh authorize` writes there (falling back to `~/.config/mysh/authorized_keys` for a server without `Info`) | keeping the literal remote path; making the server also read `~/.config/mysh/authorized_keys` | `authorize` reported "added" on a server with a non-default `MYSH_CONFIG_DIR` while the key stayed untrusted; the server is the only party that knows where it reads, and widening the server's trust sources would be a trust-model change for a client-side bug |
+| 68 | `error: …` lines of a failed command go to stderr unless the console is drawing on a terminal, and a command that fails through a master's control socket is reported by the requester's own output mode (`{"error":…}` with `--json`) | stdout as before; the master's plain-mode text for everyone | `mysh cat HOST f > out` wrote the error into `out`, and a `--json` caller through a master got un-parseable text; notices already followed the terminal rule, errors now match it |
+| 69 | `mysh master HOST --daemon` is wired to `ctl::ensure` (spawn detached, wait for the socket, exit 0; an already running master counts) | removing the flag | docs/05 described the flag and scripts need a synchronous "the master is up" step; `--master auto` covers interactive use but not a setup script |
 
 ## Testing strategy
 

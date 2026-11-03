@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod accept;
 pub mod args;
 pub mod attach;
 pub mod client;
@@ -36,6 +37,7 @@ pub mod session_api;
 pub mod sync;
 pub mod types;
 
+pub use accept::{AcceptOpts, Acceptor, Inbound};
 pub use client::{Client, ExecRequest, Files, Sessions};
 pub use error::{Error, Result};
 pub use report::{NullReporter, RefuseUnknown, Reporter, TrustPrompt};

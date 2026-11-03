@@ -34,6 +34,7 @@ mysh-client = { path = "crates/mysh-client" }   # not on crates.io
 | `session_api` | the remote process API by id: `session_new/read/send/list/kill/wait` and their `--json` shapes   |
 | `files`, `fileops`, `sync` | file primitives (`stat`, `list_all`, `read_range`, `write_bytes`, `get_to`, `put_from`, `remove`, `rename`, `hash`, `tail_lines`, …), the `put`/`get`/`ls`/`cat`/… runners, and `sync` with `SyncOutcome` |
 | `forward`     | `Forwards`: `-L`/`-R`/`-D` listeners on a connection                                              |
+| `accept`      | `Acceptor`, `AcceptOpts`, `Inbound`: connections servers open themselves ("Accepting connections") |
 | `ctl`         | the control-socket requester (`request`, `socket_ready`) and `ensure` (start a `mysh master`)   |
 | `fleet`       | `parse_hosts`/`expand_hosts` (`--hosts`/`--group`) and `run`: one exec on many hosts             |
 | `pair`        | `pair`: SPAKE2 first contact with a one-time code (02-security.md "Pairing")                     |
@@ -156,6 +157,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+### Accepting connections
+
+A server started with `mysh serve --connect-back ADDR` dials the client
+instead of waiting to be dialed; after TCP nothing changes, so an accepted
+connection is an ordinary [`Client`]. `mysh_client::accept` is that side:
+
+```rust
+use std::{net::SocketAddr, sync::Arc};
+use mysh_client::{AcceptOpts, Acceptor, ExecRequest, NullReporter,
+                  config::Paths, identity::{Callers, client_identities}};
+
+let paths = Paths::from_env();
+let callers = Callers::load(&paths);                 // ~/.config/mysh/callers
+let identity = client_identities(&Default::default(), &paths, &Default::default(),
+                                 &mut |_| Err(std::io::Error::other("no passphrase")))
+    .await?.remove(0);
+let mut acceptor = Acceptor::bind(
+    "[::]:7722".parse::<SocketAddr>()?,
+    identity,
+    callers,
+    Arc::new(NullReporter),
+    AcceptOpts { accept_new: false, handshakes_per_minute: 30 },
+).await?;
+
+while let Some(inbound) = acceptor.next().await {
+    println!("{} from {}", inbound.caller.label(), inbound.peer);
+    let out = inbound.client.exec(ExecRequest::argv(["uname", "-sm"])).await?;
+    println!("{}", String::from_utf8_lossy(out.stdout.as_bytes()));
+    inbound.client.close().await;   // the server goes back to its period
+}
+```
+
+- Trust is by **key**, not by address: the server's static key is looked
+  up in the [`Callers`] store (`~/.config/mysh/callers`, `authorized_keys`
+  line format, the comment is the name) plus the baked peers. An unknown
+  key is refused before the client reveals its own in Noise message 3, and
+  reported as `Event::Refused`; `AcceptOpts::accept_new` records it
+  instead (02-security.md "Callers"). The server still authorizes the
+  client's key as usual, so both ends are checked.
+- `Inbound { client, caller, peer, name }`: `caller.label()` is the name
+  (or fingerprint label) the connection is known by, `name` is the
+  informational `ServerHello.name`.
+- Handshakes run concurrently and are released in arrival order; a slow
+  consumer never eats into a handshake deadline, and refused or failed
+  handshakes never reach `next()`. Queued connections stay alive (their
+  pinger runs), so release them promptly: holding one keeps that server
+  from going back to its period, and the server will close it itself after
+  `--connect-max`.
+- The reporter receives `Event::Accepted { name, fingerprint, addr, server }`,
+  `Event::Closed { name, fingerprint, reason }` and `Event::Refused
+  { fingerprint, addr, reason }`.
+- `Client::from_connection(conn, reporter)` wraps any existing
+  [`Connection`] the same way; such a client cannot `reconnect()` (an
+  accepted connection is only re-established by the server).
+- `Connection::bind(addr, idle)` / `unbind()` ask the server for a
+  listener of its own (`serve --allow-bind-request`), so ordinary clients
+  can dial it; a refusal carries the `denied` code.
 
 ### Errors
 

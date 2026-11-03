@@ -9,6 +9,7 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
@@ -528,6 +529,158 @@ impl ClientTrust {
     }
 }
 
+/// Source label of a caller accepted with `--accept-new`.
+const ACCEPT_NEW: &str = "accept-new";
+
+/// A server allowed to connect back (docs/02-security.md "Callers"): one
+/// line of the client's `callers` file or a baked peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Caller {
+    /// The line's comment: the name the connection is addressed by
+    /// (`@NAME`, its control socket). `None` for an unnamed line.
+    pub name: Option<String>,
+    /// Fingerprint of the server's key.
+    pub fingerprint: Fingerprint,
+    /// Where the key was found (`~/.config/mysh/callers:3`, `baked`,
+    /// `accept-new`).
+    pub via: String,
+}
+
+impl Caller {
+    /// The name the connection is addressed by: the line's comment, or for
+    /// an unnamed caller the first twelve characters of the fingerprint's
+    /// base64 (`SHA256:` stripped).
+    #[must_use]
+    pub fn label(&self) -> String {
+        match &self.name {
+            Some(name) => name.clone(),
+            None => fingerprint_label(&self.fingerprint),
+        }
+    }
+}
+
+/// The first twelve characters of a fingerprint's base64 (`SHA256:`
+/// stripped): how an unnamed caller is addressed.
+#[must_use]
+pub fn fingerprint_label(fingerprint: &Fingerprint) -> String {
+    let text = fingerprint.as_str();
+    let b64 = text.split_once(':').map_or(text, |(_, b64)| b64);
+    b64.chars().take(12).collect()
+}
+
+/// The servers a client accepts inbound connections from: the `callers`
+/// file (`authorized_keys` line format; the comment is the name) plus the
+/// baked peers. Keyed by the server's key, never by its address.
+#[derive(Debug)]
+pub struct Callers {
+    /// The file unknown callers are appended to with `--accept-new`.
+    path: PathBuf,
+    entries: Mutex<AuthorizedKeys>,
+}
+
+impl Callers {
+    /// Read `paths.callers`; a missing file is an empty store.
+    #[must_use]
+    pub fn load(paths: &Paths) -> Self {
+        Self::load_from(&paths.callers)
+    }
+
+    /// Read an explicit callers file (`--callers PATH`); a missing file is
+    /// an empty store.
+    #[must_use]
+    pub fn load_from(path: &Path) -> Self {
+        let home = dirs::home_dir();
+        let label = tildify(path, home.as_deref());
+        let entries = read_trust_file(path).map_or_else(AuthorizedKeys::new, |text| {
+            AuthorizedKeys::parse(&text, &label)
+        });
+        Self {
+            path: path.to_owned(),
+            entries: Mutex::new(entries),
+        }
+    }
+
+    /// Parse callers from `text` (labelled `source`), with `path` as the
+    /// file `--accept-new` appends to.
+    #[must_use]
+    pub fn parse(text: &str, source: &str, path: PathBuf) -> Self {
+        Self {
+            path,
+            entries: Mutex::new(AuthorizedKeys::parse(text, source)),
+        }
+    }
+
+    /// Add the compiled-in peers (named by their comments).
+    pub fn include_baked(&self, baked: &Baked) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.extend(baked.peers.clone());
+        }
+    }
+
+    /// The file unknown callers are recorded in.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Number of callers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.lock().map_or(0, |e| e.len())
+    }
+
+    /// Whether no caller is known.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The caller `key` belongs to, if it is one.
+    #[must_use]
+    pub fn lookup(&self, key: &PublicKey) -> Option<Caller> {
+        let entries = self.entries.lock().ok()?;
+        let entry = entries.find(key)?;
+        Some(Caller {
+            name: entry
+                .comment
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(str::to_owned),
+            fingerprint: key.fingerprint(),
+            via: if entry.source == BAKED {
+                BAKED.to_owned()
+            } else {
+                format!("{}:{}", entry.source, entry.line)
+            },
+        })
+    }
+
+    /// `--accept-new`: record an unknown `key` in the callers file without
+    /// a name (naming it is an edit to the file) and in this store. The
+    /// resulting caller is addressed by its fingerprint.
+    pub fn record(&self, key: &PublicKey) -> io::Result<Caller> {
+        Self::append(&self.path, key, None)?;
+        if let Ok(mut entries) = self.entries.lock()
+            && !entries.contains(key)
+        {
+            entries.extend(AuthorizedKeys::parse(&key.to_line(None), ACCEPT_NEW));
+        }
+        Ok(Caller {
+            name: None,
+            fingerprint: key.fingerprint(),
+            via: ACCEPT_NEW.to_owned(),
+        })
+    }
+
+    /// Append `key` to the callers file at `path` as `mysh-x25519 <b64>
+    /// NAME` unless it is already listed; `false` when it was. Creates the
+    /// file 0600 and its parent 0700.
+    pub fn append(path: &Path, key: &PublicKey, name: Option<&str>) -> io::Result<bool> {
+        AuthorizedKeys::append_line(path, key, name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -608,6 +761,7 @@ mod tests {
             timeout: None,
             cwd: None,
             master: crate::config::MasterMode::Never,
+            via_socket_only: false,
         }
     }
 
@@ -847,5 +1001,70 @@ mod tests {
         );
         assert_eq!(tildify(Path::new("/etc/x"), Some(home)), "/etc/x");
         assert_eq!(tildify(Path::new("/etc/x"), None), "/etc/x");
+    }
+
+    #[test]
+    fn callers_parse_lookup_and_names() {
+        let named = key();
+        let unnamed = key();
+        let stranger = key();
+        let text = format!(
+            "{}{}# comment\n",
+            named.to_line(Some("alpha")),
+            unnamed.to_line(None)
+        );
+        let callers = Callers::parse(&text, "callers", PathBuf::from("/nonexistent/callers"));
+        assert_eq!(callers.len(), 2);
+        let a = callers.lookup(&named).expect("named caller");
+        assert_eq!(a.name.as_deref(), Some("alpha"));
+        assert_eq!(a.label(), "alpha");
+        assert_eq!(a.fingerprint, named.fingerprint());
+        assert_eq!(a.via, "callers:1");
+        let u = callers.lookup(&unnamed).expect("unnamed caller");
+        assert_eq!(u.name, None);
+        assert_eq!(u.label(), fingerprint_label(&unnamed.fingerprint()));
+        assert_eq!(u.label().len(), 12);
+        assert!(!u.label().starts_with("SHA256"));
+        assert_eq!(callers.lookup(&stranger), None);
+    }
+
+    #[test]
+    fn callers_include_baked_peers_by_comment() {
+        let peer = key();
+        let baked = Baked::parse(None, Some(&peer.to_line(Some("compiled")))).expect("baked");
+        let callers = Callers::parse("", "callers", PathBuf::from("/nonexistent/callers"));
+        assert!(callers.is_empty());
+        callers.include_baked(&baked);
+        let c = callers.lookup(&peer).expect("baked caller");
+        assert_eq!(c.name.as_deref(), Some("compiled"));
+        assert_eq!(c.via, BAKED);
+    }
+
+    #[test]
+    fn callers_append_and_record() {
+        let dir = TempDir::new("callers");
+        let paths = paths_in(&dir);
+        let k1 = key();
+        let k2 = key();
+        assert!(Callers::append(&paths.callers, &k1, Some("one")).expect("append"));
+        assert!(!Callers::append(&paths.callers, &k1, Some("one")).expect("dedupe"));
+        let callers = Callers::load(&paths);
+        assert_eq!(
+            callers.lookup(&k1).expect("one").name.as_deref(),
+            Some("one")
+        );
+        assert_eq!(callers.lookup(&k2), None);
+        let recorded = callers.record(&k2).expect("record");
+        assert_eq!(recorded.name, None);
+        assert_eq!(recorded.via, ACCEPT_NEW);
+        // Known in memory and on disk, without a name.
+        assert_eq!(callers.lookup(&k2).expect("recorded").name, None);
+        let reloaded = Callers::load(&paths);
+        assert_eq!(reloaded.len(), 2);
+        let text = fs::read_to_string(&paths.callers).expect("read");
+        assert!(text.contains(k2.to_line(None).trim_end()), "{text}");
+        // A missing file is an empty store.
+        let missing = Callers::load_from(&dir.path("nope"));
+        assert!(missing.is_empty());
     }
 }

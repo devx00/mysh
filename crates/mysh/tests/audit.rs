@@ -23,6 +23,7 @@ struct AuditLine {
     peer: String,
     key: String,
     kind: String,
+    direction: String,
     event: String,
     detail: serde_json::Map<String, serde_json::Value>,
     exit: Option<i32>,
@@ -170,6 +171,8 @@ async fn audit_log_records_every_event_kind_with_a_stable_schema() {
         assert_eq!(line.ts.len(), 24, "{}", line.ts);
         assert!(line.ts.ends_with('Z'));
         assert!(line.peer.starts_with("127.0.0.1:"), "{}", line.peer);
+        // Every connection here was dialed by the client.
+        assert_eq!(line.direction, "inbound");
     }
 
     // Per-event facts.

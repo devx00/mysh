@@ -233,7 +233,7 @@ async fn mkdir(
 
 /// Every leading directory of `path` ending with `path` itself:
 /// `a/b/c` → `a`, `a/b`, `a/b/c`; `/x/y` → `/x`, `/x/y`; `~/d` → `~/d`.
-fn prefixes(path: &str) -> Vec<String> {
+pub(crate) fn prefixes(path: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut end = 0;
     for (i, c) in path.char_indices() {

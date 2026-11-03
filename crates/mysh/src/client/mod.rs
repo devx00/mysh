@@ -3,6 +3,7 @@
 //! docs/05-meta-shell.md "Modes and exit" and docs/04-sessions.md "Exit
 //! codes".
 
+pub mod accept;
 pub mod attach;
 pub mod conn;
 pub mod console;
@@ -30,7 +31,9 @@ use tokio::signal::unix::{SignalKind, signal};
 use tracing::{debug, warn};
 
 use crate::{
-    cli::{AuthorizeArgs, FileCmd, ForwardCliArgs, GetArgs, MasterArgs, PutArgs, SessionArgs},
+    cli::{
+        AuthorizeArgs, BindArgs, FileCmd, ForwardCliArgs, GetArgs, MasterArgs, PutArgs, SessionArgs,
+    },
     config::{Paths, Target},
     identity::Baked,
     output::{EXIT_TIMEOUT, Mode, code_for, codes},
@@ -80,6 +83,8 @@ pub enum ClientCommand {
     File(FileCmd),
     Forward(ForwardCliArgs),
     Authorize(AuthorizeArgs),
+    /// `mysh HOST bind [ADDR|off]`: a listener on the server's side.
+    Bind(BindArgs),
     /// `mysh HOST session …`: the remote process API.
     Session(SessionArgs),
     /// `mysh master HOST` / `mysh -M HOST`: hold the connection open.
@@ -165,6 +170,9 @@ async fn dispatch(
         ClientCommand::Authorize(args) => {
             let line = meta::pubkey_line(conn, args.pubkey.as_deref(), &home_dir(), &local_cwd)?;
             one_shot(console, None, files::authorize(conn, console, &line)).await
+        }
+        ClientCommand::Bind(args) => {
+            one_shot(console, target.timeout, meta::bind(conn, console, &args)).await
         }
         ClientCommand::Session(args) => {
             // `session send --stdin` reads this process's stdin itself.

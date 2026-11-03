@@ -15,6 +15,16 @@ The agreed version is bound into the Noise **prologue** `b"mysh" ‖ u16-LE
 version`, so a middlebox that rewrites the preamble causes handshake failure
 rather than a silent downgrade. Unknown magic → close without reply.
 
+**Direction is independent of roles.** "Client" and "server" are protocol
+roles — the client sends first, is the Noise initiator and owns odd yamux
+stream ids; the server is the responder. Which side opened the TCP
+connection does not matter: normally the client dials, but a server in
+connect-back mode (`mysh serve --connect-back ADDR`) dials a client that
+accepts such connections (`mysh accept`), and from the first preamble byte
+on nothing differs. XX's identity hiding then favours the accepting
+client: it reveals its static key (message 3) only after it has verified
+the server's (message 2) against its `callers` store (02-security.md).
+
 ## 2. Handshake
 
 `Noise_XX_25519_ChaChaPoly_BLAKE2s`, client = initiator.
@@ -180,8 +190,15 @@ enum ControlMsg {
     Pong { nonce: u64 },
     Notice(String),                 // server → client; shown on stderr ("server shutting down")
     Shutdown { reason: String },    // either side; peer finishes in-flight streams, then closes
+    Bind { addr: String, idle_secs: u32 },   // client → server: bind a listener at addr
+    Bound { addr: String },                  // server → client: bound (port 0 resolved)
+    Unbound { addr: String, reason: String },// server → client: refused, or closed later
+    Unbind,                                  // client → server: close the requested listener
 }
 ```
+
+Variants are append-only; a side that receives a variant it does not know
+ignores it.
 
 Keep-alive: the client pings every 30 s; three consecutive unanswered pings →
 the client declares the connection dead (exit 255). The server closes a
@@ -190,6 +207,26 @@ TCP keep-alive is not set in v1 (tokio exposes no API for it; the pings
 cover liveness).
 
 RTT shown by `info`/`ping` is measured here.
+
+**Bind on request.** An authorized client (never a pairing-only one) may
+ask a server to bind a listener so that ordinary clients can dial it —
+typically over a connection the server opened itself. `Bind { addr,
+idle_secs }` is answered by exactly one of `Bound { addr }` (the address
+actually bound) or `Unbound { addr, reason }`; without `mysh serve
+--allow-bind-request` the reason is `bind requests are not allowed`. The
+listener belongs to the server process, not to the requesting connection:
+it runs the normal accept loop until `idle_secs` pass without an accepted
+connection (0: never), until `Unbind` from any authorized connection, or
+until the server exits. When it closes, the connection that requested it
+(if still open) receives `Unbound { addr, reason }`. `Unbind` is always
+answered with `Unbound` (`reason: "unbind requested"`, or `"no requested
+listener"` with an empty `addr`). One requested listener per server
+process at a time; a second `Bind` while one is live is refused with its
+address in the reason.
+
+**Connect-back and `Shutdown`.** A server that dialed the connection ends
+it itself after `--connect-max` with `Shutdown { reason: "connect-back:
+max connection time" }`, then the usual 5 s grace.
 
 ## 7. Session stream
 
@@ -455,6 +492,7 @@ struct Info {
     caps: u32,               // the ServerHello.caps bits
     limits: Limits,          // { max_sessions, max_listeners, max_streams, detach_grace_secs, idle_timeout_secs, handshakes_per_minute, denied: ["exec", …] }
     uptime_secs: u64,        // since the server process started
+    authorized_keys: String, // the file the server reads and `authorize` appends to (absolute)
 }
 ```
 
@@ -462,6 +500,11 @@ struct Info {
 by `--deny` and the key's options, with the `--deny` spellings (`pty`,
 `exec`, `files`, `forward-local`, `forward-remote`). No `Denied` case: the
 reply is always answered for an authorized client.
+
+`authorized_keys` is `<config dir>/authorized_keys` — the one file the
+server always reads and pairing appends to; `--authorized-keys` files are
+read in addition but never written. `mysh authorize` writes there, so a
+server with a non-default `MYSH_CONFIG_DIR` is still authorized correctly.
 
 ## 10quinquies. Pairing
 

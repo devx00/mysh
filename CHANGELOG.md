@@ -5,7 +5,7 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-Milestones M1–M11 of `docs/06-roadmap.md` are implemented: mysh connects,
+Milestones M1–M12 of `docs/06-roadmap.md` are implemented: mysh connects,
 authenticates, runs interactive and non-interactive sessions that survive a
 disconnect, transfers files and forwards ports on Linux, macOS and Android,
 ships as static release binaries, and exposes everything to programs through
@@ -167,6 +167,47 @@ server.
   MCP conformance tests); 23 fuzz targets; `scripts/android-build.sh` links
   an Android binary with the NDK clang; `scripts/lima-test.sh` runs the
   suite on Linux in a lima VM.
+- **Connect-back (server)** (M12): `mysh serve --connect-back ADDR`
+  (repeatable) dials a client that accepts connections and serves it
+  through the ordinary handshake and connection path; `--connect-period`
+  (default `5m`, start-to-start), `--connect-jitter` (default 10 %),
+  `--connect-max` (default `30m`; the server ends the connection with a
+  `Shutdown` notice). One connection per address at a time, failures backed
+  off 5 s doubling up to the period; `--listen` stays optional. Control
+  messages `Bind`/`Bound`/`Unbound`/`Unbind` let an authorized client ask a
+  server started with `--allow-bind-request` to bind a listener (idle
+  expiry, `Unbind`, process-owned). Audit lines gained
+  `direction: inbound|outbound`; `RateLimiter` moved to
+  `mysh-net::ratelimit`; `contrib/mysh-connect-back.service` is a second
+  systemd unit (docs/03 §1 and §6, docs/05 "Server options").
+- **Accepting connections (client)** (M12): `mysh accept [ADDR]
+  [--callers PATH] [--accept-new] [--handshakes-per-minute N] [--json]`
+  listens for servers started with `serve --connect-back` and prints
+  `accepted`/`closed`/`refused` lines (NDJSON with `--json`). Callers — the
+  servers allowed to connect back — live in `~/.config/mysh/callers` in
+  `authorized_keys` line format and are matched by key fingerprint, never
+  by address; the comment names the connection. Each accepted connection
+  gets a control socket at `<runtime>/mysh/@NAME.sock`, so every command
+  addresses it as `@NAME` (`mysh @host-a uptime`, `put … @host-a`,
+  `run --hosts @host-a,@host-b`) and never dials. New client command `bind
+  [ADDR|off] [--for D]` asks a server running with `--allow-bind-request`
+  for a listener of its own (`denied` otherwise). Library:
+  `mysh_client::accept::{Acceptor, AcceptOpts, Inbound}`,
+  `conn::accept_connection`, `Client::from_connection`,
+  `identity::{Callers, Caller}`, `Connection::bind`/`unbind`
+  (docs/02 "Callers", docs/05 "Accepting connections", docs/07).
+- **User guide**: `docs/guide/` (getting started, meta shell, sessions,
+  files, forwarding, automation, MCP, library, keys and trust, server,
+  config, platforms, troubleshooting) plus `docs/guide/cli-reference.md`
+  generated from `mysh help --json` by `scripts/gen-cli-reference.py`; the
+  README is a front page again; `skills/mysh/SKILL.md` for agents.
+- **Fixes found while documenting**: `mysh authorize` writes to the
+  `authorized_keys` the server reports in `Info` (new field; a server with
+  a non-default `MYSH_CONFIG_DIR` used to leave the key untrusted);
+  `mkdir -P` follows a parent that is a symlink to a directory; `error: …`
+  lines go to stderr unless drawn on a terminal, and a command failing
+  through a master keeps the requester's `--json` shape; `mysh master
+  --daemon` detaches instead of running in the foreground.
 
 ### Changed
 

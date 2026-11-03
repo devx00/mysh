@@ -254,7 +254,11 @@ pub async fn start_server(opts: ServerOpts) -> TestServer {
         ssh_ed25519_file: None,
     };
 
-    let mut policy = Policy::from_args(&ServeArgs::default());
+    // The server's config dir: `Paths.authorized_keys` is the file above.
+    let mut policy = Policy::from_args(
+        &ServeArgs::default(),
+        &Paths::with_config_dir(dir.join("server")),
+    );
     policy.deny = opts.deny.into_iter().collect();
     policy.accept_env = opts.accept_env;
     policy.shell = opts.shell;
@@ -280,6 +284,8 @@ pub async fn start_server(opts: ServerOpts) -> TestServer {
     }
     let server = Server::bind(ServerConfig {
         listen,
+        connect_back: mysh::server::connect_back::ConnectBackConfig::default(),
+        bind_requests: false,
         identity: server_identity,
         trust,
         policy,

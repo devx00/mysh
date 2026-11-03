@@ -66,6 +66,7 @@ pub fn refusal(cmd: &MetaCommand) -> Option<&'static str> {
         | MetaCommand::Forward(_)
         | MetaCommand::Exec { .. }
         | MetaCommand::Info
+        | MetaCommand::Bind(_)
         | MetaCommand::Ping { .. }
         | MetaCommand::Authorize(_)
         | MetaCommand::Jobs { .. }
@@ -332,6 +333,7 @@ async fn handle(mut stream: UnixStream, shared: Arc<Shared>, _busy: ActivityGuar
     }
     shared.console.notice(&format!("ctl: {line}"));
     let (console, mut rx) = Console::capture_with_mode(req.mode);
+    let reporter = console.clone();
     let mut ctx = Ctx::detached(&shared, console, PathBuf::from(req.cwd));
     let stdin = req.stdin;
     let mut run = tokio::spawn(async move {
@@ -368,11 +370,14 @@ async fn handle(mut stream: UnixStream, shared: Arc<Shared>, _busy: ActivityGuar
     let code = match joined {
         Ok(Ok(code)) => code,
         Ok(Err(e)) => {
-            let _ = write_msg(
-                &mut stream,
-                &CtlEvent::Err(format!("error: {e:#}\n").into_bytes()),
-            )
-            .await;
+            // Through the capture console so the requester's mode decides
+            // the shape: `{"error":…}` with `--json`, `error: …` otherwise.
+            reporter.error(&e);
+            while let Some(ev) = rx.try_recv() {
+                if relay(&mut stream, ev).await.is_err() {
+                    return;
+                }
+            }
             1
         }
         Err(e) => {

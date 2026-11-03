@@ -1,117 +1,131 @@
 # mysh
 
-A minimal, encrypted remote shell for administering personal servers and
-devices. One static binary that is both client and server, for Linux, macOS,
-and Android.
-
-- Mutually authenticated `Noise_XX_25519_ChaChaPoly_BLAKE2s`; reuses OpenSSH
-  ed25519 keys, `authorized_keys`, and `known_hosts`; or bake keys into the
-  binary for zero-config devices.
-- Every connection starts at a meta shell: `shell` opens a real remote
-  shell (PTY, follows your terminal size), `Ctrl-]` brings you back without
-  dropping anything; `put`, `get`, `forward`, `info`, and friends live
-  there too, and double as CLI subcommands (which reuse a live client's
-  connection through its control socket).
-- Sessions survive a dropped connection: `mysh --attach HOST` picks them up
-  with the output you missed.
-- Per-key `authorized_keys` options (`command=`, `from=`, `no-pty`, …),
-  per-IP handshake rate limiting, automatic rekeying, fuzzed parsers.
-- A remote process API for programs: `--json` everywhere, sessions read by
-  byte offset, file primitives, fleet fan-out, and `mysh mcp`, an MCP
-  server that hands the same tools to an AI agent over stdio
-  (`contrib/mcp/`).
-- Embeddable: the `mysh-client` crate is the same client code behind a
-  Rust API with no terminal dependencies (`docs/07-embedding.md`).
-
-**Status:** milestones M1–M11 of [docs/06-roadmap.md](docs/06-roadmap.md)
-are implemented. M6–M10 turned mysh into a remote process API for agents and
-orchestrators (`--json` everywhere, a session read/write API with offsets,
-file primitives, fleet fan-out, the `mysh-client` crate, an MCP server); M11
-made it build for 25 targets out of the box — see "Targets" below.
-
-| doc                                              | contents                                  |
-| ------------------------------------------------ | ----------------------------------------- |
-| [01-architecture](docs/01-architecture.md)       | goals, crates, layering, platform matrix, build |
-| [02-security](docs/02-security.md)               | keys, ssh key reuse, baked keys, trust, threat model |
-| [03-protocol](docs/03-protocol.md)               | preamble, handshake, framing, streams, messages |
-| [04-sessions](docs/04-sessions.md)               | pty lifecycle, terminal driver, forwarding, files |
-| [05-meta-shell](docs/05-meta-shell.md)           | meta key, prompt, commands, CLI, config   |
-| [06-roadmap](docs/06-roadmap.md)                 | milestones, decisions log, testing        |
-| [07-embedding](docs/07-embedding.md)             | `mysh-client` library API, MCP server tools and schemas |
-| [08-platform-matrix](docs/08-platform-matrix.md) | every target, how it was validated, what does not ship |
-| [skills/mysh](skills/mysh/SKILL.md)              | agent skill: driving a running server from the CLI with `--json` |
-
-## Quickstart
+A small, encrypted remote shell. One static binary is both client and
+server; it runs on Linux, macOS, Android, FreeBSD and more, and it is built
+to be driven by people at a terminal and by programs alike.
 
 ```sh
-cargo build --release
+mysh keygen                              # your identity
+mysh serve --authorized-key "$(cat ~/.config/mysh/id.pub)"   # on the host
+mysh -s box                              # a shell, like ssh
+mysh box 'uptime'                        # one command, its exit status
+mysh --json box 'df -h /'                # the same, as a JSON document
+```
 
-# on the server: generate a host key on first run and trust your client key
+## Why
+
+- **Noise, not SSH.** `Noise_XX_25519_ChaChaPoly_BLAKE2s`, mutual
+  authentication, one round trip. No algorithm negotiation, no agent
+  forwarding, no X11. Your existing OpenSSH ed25519 keys, `authorized_keys`
+  and `known_hosts` are reused as they are; or bake keys into the binary
+  for hosts that never get configured by hand.
+- **A meta shell between you and the remote.** Every connection lands at a
+  prompt that owns the connection: `shell` opens a real PTY shell, `Ctrl-]`
+  comes back without dropping it, and `put`, `get`, `forward`, `tail -f`,
+  `sessions` and the rest live there — or as plain CLI subcommands that
+  reuse a running client's connection.
+- **Sessions outlive connections.** Lose the network; `mysh --attach host`
+  picks the shell back up with the output you missed.
+- **Either side can dial.** A server with no inbound port runs
+  `serve --connect-back`; `mysh accept` on the client takes the calls, and
+  every command then addresses it as `@name`. Same handshake, same trust.
+- **Made for automation.** `--json` and `--json-stream` on every command,
+  stable error codes, a session API that reads output by byte offset, file
+  primitives that need no shell quoting, `run --hosts` fan-out, an MCP
+  server (`mysh mcp`), a Rust library (`mysh-client`), and an agent skill.
+- **Portable.** One release script produces static Linux binaries for
+  seven architectures, a macOS universal binary, Android, and the BSDs.
+
+## Install
+
+Download the artifact for your platform (`mysh-<version>-<target>`), make
+it executable, put it on your `PATH`. Or build it:
+
+```sh
+cargo build --release        # target/release/mysh for the host
+scripts/release.sh           # every supported target into dist/
+```
+
+Platform notes, service units and what is validated where: [docs/guide/platforms/](docs/guide/platforms/README.md).
+
+## First connection
+
+```sh
+# host: a host key is generated on first start; trust your client key
 mysh serve --listen 0.0.0.0:7722 --authorized-key "$(cat ~/.config/mysh/id.pub)"
 
-# on the client
-mysh keygen                 # ~/.config/mysh/id, id.pub
-mysh pi.lan                 # meta prompt; `shell` for a shell, Ctrl-] to come back
-mysh -s pi.lan              # straight to a shell, like ssh
-mysh pi.lan 'uptime'        # one command, exits with its status
-mysh put pi.lan ./file '~'  # one-shot transfer
-mysh forward pi.lan -L 8080:localhost:80
-mysh mcp --hosts pi.lan     # MCP server over stdio for an agent (docs/07-embedding.md)
+# client
+mysh keygen                  # ~/.config/mysh/id, id.pub
+mysh box.lan                 # meta prompt; `shell` for a shell, Ctrl-] to come back
+mysh -s box.lan              # straight to a shell
+mysh box.lan 'uptime'        # one command
+mysh put box.lan ./file '~'  # transfer
+mysh forward box.lan -L 8080:localhost:80
 ```
 
-## Embedding
+The first connection asks you to confirm the host key (or use `--accept-new`
+/ `--pin`); after that it is pinned in `known_hosts`. To get your key onto a
+host without copy-paste, run `mysh serve --pair` there and `mysh pair HOST
+CODE` here. Details: [getting started](docs/guide/getting-started.md),
+[keys and trust](docs/guide/keys-and-trust.md).
 
-```rust
-use std::sync::Arc;
-use mysh_client::{Client, ExecRequest, NullReporter, RefuseUnknown, config, identity::Baked};
+## Documentation
 
-let paths = config::Paths::from_env();
-let config = config::Config::load(&paths.config_file)?;
-let target = config::resolve_target("pi.lan", &Default::default(), &config)?;
-let client = Client::connect(&target, &paths, &Baked::default(),
-    Arc::new(NullReporter), Arc::new(RefuseUnknown)).await?;
-let out = client.exec(ExecRequest::argv(["uname", "-sm"])).await?;
-println!("{} exit={:?}", out.stdout.as_bytes().escape_ascii(), out.exit);
-```
+**User guide** — [docs/guide/](docs/guide/README.md)
 
-## Build and test
+| page | what it covers |
+| --- | --- |
+| [getting-started](docs/guide/getting-started.md) | install, keys, first server, first connection |
+| [meta-shell](docs/guide/meta-shell.md) | the prompt, the meta key, every prompt command, jobs |
+| [sessions](docs/guide/sessions.md) | PTY and exec sessions, persistence, the offset-based session API |
+| [files](docs/guide/files.md) | put/get, file primitives, `sync` |
+| [forwarding](docs/guide/forwarding.md) | `-L`, `-R`, `-D`, forward policy |
+| [automation](docs/guide/automation.md) | `--json`, error codes, masters, fleet fan-out |
+| [mcp](docs/guide/mcp.md) | the MCP server for AI agents |
+| [library](docs/guide/library.md) | embedding the `mysh-client` crate |
+| [connect-back](docs/guide/connect-back.md) | servers with no inbound port: `serve --connect-back`, `mysh accept`, `@NAME` |
+| [keys-and-trust](docs/guide/keys-and-trust.md) | identities, ssh key reuse, `authorized_keys` options, pairing, baked keys |
+| [server](docs/guide/server.md) | every `serve` option, audit log, running as a service |
+| [config](docs/guide/config.md) | `config.toml`, host aliases, groups, environment variables |
+| [platforms](docs/guide/platforms/README.md) | per-OS notes, artifacts, validation status, building |
+| [troubleshooting](docs/guide/troubleshooting.md) | error codes and what to do about them |
+| [cli-reference](docs/guide/cli-reference.md) | every command and flag (generated from the binary) |
+
+**Agent skill** — [skills/mysh/SKILL.md](skills/mysh/SKILL.md): how a
+program or AI agent drives a running server from the CLI.
+
+**Design** — `docs/0N-*.md` is the specification the code is written
+against: [architecture](docs/01-architecture.md),
+[security](docs/02-security.md), [protocol](docs/03-protocol.md),
+[sessions and PTY](docs/04-sessions.md), [meta shell and CLI](docs/05-meta-shell.md),
+[roadmap and decisions log](docs/06-roadmap.md),
+[embedding](docs/07-embedding.md), [platform matrix](docs/08-platform-matrix.md).
+
+## Status
+
+Milestones M1–M12 of the [roadmap](docs/06-roadmap.md) are implemented:
+transport, sessions, meta shell, files, forwards, persistence, pairing,
+the automation interface, the library and MCP server, the build matrix, and
+connect-back. 466 tests run natively on macOS and Linux; every Linux artifact is
+exercised under emulation. Not yet: a stable wire protocol (`VERSION 1` is
+still allowed to change), signed macOS builds, Windows (out of scope).
+
+## Development
 
 ```sh
-cargo build --release        # native
 cargo lint                   # clippy, -D warnings
-cargo test --workspace       # unit + integration (loopback, real ptys)
-cargo check-matrix           # type-check the required targets (check-matrix-stretch, scripts/check-tier3.sh for the rest)
-scripts/release.sh           # required set: 13 targets + universal, SHA256SUMS in dist/ (needs zig + cargo-zigbuild, the NDK)
-scripts/release.sh --stretch # plus the 12 stretch targets (nightly + rust-src for tier 3)
-scripts/validate-dist.sh     # run every Linux artifact under qemu-user (docker + binfmt)
-scripts/lima-test.sh         # run the suite on Linux in a lima VM
-scripts/fuzz-all.sh 60       # every fuzz target for 60 s (needs nightly + cargo-fuzz)
+cargo test --workspace       # unit + integration (loopback servers, real ptys)
+cargo check-matrix           # type-check the required targets
+scripts/release.sh --stretch # all 25 targets + universal, SHA256SUMS in dist/
+scripts/validate-dist.sh     # run every Linux artifact under qemu-user
+scripts/lima-test.sh         # the suite on Linux in a lima VM
+scripts/fuzz-all.sh 60       # every fuzz target for 60 s
 ```
 
-Deploy as a service with the files in [`contrib/`](contrib/) (systemd,
-launchd, Termux:Boot).
-
-Cross-compilation details and baked (keyless) builds: `docs/01-architecture.md`
-and `docs/02-security.md`.
-
-## Targets
-
-One `scripts/release.sh` run produces the required set; `--stretch` adds the
-rest. Full table, validation method per artifact, and the two targets that
-do not ship (`mips64el`, illumos) are in
-[docs/08-platform-matrix.md](docs/08-platform-matrix.md).
-
-| OS | required | stretch |
-| --- | --- | --- |
-| Linux (static musl) | x86_64, aarch64, i686, armv7, armv6, riscv64 | armv5te, ppc64le, loongarch64, s390x (musl + glibc), mips, mipsel |
-| macOS | aarch64, x86_64, universal | — |
-| Android (bionic, API 24) | aarch64, armv7, x86_64 | i686 |
-| FreeBSD | x86_64, aarch64 | — |
-| NetBSD / OpenBSD | — | x86_64, aarch64 each |
-
-Every Linux artifact is exercised under qemu-user by `scripts/validate-dist.sh`
-(`--version`, `keygen`, a loopback `serve` + `exec`); macOS arm64 and aarch64
-Linux run the full test suite natively. Windows is out of scope.
+[docs/guide/platforms/building.md](docs/guide/platforms/building.md) has
+the toolchain requirements. Contributions follow the decisions log: a
+change that deviates from a `docs/0N` file updates that file and adds a
+row to `docs/06-roadmap.md`.
 
 ## License
 

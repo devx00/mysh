@@ -19,8 +19,12 @@ use mysh::{
         console::Console,
         files::{authorize, get, put},
     },
+    config::Paths,
 };
-use mysh_net::{framing::read_msg, keys::SecretKey};
+use mysh_net::{
+    framing::read_msg,
+    keys::{SecretKey, write_public_key, write_secret_key},
+};
 use mysh_proto::{
     file::{Attrs, FileKind, FileOp, ListPage},
     open::Open,
@@ -458,11 +462,12 @@ async fn authorize_installs_key_once() {
     authorize(&ctx.conn, &ctx.console, &line)
         .await
         .expect("authorize");
-    let mysh_dir = ctx.server.home.join(".config/mysh");
-    let ak = mysh_dir.join("authorized_keys");
-    assert_eq!(
-        std::fs::metadata(&mysh_dir).expect("mysh dir").mode() & 0o777,
-        0o700
+    // The server's config dir is not `~/.config/mysh`; `authorize` must
+    // write where the server reads (the path reported in `Info`).
+    let ak = ctx.server.server_authorized_keys.clone();
+    assert_ne!(
+        ak.parent().expect("parent"),
+        ctx.server.home.join(".config/mysh")
     );
     assert_eq!(
         std::fs::metadata(&ak).expect("authorized_keys").mode() & 0o777,
@@ -491,8 +496,27 @@ async fn authorize_installs_key_once() {
     assert_eq!(text.lines().count(), 2, "{text:?}");
     assert!(text.contains(line.trim()) && text.contains(other.trim()));
 
-    // Connecting with the new key is not checked here: the harness server's
-    // `TrustSource.files` is empty, so it never reads this file.
+    // The harness server reads that file on every connection: a key
+    // installed by `authorize` can connect.
+    let newbox = SecretKey::generate();
+    let new_dir = ctx.server.dir.path().join("newbox");
+    write_secret_key(&new_dir.join("id"), &newbox).expect("write key");
+    write_public_key(&new_dir.join("id.pub"), &newbox.public(), Some("newbox")).expect("write pub");
+    authorize(
+        &ctx.conn,
+        &ctx.console,
+        &newbox.public().to_line(Some("newbox")),
+    )
+    .await
+    .expect("authorize newbox");
+    let mut paths = Paths::with_config_dir(new_dir);
+    paths.agent_socket = None;
+    let conn = ctx
+        .server
+        .connect_with_paths(ConnectOpts::default(), &paths)
+        .await
+        .expect("the authorized key connects");
+    conn.close().await;
     ctx.finish().await;
 }
 

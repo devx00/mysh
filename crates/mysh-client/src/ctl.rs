@@ -74,12 +74,21 @@ pub enum CtlEvent {
     },
 }
 
-/// `runtime_dir/<host>_<port>.sock` with every byte outside
-/// `[A-Za-z0-9.-]` of the host replaced by `_`.
+/// `runtime_dir/<host>_<port>.sock`, or `runtime_dir/@NAME.sock` for an
+/// accepted connection ([`Target::via_socket_only`]), with every byte
+/// outside `[A-Za-z0-9.-]` of the name replaced by `_`.
 pub fn socket_path(paths: &Paths, target: &Target) -> PathBuf {
-    let host: String = target
-        .host
-        .chars()
+    if let Some(name) = crate::config::accepted_name(&target.host) {
+        return paths.runtime_dir.join(format!("@{}.sock", sanitize(name)));
+    }
+    paths
+        .runtime_dir
+        .join(format!("{}_{}.sock", sanitize(&target.host), target.port))
+}
+
+/// Everything outside `[A-Za-z0-9.-]` becomes `_`.
+fn sanitize(name: &str) -> String {
+    name.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
                 c
@@ -87,10 +96,7 @@ pub fn socket_path(paths: &Paths, target: &Target) -> PathBuf {
                 '_'
             }
         })
-        .collect();
-    paths
-        .runtime_dir
-        .join(format!("{host}_{}.sock", target.port))
+        .collect()
 }
 
 /// Whether a client or master is serving `target`'s control socket.
@@ -286,6 +292,29 @@ mod tests {
         assert_eq!(
             socket_path(&paths, &t),
             PathBuf::from("/run/mysh/pi.lan_7722.sock")
+        );
+    }
+
+    #[test]
+    fn accepted_targets_get_their_own_socket() {
+        let paths = Paths {
+            runtime_dir: PathBuf::from("/run/mysh"),
+            ..Paths::with_config_dir(PathBuf::from("/cfg"))
+        };
+        let t =
+            resolve_target("@host-a", &ConnectOpts::default(), &Config::default()).expect("target");
+        assert!(t.via_socket_only);
+        assert_eq!(
+            socket_path(&paths, &t),
+            PathBuf::from("/run/mysh/@host-a.sock")
+        );
+        // An unnamed caller is addressed by its fingerprint label, whose
+        // base64 may hold `+` and `/`.
+        let t = resolve_target("@ab+cd/ef0123", &ConnectOpts::default(), &Config::default())
+            .expect("target");
+        assert_eq!(
+            socket_path(&paths, &t),
+            PathBuf::from("/run/mysh/@ab_cd_ef0123.sock")
         );
     }
 

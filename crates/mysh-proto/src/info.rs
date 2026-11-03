@@ -20,6 +20,10 @@ pub struct Info {
     pub limits: Limits,
     /// Seconds since the server process started.
     pub uptime_secs: u64,
+    /// The `authorized_keys` file the server trusts and `authorize` appends
+    /// to (`--authorized-keys`, else `<config dir>/authorized_keys`),
+    /// already absolute.
+    pub authorized_keys: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

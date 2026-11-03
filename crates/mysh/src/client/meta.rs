@@ -20,7 +20,7 @@ use tokio::{
 use tracing::debug;
 
 use crate::{
-    cli::{ForwardAction, MetaCommand, meta_help, parse_meta_line},
+    cli::{BindArgs, ForwardAction, MetaCommand, meta_help, parse_meta_line},
     client::{
         attach,
         conn::Connection,
@@ -35,8 +35,8 @@ use crate::{
     },
     config::{ForwardSpec, Target, decode_send_text, expand_tilde},
     output::{
-        self, CwdOut, EXIT_TIMEOUT, ExecResult, ForwardRow, InfoOut, JobOut, JobRow, OkOut,
-        PingOut, ProgressOut, SessionRow, SessionsOut, code_for, codes, millis,
+        self, BindOut, CwdOut, EXIT_TIMEOUT, ExecResult, ForwardRow, InfoOut, JobOut, JobRow,
+        OkOut, PingOut, ProgressOut, SessionRow, SessionsOut, code_for, codes, millis,
     },
 };
 
@@ -381,6 +381,11 @@ pub async fn execute(ctx: &mut Ctx, cmd: MetaCommand, term: Option<&mut Terminal
             crate::client::session_api::run(&conn, &console, &args, None).await?;
         }
         MetaCommand::Info => cmd_info(ctx).await?,
+        MetaCommand::Bind(args) => {
+            let conn = ctx.shared.conn.clone();
+            let console = ctx.console.clone();
+            bind(&conn, &console, &args).await?;
+        }
         MetaCommand::Ping { count } => cmd_ping(ctx, count.unwrap_or(4).max(1), term).await?,
         MetaCommand::Log { target } => cmd_log(ctx, &target)?,
         MetaCommand::Jobs { wait, id } => cmd_jobs(ctx, wait, id).await?,
@@ -863,6 +868,31 @@ async fn cmd_forward(ctx: &Ctx, args: &crate::cli::ForwardArgs) -> Result<()> {
 /// `Open::Info`; `None` when the server does not implement it.
 pub async fn server_info(conn: &Connection) -> Result<Option<mysh_proto::info::Info>> {
     conn.info().await
+}
+
+/// `bind [ADDR|off] [--for DURATION]`: ask the server for a listener of
+/// its own (docs/05-meta-shell.md "Bind on request"). Used by the prompt,
+/// the control socket and `mysh HOST bind`.
+pub async fn bind(conn: &Connection, console: &Console, args: &BindArgs) -> Result<()> {
+    if args.is_off() {
+        conn.unbind().await?;
+        console.report(&OkOut::OK, || "bind off\n".to_owned());
+        return Ok(());
+    }
+    let addr = args.address();
+    let bound = conn
+        .bind(&addr, args.idle.unwrap_or(Duration::ZERO))
+        .await?;
+    console.report(
+        &BindOut {
+            bound: bound.clone(),
+        },
+        || match args.idle {
+            Some(idle) => format!("bound {bound} (for {})\n", format_duration(idle)),
+            None => format!("bound {bound}\n"),
+        },
+    );
+    Ok(())
 }
 
 async fn cmd_info(ctx: &Ctx) -> Result<()> {

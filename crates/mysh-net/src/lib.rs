@@ -11,6 +11,7 @@
 //! - [`mux`]: yamux multiplexing and the per-stream prologue
 //! - [`agent`]: OpenSSH `ssh-agent` client (list ed25519 identities, sign)
 //! - [`pairing`]: SPAKE2 + key confirmation for `mysh pair`
+//! - [`ratelimit`]: per-address token bucket for handshake admission
 
 #![forbid(unsafe_code)]
 
@@ -21,4 +22,5 @@ pub mod keys;
 pub mod mux;
 pub mod noise;
 pub mod pairing;
+pub mod ratelimit;
 pub mod trust;

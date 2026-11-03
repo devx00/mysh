@@ -519,6 +519,9 @@ impl RunCollector {
             Event::Started { .. }
             | Event::Progress { .. }
             | Event::Result { .. }
+            | Event::Accepted { .. }
+            | Event::Closed { .. }
+            | Event::Refused { .. }
             | Event::Host { .. } => {}
         }
     }

@@ -648,6 +648,55 @@ pub enum Event {
         /// Nested event.
         data: Box<Event>,
     },
+    /// An accepting client (`mysh accept`, [`crate::accept::Acceptor`])
+    /// completed the handshake with a server that connected back.
+    Accepted {
+        /// The caller's name (its `callers` comment, or the fingerprint
+        /// label of an unnamed one).
+        name: String,
+        /// The server's key fingerprint.
+        fingerprint: String,
+        /// The server's socket address.
+        addr: String,
+        /// The server's hello and the negotiated protocol version.
+        server: AcceptedServer,
+    },
+    /// An accepted connection ended.
+    Closed {
+        /// The caller's name.
+        name: String,
+        /// The server's key fingerprint.
+        fingerprint: String,
+        /// Why it ended.
+        reason: String,
+    },
+    /// An inbound connection was refused before our identity was revealed:
+    /// the server's key is not a caller.
+    Refused {
+        /// The server's key fingerprint (empty when the handshake failed
+        /// before it was known).
+        fingerprint: String,
+        /// The server's socket address.
+        addr: String,
+        /// Why.
+        reason: String,
+    },
+}
+
+/// The server side of an accepted connection (`Event::Accepted.server`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedServer {
+    /// `ServerHello.name` (informational: the server's hostname by default).
+    pub name: String,
+    /// Negotiated protocol version.
+    pub version: u16,
+}
+
+/// `bind` result: `{"bound": "ADDR"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindOut {
+    /// The address the server's requested listener is bound at.
+    pub bound: String,
 }
 
 // ---------------------------------------------------------------------------

@@ -232,6 +232,54 @@ A **mismatch** against any known entry is a hard failure with a loud message
 naming the file and line. There is no bypass flag; the user edits the file.
 On failure the client closes the connection without sending message 3.
 
+**Connect-back.** With `mysh serve --connect-back ADDR` the server opens
+the TCP connection to a client that accepts connections (`mysh accept`);
+the protocol roles and everything above are unchanged — the server still
+authorizes the client's key against its `authorized_keys` (per-key options
+and `from=` included, applied to the accepting client's address), and the
+client still verifies the server's static key before revealing its own.
+Only the lookup differs on the accepting side: the source address of a
+server that dialed in means nothing, so the client identifies callers by
+key fingerprint through its `callers` store, never by `host:port` (see
+"Callers"). A server never dials more than one connection per address at
+a time, retries failures with backoff, and closes a connection the client
+holds longer than `--connect-max` itself.
+
+## Callers
+
+A **caller** is a server allowed to connect back to a client that accepts
+connections (`mysh accept`, `mysh_client::Acceptor`). The client lists them
+in `~/.config/mysh/callers`, in `authorized_keys` line format:
+
+```
+mysh-x25519 <base64> host-a
+ssh-ed25519 AAAAC3Nza… host-b
+# unnamed: addressed by fingerprint
+mysh-x25519 <base64>
+```
+
+The comment is the **name**: the accepted connection is served at
+`<runtime>/mysh/@NAME.sock` and addressed as `@NAME` by every other
+command (`mysh @host-a uptime`, `put … @host-a`, `run --hosts @host-a,@host-b`).
+A line without a comment is addressed by the first twelve base64 characters
+of its fingerprint (`SHA256:` stripped), and so is a key recorded by
+`--accept-new`; naming such a caller is an edit to the file. Baked peers
+count as callers too, named by their comment.
+
+The store is keyed by **key**, never by address: the source address of a
+connecting-back server is meaningless, and two servers behind the same
+address are still two callers. A key that is in neither the file nor the
+baked peers is refused (`trust_unknown`) before the client reveals its own
+static key in Noise message 3 — the handshake's identity hiding favours the
+accepting side. `mysh accept --accept-new` instead records the key (without
+a name) and accepts it; this is first contact, with the same caveat as
+TOFU. Unknown, refused and accepted connections are all reported
+(`refused`, `accepted`, `closed` events) and rate limited per source
+address (`--handshakes-per-minute`, default 30).
+
+The client's own identity and the server's `authorized_keys` check are
+unchanged: an accepting client authenticates exactly as a dialing one.
+
 ## Pairing
 
 First contact without copying key files by hand: a one-time code typed on
@@ -311,7 +359,7 @@ written by one task on the server (`server/audit.rs`), independent of
 
 ```json
 {"ts":"2026-11-02T10:41:07.512Z","peer":"192.0.2.9:51022","key":"SHA256:…","kind":"x25519",
- "event":"exec","detail":{"id":1,"pid":4242,"pty":false,"signal":null},
+ "direction":"inbound","event":"exec","detail":{"id":1,"pid":4242,"pty":false,"signal":null},
  "exit":0,"bytes_in":null,"bytes_out":null,"duration_ms":38}
 ```
 
@@ -320,6 +368,7 @@ written by one task on the server (`server/audit.rs`), independent of
 | `ts`          | RFC 3339 UTC with milliseconds, stamped when the line is written (so lines are in non-decreasing order) |
 | `peer`        | client `ip:port`                                                      |
 | `key`, `kind` | the client's key fingerprint (`SHA256:…`) and `x25519` / `ssh-ed25519`; `"?"` and `""` when a connection was refused before any key was offered |
+| `direction`   | `inbound` (a listener accepted the client) or `outbound` (the server dialed the client: `--connect-back`); absent in logs written before this field existed, meaning `inbound` |
 | `event`       | one of the kinds below                                                |
 | `detail`      | event-specific object (always present)                                |
 | `exit`        | exit code of an `exec` (null when killed by a signal — see `detail.signal`) |

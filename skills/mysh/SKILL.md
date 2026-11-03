@@ -66,7 +66,7 @@ Error codes (`error.code`): `unauthorized`, `denied`, `not_found`,
 not an error:
 
 ```sh
-out=$(mysh --json --timeout 60s pi 'systemctl is-active nginx') || true
+out=$(mysh --json --timeout 60s box 'systemctl is-active nginx') || true
 echo "$out" | jq -r '.stdout'      # "active\n"
 echo "$out" | jq '.exit'           # 0 / 3
 ```
@@ -77,10 +77,10 @@ the same bytes until they age out of the 1 MiB ring (`oldest` tells you if
 you fell behind). Loop on `next`:
 
 ```sh
-id=$(mysh session pi --json new -- make -j4 2>&1 | jq .id)
+id=$(mysh session box --json new -- make -j4 2>&1 | jq .id)
 off=0
 while :; do
-  r=$(mysh session pi --json read "$id" --since "$off" --wait 5s)
+  r=$(mysh session box --json read "$id" --since "$off" --wait 5s)
   echo "$r" | jq -r '.chunks[] | select(.stream=="stdout") | .data' | tr -d '\n' ; echo
   off=$(echo "$r" | jq .next)
   [ "$(echo "$r" | jq '.exited != null')" = true ] && break
@@ -123,7 +123,7 @@ Any prompt command runs non-interactively by piping it in; the global
 `--json` applies to all of them (do **not** put `--json` after the command):
 
 ```sh
-printf 'info\nsessions -a\nforward ls\n' | mysh --json pi
+printf 'info\nsessions -a\nforward ls\n' | mysh --json box
 ```
 
 Each command prints one JSON document; the run stops at the first failing

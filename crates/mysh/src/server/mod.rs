@@ -7,10 +7,16 @@
 //! stream must be `Open::Control`; every later stream is dispatched to the
 //! handler for its `Open` kind (docs/03-protocol.md §5–§10).
 //!
+//! With `--connect-back` the server also dials accepting clients itself
+//! ([`connect_back`]); after TCP the connection takes the same path
+//! (`handle_connection`) as an accepted one. An authorized client may ask
+//! the server to bind a listener (`ControlMsg::Bind`, `--allow-bind-request`).
+//!
 //! The server is single-user: it serves the OS user that runs it, with no
 //! privilege separation and no path sandboxing beyond `~` expansion.
 
 pub mod audit;
+pub mod connect_back;
 pub mod files;
 pub mod forward;
 pub mod info;
@@ -18,10 +24,11 @@ pub mod pair;
 pub mod session;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     future::Future,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicU32, AtomicUsize, Ordering},
@@ -35,6 +42,7 @@ use mysh_net::{
     handshake::{Accept, HandshakeError, Handshaken, Peer, server_handshake},
     keys::Identity,
     mux::{Incoming, Mode, Mux, Stream, accept_open},
+    ratelimit::RateLimiter,
     trust::KeyOptions,
 };
 use mysh_proto::{
@@ -72,12 +80,6 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Pause after a failed `accept` (EMFILE and friends) before retrying.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
-/// Rate-limiter buckets idle for this long are forgotten.
-const BUCKET_TTL: Duration = Duration::from_secs(600);
-
-/// A rate-limited address is logged at most once per this interval.
-const RATE_LIMIT_WARN_EVERY: Duration = Duration::from_secs(10);
-
 /// Session policy derived from `mysh serve` options and the server's own
 /// environment (docs/04-sessions.md, "Shell and home resolution"), narrowed
 /// per connection by the matched key's options
@@ -113,6 +115,11 @@ pub struct Policy {
     /// Accept ssh-ed25519 signature authentication (`--no-signature-auth`
     /// switches it off).
     pub signature_auth: bool,
+    /// The `authorized_keys` file the client's `authorize` appends to:
+    /// `<config dir>/authorized_keys` (`$MYSH_CONFIG_DIR`), the file the
+    /// server always reads and pairing writes to; `--authorized-keys`
+    /// files are read in addition but never written. Reported in `Info`.
+    pub authorized_keys: PathBuf,
 }
 
 impl Policy {
@@ -122,9 +129,9 @@ impl Policy {
     }
 
     /// Policy for `mysh serve`: `--deny`, `--accept-env`, `--shell`,
-    /// `--name` (default: hostname), the hardening knobs, and the server's
-    /// home/user/`PATH`.
-    pub fn from_args(args: &ServeArgs) -> Self {
+    /// `--name` (default: hostname), the hardening knobs, the server's
+    /// home/user/`PATH`, and the `authorized_keys` path from `paths`.
+    pub fn from_args(args: &ServeArgs, paths: &Paths) -> Self {
         Self {
             deny: args.deny.iter().copied().collect(),
             accept_env: args.accept_env.clone(),
@@ -145,6 +152,7 @@ impl Policy {
                 .detach_grace
                 .map_or(limits::DETACH_GRACE, Duration::from_secs),
             signature_auth: !args.no_signature_auth,
+            authorized_keys: paths.authorized_keys.clone(),
         }
     }
 
@@ -171,83 +179,18 @@ impl Policy {
     }
 }
 
-/// One client address in the [`RateLimiter`].
-#[derive(Debug, Clone, Copy)]
-struct Bucket {
-    tokens: f64,
-    last: Instant,
-    /// When this address was last logged as rate limited.
-    warned: Option<Instant>,
-}
-
-/// Token bucket per client address for handshake admission
-/// (docs/02-security.md, "Limits and hardening"): capacity `rate`, refilled
-/// at `rate` per minute. Addresses not seen for ten minutes are forgotten
-/// when a new one is added.
-#[derive(Debug)]
-pub(crate) struct RateLimiter {
-    rate: u32,
-    buckets: HashMap<IpAddr, Bucket>,
-}
-
-impl RateLimiter {
-    /// `rate` handshakes per minute per address; must be non-zero (a zero
-    /// rate means "no limiter", see [`Shared`]).
-    pub(crate) fn new(rate: u32) -> Self {
-        Self {
-            rate,
-            buckets: HashMap::new(),
-        }
-    }
-
-    /// Admit a handshake from `ip` at `now`, consuming one token; `false`
-    /// when the bucket is empty.
-    pub(crate) fn check(&mut self, ip: IpAddr, now: Instant) -> bool {
-        let capacity = f64::from(self.rate);
-        let per_second = capacity / 60.0;
-        if !self.buckets.contains_key(&ip) {
-            self.buckets
-                .retain(|_, b| now.saturating_duration_since(b.last) < BUCKET_TTL);
-        }
-        let bucket = self.buckets.entry(ip).or_insert(Bucket {
-            tokens: capacity,
-            last: now,
-            warned: None,
-        });
-        let elapsed = now.saturating_duration_since(bucket.last).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * per_second).min(capacity);
-        bucket.last = now;
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// After a rejected [`RateLimiter::check`]: whether to log it (at most
-    /// once per ten seconds per address).
-    pub(crate) fn should_warn(&mut self, ip: IpAddr, now: Instant) -> bool {
-        let Some(bucket) = self.buckets.get_mut(&ip) else {
-            return true;
-        };
-        if bucket
-            .warned
-            .is_some_and(|at| now.saturating_duration_since(at) < RATE_LIMIT_WARN_EVERY)
-        {
-            return false;
-        }
-        bucket.warned = Some(now);
-        true
-    }
-}
-
 /// Everything a [`Server`] needs; built by [`serve`] or directly by tests.
 #[derive(Debug)]
 pub struct ServerConfig {
     /// Addresses to listen on; empty → `[::]:7722`, falling back to
-    /// `0.0.0.0:7722` when IPv6 is unavailable.
+    /// `0.0.0.0:7722` when IPv6 is unavailable — unless `connect_back` has
+    /// addresses, in which case nothing is bound.
     pub listen: Vec<SocketAddr>,
+    /// Clients to connect back to (`--connect-back`).
+    pub connect_back: connect_back::ConnectBackConfig,
+    /// Honour `ControlMsg::Bind` from authorized clients
+    /// (`--allow-bind-request`).
+    pub bind_requests: bool,
     /// Host identity.
     pub identity: Identity,
     /// Trusted client keys; re-read on every connection.
@@ -261,11 +204,11 @@ pub struct ServerConfig {
 
 /// State shared by every connection of one server.
 #[derive(Debug)]
-struct Shared {
+pub(crate) struct Shared {
     identity: Identity,
     trust: TrustSource,
     policy: Arc<Policy>,
-    handshakes: Arc<Semaphore>,
+    pub(crate) handshakes: Arc<Semaphore>,
     /// `None` when `handshakes_per_minute` is 0.
     limiter: Option<Mutex<RateLimiter>>,
     /// Session ids and detached PTY sessions, which outlive connections.
@@ -274,6 +217,24 @@ struct Shared {
     pairing: Option<Arc<pair::PairState>>,
     /// Audit log sink (disabled without `--audit`).
     audit: Arc<audit::Audit>,
+    /// Every connection and requested listener; `Server::run` waits for it.
+    tracker: TaskTracker,
+    /// `--allow-bind-request`.
+    bind_requests: bool,
+    /// The listener bound on a client's request, if any (one per server
+    /// process; it belongs to the process, not to the requesting
+    /// connection).
+    requested: Mutex<Option<RequestedListener>>,
+}
+
+/// A listener bound on `ControlMsg::Bind` (docs/03-protocol.md §6).
+#[derive(Debug)]
+struct RequestedListener {
+    addr: SocketAddr,
+    /// `true` tells the accept loop to stop (`Unbind`).
+    stop: watch::Sender<bool>,
+    /// `Some(reason)` once the accept loop has ended.
+    ended: watch::Receiver<Option<String>>,
 }
 
 impl Shared {
@@ -293,22 +254,107 @@ impl Shared {
         }
         false
     }
+
+    /// The address of the live requested listener, if there is one.
+    fn requested_live(&self) -> Option<SocketAddr> {
+        self.requested
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .filter(|r| r.ended.borrow().is_none())
+            .map(|r| r.addr)
+    }
+
+    /// `ControlMsg::Bind`: bind `addr`, run an accept loop on it that
+    /// closes after `idle_secs` without an accepted connection (0: never),
+    /// and return the bound address plus a watch that carries the reason
+    /// once the loop has ended. `Err(reason)` is sent back as `Unbound`.
+    async fn bind_on_request(
+        self: &Arc<Self>,
+        addr: &str,
+        idle_secs: u32,
+        peer: SocketAddr,
+        shutdown: watch::Receiver<Option<String>>,
+    ) -> Result<(SocketAddr, watch::Receiver<Option<String>>), String> {
+        let requested: SocketAddr = addr
+            .parse()
+            .map_err(|_| format!("bind {addr}: expected HOST:PORT"))?;
+        if let Some(existing) = self.requested_live() {
+            return Err(format!(
+                "a requested listener is already bound at {existing}"
+            ));
+        }
+        let listener = TcpListener::bind(requested)
+            .await
+            .map_err(|e| format!("bind {addr}: {e}"))?;
+        let actual = listener
+            .local_addr()
+            .map_err(|e| format!("bind {addr}: {e}"))?;
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (ended_tx, ended_rx) = watch::channel(None::<String>);
+        {
+            let mut slot = self
+                .requested
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(existing) = slot.as_ref().filter(|r| r.ended.borrow().is_none()) {
+                // Lost the race against another connection's request.
+                return Err(format!(
+                    "a requested listener is already bound at {}",
+                    existing.addr
+                ));
+            }
+            *slot = Some(RequestedListener {
+                addr: actual,
+                stop: stop_tx,
+                ended: ended_rx.clone(),
+            });
+        }
+        let idle = (idle_secs != 0).then(|| Duration::from_secs(u64::from(idle_secs)));
+        info!(%peer, addr = %actual, ?idle, "listener bound on request");
+        tokio::spawn(self.tracker.track_future(requested_listener_loop(
+            listener,
+            idle,
+            Arc::clone(self),
+            stop_rx,
+            ended_tx,
+            shutdown,
+        )));
+        Ok((actual, ended_rx))
+    }
+
+    /// `ControlMsg::Unbind`: stop the requested listener; its address when
+    /// there was a live one.
+    fn unbind(&self, peer: SocketAddr) -> Option<SocketAddr> {
+        let slot = self
+            .requested
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let live = slot.as_ref().filter(|r| r.ended.borrow().is_none())?;
+        info!(%peer, addr = %live.addr, "unbind requested");
+        let _ = live.stop.send(true);
+        Some(live.addr)
+    }
 }
 
 /// A bound server; [`Server::run`] serves until the shutdown future resolves.
 #[derive(Debug)]
 pub struct Server {
     listeners: Vec<TcpListener>,
+    connect_back: connect_back::ConnectBackConfig,
     shared: Arc<Shared>,
 }
 
 impl Server {
     /// Bind every listen address (all must succeed). With no addresses the
-    /// default `[::]:7722` is tried first and `0.0.0.0:7722` second.
+    /// default `[::]:7722` is tried first and `0.0.0.0:7722` second — unless
+    /// the server only connects back, in which case nothing is bound.
     pub async fn bind(cfg: ServerConfig) -> Result<Self> {
         info::mark_started();
         let mut listeners = Vec::with_capacity(cfg.listen.len().max(1));
-        if cfg.listen.is_empty() {
+        if cfg.listen.is_empty() && !cfg.connect_back.addrs.is_empty() {
+            // Connect-back only: no listener.
+        } else if cfg.listen.is_empty() {
             let v6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, DEFAULT_PORT));
             match TcpListener::bind(v6).await {
                 Ok(listener) => listeners.push(listener),
@@ -343,6 +389,7 @@ impl Server {
         };
         Ok(Self {
             listeners,
+            connect_back: cfg.connect_back,
             shared: Arc::new(Shared {
                 identity: cfg.identity,
                 trust: cfg.trust,
@@ -355,6 +402,9 @@ impl Server {
                     .as_ref()
                     .map(|c| Arc::new(pair::PairState::new(c))),
                 audit,
+                tracker: TaskTracker::new(),
+                bind_requests: cfg.bind_requests,
+                requested: Mutex::new(None),
             }),
         })
     }
@@ -372,17 +422,34 @@ impl Server {
         self.shared.pairing.clone()
     }
 
-    /// Accept connections until `shutdown` resolves; then send
-    /// `ControlMsg::Shutdown` to every connection, wait up to 5 s for them
-    /// to finish, and return.
+    /// Addresses the server connects back to.
+    pub fn connect_back_addrs(&self) -> &[connect_back::Addr] {
+        &self.connect_back.addrs
+    }
+
+    /// Accept connections (and connect back) until `shutdown` resolves;
+    /// then send `ControlMsg::Shutdown` to every connection, wait up to 5 s
+    /// for them to finish, and return.
     pub async fn run(self, shutdown: impl Future<Output = ()> + Send) -> Result<()> {
         let (shutdown_tx, shutdown_rx) = watch::channel(None::<String>);
-        let tracker = TaskTracker::new();
+        let tracker = self.shared.tracker.clone();
         let mut acceptors = JoinSet::new();
         for listener in self.listeners {
             acceptors.spawn(accept_loop(
                 listener,
                 Arc::clone(&self.shared),
+                tracker.clone(),
+                shutdown_rx.clone(),
+            ));
+        }
+        // Connect-back loops are not aborted at shutdown: each finishes its
+        // current connection (told to stop through the watch) and exits.
+        let mut loops = JoinSet::new();
+        for addr in &self.connect_back.addrs {
+            loops.spawn(connect_back::run_loop(
+                addr.clone(),
+                Arc::clone(&self.shared),
+                self.connect_back.clone(),
                 tracker.clone(),
                 shutdown_rx.clone(),
             ));
@@ -393,11 +460,17 @@ impl Server {
         loop {
             tokio::select! {
                 () = &mut shutdown => break,
-                ended = acceptors.join_next() => match ended {
-                    None => bail!("every listener has stopped"),
-                    Some(Ok(())) => warn!("a listener stopped unexpectedly"),
+                ended = acceptors.join_next(), if !acceptors.is_empty() => match ended {
+                    Some(Ok(())) | None => warn!("a listener stopped unexpectedly"),
                     Some(Err(e)) => warn!(error = %e, "a listener task failed"),
                 },
+                ended = loops.join_next(), if !loops.is_empty() => match ended {
+                    Some(Ok(())) | None => warn!("a connect-back loop stopped unexpectedly"),
+                    Some(Err(e)) => warn!(error = %e, "a connect-back loop failed"),
+                },
+            }
+            if acceptors.is_empty() && loops.is_empty() {
+                bail!("every listener and connect-back loop has stopped");
             }
         }
 
@@ -411,6 +484,7 @@ impl Server {
                 "connections still open after the shutdown grace period"
             );
         }
+        loops.abort_all();
         // Detached sessions belong to no connection: hang them up now.
         let _ = timeout(SHUTDOWN_GRACE, self.shared.registry.close_detached()).await;
         Ok(())
@@ -430,7 +504,8 @@ pub async fn serve(args: ServeArgs, paths: Paths) -> Result<()> {
         );
     }
     let listen = parse_listen(&args.listen)?;
-    let policy = Policy::from_args(&args);
+    let connect_back = connect_back::ConnectBackConfig::from_args(&args)?;
+    let policy = Policy::from_args(&args, &paths);
     let fingerprint = identity.public.fingerprint();
     let source = identity.source.clone();
     let pair_duration = match &args.pair {
@@ -443,6 +518,8 @@ pub async fn serve(args: ServeArgs, paths: Paths) -> Result<()> {
 
     let server = Server::bind(ServerConfig {
         listen,
+        connect_back,
+        bind_requests: args.allow_bind_request,
         identity,
         trust,
         policy,
@@ -465,6 +542,12 @@ pub async fn serve(args: ServeArgs, paths: Paths) -> Result<()> {
     };
     for addr in server.local_addrs() {
         info!(%addr, "listening");
+    }
+    for addr in server.connect_back_addrs() {
+        info!(%addr, period = ?server.connect_back.period, "connecting back");
+    }
+    if args.allow_bind_request {
+        info!("bind requests from authorized clients are allowed");
     }
     info!(%fingerprint, %source, "host identity");
     let pairing = server.pairing().expect("serve always configures pairing");
@@ -545,34 +628,88 @@ async fn accept_loop(
     shutdown: watch::Receiver<Option<String>>,
 ) {
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(e) => {
-                warn!(error = %e, "accept failed");
-                tokio::time::sleep(ACCEPT_RETRY).await;
-                continue;
+        accept_one(&listener, &shared, &tracker, &shutdown).await;
+    }
+}
+
+/// Accept one connection and hand it to its own task (or drop it: rate
+/// limit, handshake cap). A failed `accept` is logged and followed by a
+/// short pause. Returns once an accept has happened either way.
+async fn accept_one(
+    listener: &TcpListener,
+    shared: &Arc<Shared>,
+    tracker: &TaskTracker,
+    shutdown: &watch::Receiver<Option<String>>,
+) {
+    let (stream, peer) = match listener.accept().await {
+        Ok(accepted) => accepted,
+        Err(e) => {
+            warn!(error = %e, "accept failed");
+            tokio::time::sleep(ACCEPT_RETRY).await;
+            return;
+        }
+    };
+    if !shared.admit(peer) {
+        return;
+    }
+    let Ok(permit) = Arc::clone(&shared.handshakes).try_acquire_owned() else {
+        debug!(%peer, "too many concurrent handshakes; closing");
+        return;
+    };
+    let local = stream
+        .local_addr()
+        .or_else(|_| listener.local_addr())
+        .unwrap_or_else(|_| SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
+    tokio::spawn(tracker.track_future(handle_connection(
+        stream,
+        peer,
+        local,
+        Arc::clone(shared),
+        permit,
+        shutdown.clone(),
+        audit::Direction::Inbound,
+    )));
+}
+
+/// Accept loop for a listener bound on request (`Shared::bind_on_request`):
+/// like [`accept_loop`], but it ends after `idle` without an accepted
+/// connection, on `stop`, or at server shutdown, and reports why on
+/// `ended`.
+///
+/// Boxed because it is reachable from the connections it spawns
+/// (`control_loop` → `Bind` → here), which would otherwise make the
+/// future types recursive.
+fn requested_listener_loop(
+    listener: TcpListener,
+    idle: Option<Duration>,
+    shared: Arc<Shared>,
+    mut stop: watch::Receiver<bool>,
+    ended: watch::Sender<Option<String>>,
+    shutdown: watch::Receiver<Option<String>>,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
+        let mut server_shutdown = shutdown.clone();
+        let reason = loop {
+            // Recreated per iteration: every accepted connection restarts it.
+            let idle_expired = async {
+                match idle {
+                    Some(idle) => tokio::time::sleep(idle).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                () = accept_one(&listener, &shared, &shared.tracker, &shutdown) => {}
+                () = idle_expired => break "no connection within the idle time",
+                _ = stop.changed() => break "unbind requested",
+                _ = server_shutdown.changed() => break "server shutting down",
             }
         };
-        if !shared.admit(peer) {
-            continue;
-        }
-        let Ok(permit) = Arc::clone(&shared.handshakes).try_acquire_owned() else {
-            debug!(%peer, "too many concurrent handshakes; closing");
-            continue;
-        };
-        let local = stream
-            .local_addr()
-            .or_else(|_| listener.local_addr())
-            .unwrap_or_else(|_| SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
-        tokio::spawn(tracker.track_future(handle_connection(
-            stream,
-            peer,
-            local,
-            Arc::clone(&shared),
-            permit,
-            shutdown.clone(),
-        )));
-    }
+        info!(%addr, reason, "requested listener closed");
+        let _ = ended.send(Some(reason.to_owned()));
+    })
 }
 
 /// Run the handshake and authorize the client's key (`None` after a logged
@@ -648,7 +785,9 @@ async fn authenticate(
 }
 
 /// Handshake, authorize, take the control stream, then dispatch streams
-/// until the connection ends.
+/// until the connection ends. The single path for every connection, dialed
+/// by the client or by the server (`direction`). `true` once the client was
+/// authenticated (a refused or failed handshake returns `false` at once).
 #[allow(clippy::needless_pass_by_value)] // owned by the spawned task
 async fn handle_connection(
     stream: TcpStream,
@@ -657,7 +796,8 @@ async fn handle_connection(
     shared: Arc<Shared>,
     permit: OwnedSemaphorePermit,
     shutdown: watch::Receiver<Option<String>>,
-) {
+    direction: audit::Direction,
+) -> bool {
     // TCP keepalive is not configurable through `tokio::net::TcpStream`
     // (that needs `socket2`); the control-stream idle timeout covers it.
     if let Err(e) = stream.set_nodelay(true) {
@@ -666,7 +806,7 @@ async fn handle_connection(
     let result = authenticate(stream, peer, &shared).await;
     drop(permit);
     let Some((hs, options)) = result else {
-        return;
+        return false;
     };
     let connected = std::time::Instant::now();
     let client = hs.peer;
@@ -677,7 +817,10 @@ async fn handle_connection(
         version = hs.version,
         "client connected"
     );
-    let audit = shared.audit.handle(peer, Some(&client));
+    let audit = shared
+        .audit
+        .handle(peer, Some(&client))
+        .with_direction(direction);
     audit.emit(audit::Event::Connect, || {
         serde_json::json!({
             "version": hs.version,
@@ -694,10 +837,20 @@ async fn handle_connection(
     let (mux, mut incoming) = Mux::new(hs.stream, Mode::Server);
     let Some(control) = take_control(&mut incoming, peer).await else {
         mux.close().await;
-        return;
+        return true;
     };
-    let idle = policy.idle_timeout;
-    let control_task = tokio::spawn(control_loop(control, mux.clone(), shutdown, peer, idle));
+    let control_task = tokio::spawn(control_loop(
+        control,
+        mux.clone(),
+        shutdown,
+        ControlCtx {
+            peer,
+            idle: policy.idle_timeout,
+            shared: Arc::clone(&shared),
+            // A pairing-only connection is not authorized for anything else.
+            bind_allowed: shared.bind_requests && !hs.pairing,
+        },
+    ));
 
     if let (true, Some(state)) = (hs.pairing, shared.pairing.as_ref()) {
         // Pairing-only: `Control` and one `Pair` stream, nothing else.
@@ -735,6 +888,7 @@ async fn handle_connection(
         || serde_json::json!({}),
     );
     info!(%peer, "client disconnected");
+    true
 }
 
 /// The first stream must be `Open::Control`; answer `Ok` and return it.
@@ -762,19 +916,34 @@ async fn take_control(incoming: &mut Incoming, peer: SocketAddr) -> Option<Strea
     Some(control)
 }
 
+/// What [`control_loop`] needs beyond the stream.
+struct ControlCtx {
+    peer: SocketAddr,
+    /// Close after this long without a control message.
+    idle: Duration,
+    shared: Arc<Shared>,
+    /// `--allow-bind-request` and the client is fully authorized.
+    bind_allowed: bool,
+}
+
 /// Control stream (docs/03-protocol.md §6): answer pings, honour the
-/// client's `Shutdown`, relay the server's, and enforce the idle timeout.
-/// Closes the mux when it ends.
+/// client's `Shutdown`, relay the server's, serve `Bind`/`Unbind`, and
+/// enforce the idle timeout. Closes the mux when it ends.
 #[allow(clippy::needless_pass_by_value)] // owned by the spawned task
 async fn control_loop(
     control: Stream,
     mux: Mux,
     mut shutdown: watch::Receiver<Option<String>>,
-    peer: SocketAddr,
-    idle: Duration,
+    ctx: ControlCtx,
 ) {
     use tokio::io::AsyncWriteExt as _;
 
+    let ControlCtx {
+        peer,
+        idle,
+        shared,
+        bind_allowed,
+    } = ctx;
     let (mut rd, mut wr) = tokio::io::split(control);
     let (tx, mut rx) = mpsc::channel::<ControlMsg>(8);
     let reader = tokio::spawn(async move {
@@ -786,7 +955,16 @@ async fn control_loop(
     });
 
     let mut close_at: Option<Instant> = None;
+    // The requested listener this connection is told about when it ends.
+    let mut bound: BoundWatch = None;
     loop {
+        let watching = bound.is_some();
+        let bound_ended = async {
+            match bound.as_mut() {
+                Some((_, ended)) => ended.changed().await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             msg = rx.recv() => match msg {
                 None => {
@@ -802,7 +980,32 @@ async fn control_loop(
                     info!(%peer, reason, "client requested shutdown");
                     break;
                 }
-                Some(ControlMsg::Pong { .. } | ControlMsg::Notice(_)) => {}
+                Some(ControlMsg::Bind { addr, idle_secs }) => {
+                    let reply = bind_reply(&shared, bind_allowed, &mut bound, addr, idle_secs, peer, &shutdown).await;
+                    if write_msg(&mut wr, &reply).await.is_err() {
+                        break;
+                    }
+                }
+                Some(ControlMsg::Unbind) => {
+                    let reply = unbind_reply(&shared, bind_allowed, &mut bound, peer);
+                    if write_msg(&mut wr, &reply).await.is_err() {
+                        break;
+                    }
+                }
+                Some(
+                    ControlMsg::Pong { .. }
+                    | ControlMsg::Notice(_)
+                    | ControlMsg::Bound { .. }
+                    | ControlMsg::Unbound { .. },
+                ) => {}
+            },
+            _ = bound_ended, if watching => {
+                let Some(unbound) = unbound_notice(&mut bound) else {
+                    continue;
+                };
+                if write_msg(&mut wr, &unbound).await.is_err() {
+                    break;
+                }
             },
             changed = shutdown.changed(), if close_at.is_none() => {
                 let reason = if changed.is_ok() {
@@ -828,6 +1031,83 @@ async fn control_loop(
     }
     reader.abort();
     mux.close().await;
+}
+
+/// The requested listener a control loop reports on: its address and the
+/// watch that carries the reason once it has closed.
+type BoundWatch = Option<(SocketAddr, watch::Receiver<Option<String>>)>;
+
+/// Answer `ControlMsg::Bind` with `Bound` or `Unbound`; on success `bound`
+/// remembers the listener so its end is reported.
+async fn bind_reply(
+    shared: &Arc<Shared>,
+    bind_allowed: bool,
+    bound: &mut BoundWatch,
+    addr: String,
+    idle_secs: u32,
+    peer: SocketAddr,
+    shutdown: &watch::Receiver<Option<String>>,
+) -> ControlMsg {
+    if !bind_allowed {
+        warn!(%peer, addr, "bind request refused: not allowed");
+        return ControlMsg::Unbound {
+            addr,
+            reason: "bind requests are not allowed".to_owned(),
+        };
+    }
+    match shared
+        .bind_on_request(&addr, idle_secs, peer, shutdown.clone())
+        .await
+    {
+        Ok((actual, ended)) => {
+            *bound = Some((actual, ended));
+            ControlMsg::Bound {
+                addr: actual.to_string(),
+            }
+        }
+        Err(reason) => {
+            warn!(%peer, addr, reason, "bind request refused");
+            ControlMsg::Unbound { addr, reason }
+        }
+    }
+}
+
+/// Answer `ControlMsg::Unbind`: stop the requested listener (if any) and
+/// say so — once; `bound` is cleared so the listener's end is not reported
+/// a second time.
+fn unbind_reply(
+    shared: &Shared,
+    bind_allowed: bool,
+    bound: &mut BoundWatch,
+    peer: SocketAddr,
+) -> ControlMsg {
+    match bind_allowed.then(|| shared.unbind(peer)).flatten() {
+        Some(addr) => {
+            *bound = None;
+            ControlMsg::Unbound {
+                addr: addr.to_string(),
+                reason: "unbind requested".to_owned(),
+            }
+        }
+        None => ControlMsg::Unbound {
+            addr: String::new(),
+            reason: "no requested listener".to_owned(),
+        },
+    }
+}
+
+/// The `Unbound` to send once the watched requested listener has ended;
+/// forgets it so it is reported once.
+fn unbound_notice(bound: &mut BoundWatch) -> Option<ControlMsg> {
+    let (addr, ended) = bound.take()?;
+    let reason = ended
+        .borrow()
+        .clone()
+        .unwrap_or_else(|| "listener closed".to_owned());
+    Some(ControlMsg::Unbound {
+        addr: addr.to_string(),
+        reason,
+    })
 }
 
 /// Read the prologue of an accepted stream and hand it to its handler.
@@ -1078,12 +1358,14 @@ mod tests {
             idle_timeout: limits::SERVER_IDLE,
             detach_grace: limits::DETACH_GRACE,
             signature_auth: true,
+            authorized_keys: PathBuf::from("/nonexistent/authorized_keys"),
         }
     }
 
     #[test]
     fn policy_from_args_maps_hardening_flags() {
-        let defaults = Policy::from_args(&ServeArgs::default());
+        let paths = Paths::with_config_dir(PathBuf::from("/tmp/mysh-cfg"));
+        let defaults = Policy::from_args(&ServeArgs::default(), &paths);
         assert_eq!(
             defaults.handshakes_per_minute,
             limits::HANDSHAKES_PER_MINUTE
@@ -1092,6 +1374,10 @@ mod tests {
         assert_eq!(defaults.detach_grace, limits::DETACH_GRACE);
         assert!(defaults.signature_auth);
         assert_eq!(defaults.forced_command, None);
+        assert_eq!(
+            defaults.authorized_keys,
+            PathBuf::from("/tmp/mysh-cfg/authorized_keys")
+        );
 
         let args = ServeArgs {
             handshake_rate: Some(0),
@@ -1100,7 +1386,7 @@ mod tests {
             no_signature_auth: true,
             ..ServeArgs::default()
         };
-        let custom = Policy::from_args(&args);
+        let custom = Policy::from_args(&args, &paths);
         assert_eq!(custom.handshakes_per_minute, 0);
         assert_eq!(custom.idle_timeout, Duration::from_secs(7));
         assert_eq!(custom.detach_grace, Duration::from_secs(9));
@@ -1138,51 +1424,6 @@ mod tests {
         assert!(denied.with_key_options(&options).denies(Feature::Exec));
     }
 
-    #[test]
-    fn rate_limiter_bucket_drains_and_refills() {
-        let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        let other: IpAddr = "::1".parse().unwrap();
-        let t0 = Instant::now();
-        let mut limiter = RateLimiter::new(3);
-        for _ in 0..3 {
-            assert!(limiter.check(ip, t0));
-        }
-        assert!(
-            !limiter.check(ip, t0),
-            "fourth handshake in the same minute"
-        );
-        // Other addresses have their own bucket.
-        assert!(limiter.check(other, t0));
-        // 3/min = one token every 20 s; 10 s in there is only half a token.
-        assert!(!limiter.check(ip, t0 + Duration::from_secs(10)));
-        assert!(limiter.check(ip, t0 + Duration::from_secs(30)));
-        assert!(!limiter.check(ip, t0 + Duration::from_secs(30)));
-        // A full minute refills to capacity, never beyond it.
-        let t1 = t0 + Duration::from_secs(600);
-        for _ in 0..3 {
-            assert!(limiter.check(ip, t1));
-        }
-        assert!(!limiter.check(ip, t1));
-    }
-
-    #[test]
-    fn rate_limiter_warns_once_per_interval_and_prunes() {
-        let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        let t0 = Instant::now();
-        let mut limiter = RateLimiter::new(1);
-        assert!(limiter.check(ip, t0));
-        assert!(!limiter.check(ip, t0));
-        assert!(limiter.should_warn(ip, t0));
-        assert!(!limiter.should_warn(ip, t0 + Duration::from_secs(9)));
-        assert!(limiter.should_warn(ip, t0 + RATE_LIMIT_WARN_EVERY));
-        assert_eq!(limiter.buckets.len(), 1);
-        // Inserting a new address prunes buckets idle for ten minutes.
-        let newcomer: IpAddr = "10.0.0.1".parse().unwrap();
-        assert!(limiter.check(newcomer, t0 + BUCKET_TTL + Duration::from_secs(1)));
-        assert_eq!(limiter.buckets.len(), 1);
-        assert!(limiter.buckets.contains_key(&newcomer));
-    }
-
     struct Running {
         addr: SocketAddr,
         stop: oneshot::Sender<()>,
@@ -1198,6 +1439,8 @@ mod tests {
         };
         let server = Server::bind(ServerConfig {
             listen: vec!["127.0.0.1:0".parse().unwrap()],
+            connect_back: connect_back::ConnectBackConfig::default(),
+            bind_requests: false,
             identity: identity(SecretKey::generate()),
             trust,
             policy: test_policy(),

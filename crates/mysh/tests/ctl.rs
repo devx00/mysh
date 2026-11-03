@@ -303,8 +303,8 @@ async fn cli_subcommands_reuse_the_interactive_connection() {
     // authorize through the socket.
     let (code, out, err) = run_cli(&server, &env, &lcwd, "authorize", &[], &[]).await;
     assert_eq!(code, 0, "authorize failed:\nstdout:{out}\nstderr:{err}");
-    let keys = std::fs::read_to_string(server.home.join(".config/mysh/authorized_keys"))
-        .expect("authorized_keys written");
+    let keys =
+        std::fs::read_to_string(&server.server_authorized_keys).expect("authorized_keys written");
     assert!(keys.contains("mysh-x25519"), "{keys}");
 
     // A failing request reports the error and exits 1 (no fallback).

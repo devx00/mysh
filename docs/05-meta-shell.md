@@ -114,6 +114,7 @@ is `Ctrl-Z` at the prompt, `~?` is `help`.
 | `exec`       | `exec [--timeout D] [--cwd DIR] CMD...`                         | run a non-PTY exec session; stream output into the prompt; print the exit code. Quick checks without opening a shell. `--cwd` sets the start directory (default: MRU session cwd); `--timeout` sends `TERM`, then `KILL` 2 s later, and reports exit 124 |
 | `info`       | `info`                                                          | server name, address, protocol version, peer fingerprint + how it was trusted, cipher, uptime, bytes in/out, RTT, sessions, active forwards; then the server's own facts from `Open::Info` (version, platform, kernel, shell, home, user, uptime, limits, denied features) when it answers |
 | `ping`       | `ping [-c N]`                                                   | control-stream pings, RTT min/avg/max                                  |
+| `bind`       | `bind [ADDR\|off] [--for D]`                                    | ask the server to bind a listener of its own so ordinary clients can dial it (`ADDR` = `host:port` or a bare `PORT`, default `0.0.0.0:7722`); `--for D` closes it after D without a connection, `bind off` closes it now. Refused with `denied` unless the server runs with `--allow-bind-request`. Typical use: `mysh bind @host-a 0.0.0.0:7722 --for 1h` on an accepted connection |
 | `resize`     | `resize`                                                        | re-send the current terminal size to the MRU session                   |
 | `log`        | `log FILE` · `log off`                                          | tee everything written to the terminal (whichever session is foreground, replays included) to FILE from now on (`script`-like) |
 | `authorize`  | `authorize [PUBKEY_FILE]`                                       | append the client's public key (default: the identity in use) to the server's `~/.config/mysh/authorized_keys` via `File` ops; creates the dir `0700`; skips if already present. Equivalent of `ssh-copy-id` |
@@ -252,6 +253,8 @@ mysh sync   [OPTIONS] HOST [--pull] [--delete] [--dry-run] [--checksum] [-j N] S
 mysh forward [OPTIONS] HOST (-L|-R|-D SPEC)...     = connect -N with forwards
 mysh authorize [OPTIONS] HOST [PUBKEY_FILE]
 mysh pair [OPTIONS] HOST CODE...        first contact: run the PAKE with the code printed by `serve --pair`; installs our key on HOST and pins HOST's key locally (02-security.md "Pairing"). Exit 2 when the server has no window open or the code is wrong (nothing is written)
+mysh accept [ADDR] [--callers PATH] [--accept-new] [--handshakes-per-minute N] [--json]   accept connections servers open themselves ("Accepting connections")
+mysh bind [OPTIONS] HOST [ADDR|off] [--for D]   ask HOST to bind a listener for ordinary clients (needs `serve --allow-bind-request`)
 mysh help [--json] [CMD]                clap's help for CMD (or the whole CLI); `--json`: the command tree
 mysh session [OPTIONS] HOST new [--cwd DIR] [--pty] [--env K=V] -- CMD ...
 mysh session [OPTIONS] HOST send ID [TEXT...] [--stdin] [--eof]
@@ -295,14 +298,21 @@ Connection options (shared by every HOST-taking command):
 | `--hosts a,b,…`       | fan out to these hosts (comma-separated, repeatable); `run`, `put`, `get` only ("Fleet") |
 | `--group NAME`        | fan out to `[groups.NAME]` of the config file (repeatable, mixes with `--hosts`) |
 
-`HOST` forms: `host`, `host:port`, `[v6addr]:port`, `v6addr` (bare), or a
-config alias (below).
+`HOST` forms: `host`, `host:port`, `[v6addr]:port`, `v6addr` (bare), a
+config alias (below), or `@NAME` — an accepted connection
+("Accepting connections"), which is reached through its control socket
+and never dialed.
 
 Server options:
 
 | option                              | meaning                                                   |
 | ----------------------------------- | --------------------------------------------------------- |
-| `--listen ADDR`                     | repeatable; default `[::]:7722` (dual-stack) with fallback to `0.0.0.0:7722` |
+| `--listen ADDR`                     | repeatable; default `[::]:7722` (dual-stack) with fallback to `0.0.0.0:7722`. With `--connect-back` and no `--listen`, nothing is bound |
+| `--connect-back ADDR`               | repeatable, `host[:port]` (default port 7722): connect back to a client accepting connections (`mysh accept`) and serve it; one connection per address at a time, the next attempt one period after the start of the previous one, failures retried with backoff (5 s doubling, capped at the period) |
+| `--connect-period DURATION`         | start-to-start interval of connect-back attempts (default `5m`) |
+| `--connect-jitter PERCENT`          | uniform ± spread on each period so many servers do not dial together (default 10) |
+| `--connect-max DURATION`            | a connect-back connection the client holds longer than this is closed by the server (`Shutdown`; default `30m`) |
+| `--allow-bind-request`              | let authorized clients ask the server to bind a listener (`bind` command, 03-protocol.md §6); default off |
 | `--key PATH`, `--no-generate-key`   | identity                                                  |
 | `--authorized-keys PATH`, `--authorized-key KEY`, `--no-ssh-authorized-keys` | trust               |
 | `--shell PATH`                      | override shell resolution                                 |
@@ -388,6 +398,61 @@ mysh get --group lab REMOTE... LOCALDIR          # lands in LOCALDIR/<host>/
 
 `get --hosts` creates `LOCALDIR/<host>/` per host (`LOCALDIR` defaults to
 the current directory; a `/` in a host name becomes `_`).
+
+## Accepting connections
+
+`mysh accept` is the other end of `mysh serve --connect-back ADDR`: the
+server opens the TCP connection, the client keeps the protocol roles it
+always had. This is how a server behind a firewall — with no inbound
+connectivity at all — is still reachable.
+
+```
+mysh accept [ADDR] [--callers PATH] [--accept-new] [--handshakes-per-minute N] [--json]
+```
+
+- Binds `ADDR` (`host:port`, a bare `PORT`, default `[::]:7722`) and waits.
+  Servers in the callers file are accepted; anything else is refused before
+  the client reveals its own key (02-security.md "Callers"). `--callers
+  PATH` overrides `~/.config/mysh/callers`, `--accept-new` records unknown
+  keys there instead of refusing them, `--handshakes-per-minute` is the
+  per-address limit on inbound handshakes (default 30; 0 = off).
+- Prints one line per event: `accepted NAME (SHA256:…) from ADDR`,
+  `closed NAME: reason`, `refused SHA256:… from ADDR: reason`. With
+  `--json` the same events are NDJSON: `{"event":"accepted","name",
+  "fingerprint","addr","server":{"name","version"}}`,
+  `{"event":"closed","name","fingerprint","reason"}`,
+  `{"event":"refused","fingerprint","addr","reason"}`.
+- Serves a **control socket per accepted connection** at
+  `<runtime>/mysh/@NAME.sock`, exactly as a master does for a dialed one,
+  and removes it when that connection ends. `NAME` is the caller's name
+  from the callers file, or the first twelve base64 characters of its
+  fingerprint when it has none.
+- Exits on `SIGTERM`/`SIGINT`, closing every connection first so each
+  server goes back to its period instead of waiting for a TCP timeout.
+  Standard input is never read.
+
+Every other command addresses an accepted connection as `@NAME`:
+
+```
+mysh @host-a uptime
+mysh put @host-a ./build.tar.gz /tmp/
+mysh session @host-a list
+mysh run --hosts @host-a,@host-b -- uname -a
+mysh bind @host-a 0.0.0.0:7722 --for 1h
+```
+
+An `@NAME` target has no address: it only ever goes through the socket
+(no alias, no master, no dialing). When no accepted connection of that
+name is there the call fails with `connect_failed` ("no accepted
+connection named NAME").
+
+**Bind on request.** `bind [ADDR|off] [--for D]` asks the server at the
+other end to bind a listener of its own, so that ordinary dialed clients
+can reach it while it is up; the server must run with
+`--allow-bind-request`, otherwise the request is refused with the `denied`
+code. `--json` prints `{"bound": "ADDR"}` with the resolved address. The
+listener belongs to the server process, not to the requesting connection:
+it lives until `bind off`, its idle timeout, or the server exits.
 
 ## Control socket
 
@@ -539,7 +604,7 @@ structured output from the same commands with three global flags
 | --------------- | --------------------------------------------------- | ------------------------------ |
 | `--json`        | one JSON document per command, nothing else         | `{"error": …}` lines           |
 | `--json-stream` | NDJSON: one event object per line, as things happen | nothing of mysh's              |
-| `--plain`       | text without ANSI, progress, banner or prompt redraws | notices (`[mysh] …`)         |
+| `--plain`       | text without ANSI, progress, banner or prompt redraws | notices (`[mysh] …`) and `error: …` lines |
 
 `--plain` is implied by both JSON modes and whenever stdout is not a
 terminal. With a JSON mode `mysh HOST` never runs the line editor: stdin is
@@ -547,6 +612,10 @@ read as a script even on a terminal, and every command of the script prints
 its document in turn (`mysh --json HOST < script`). Exit codes do not
 change (see "Modes and exit"); `--timeout` expiry exits 124 like
 `timeout(1)`.
+
+`error: …` lines of a failed command are drawn on the terminal with the
+prompt and go to stderr otherwise, like notices — a redirected
+`mysh cat HOST f > out` never writes an error into `out`.
 
 Durations (`--timeout`, prompt `exec --timeout`) are `500ms`, `10s`, `2m`,
 `1h`, fractions allowed; a bare number is seconds.
@@ -580,6 +649,7 @@ Field names are `snake_case`; omitted optional fields are `null`. A
 | `cwd`                                     | `CwdOut {remote: string\|null, session: int\|null, local}`               |
 | `authorize`                               | `AuthorizeOut {added: bool}` (`false`: already present)                  |
 | `mysh pair HOST CODE`                     | `PairOut {host, server_fingerprint, client_fingerprint, authorized_line, host_line}` |
+| `bind ADDR`                               | `BindOut {bound}` — the address the server's requested listener is bound at (`bind off` prints `{"ok": true}`) |
 | `kill`, `forward rm`, `log`, `resize`, `detach` | `{"ok": true}`                                                     |
 | `help [CMD]`, `mysh help --json [CMD]`    | `HelpTree {command, about, args: [{name, long, short, takes_value, positional, required, repeatable, value_name, default, help}], subcommands: [HelpTree]}` — built from the clap definitions, so it is always current; the prompt tree's root is named `prompt` |
 
@@ -602,6 +672,9 @@ Every line is `{"event": NAME, …}`:
 | `error`    | `code`, `message`                                   | a command failed (codes below); in this mode errors are on stdout so one stream tells the whole story |
 | `result`   | `value`                                             | the `--json` document of a command that has one (`ls`, `info`, a transfer's `TransferOut`, …) |
 | `host`     | `host`, `data: event`                               | a fan-out (`run`, `put/get --hosts`): `data` is the event that host's own stream would carry; the run ends with a `result` whose `value` is the array |
+| `accepted` | `name`, `fingerprint`, `addr`, `server: {name, version}` | `mysh accept`: a server that connected back finished the handshake |
+| `closed`   | `name`, `fingerprint`, `reason`                     | that connection ended                                       |
+| `refused`  | `fingerprint`, `addr`, `reason`                     | an inbound connection was refused (the key is not a caller) |
 
 ### Errors and codes
 

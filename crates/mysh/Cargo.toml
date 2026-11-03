@@ -27,6 +27,8 @@ clap.workspace = true
 dirs.workspace = true
 postcard.workspace = true
 portable-atomic.workspace = true
+# `OsRng` for the connect-back period jitter (server::connect_back).
+rand_core.workspace = true
 rpassword.workspace = true
 # `system` adds `uname` for `Open::Info`.
 rustix = { workspace = true, features = ["system"] }

@@ -868,6 +868,7 @@ dependencies = [
  "mysh-pty",
  "portable-atomic",
  "postcard",
+ "rand_core",
  "rpassword",
  "rustix",
  "serde",

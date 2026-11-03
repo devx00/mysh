@@ -1975,6 +1975,7 @@ mod tests {
             idle_timeout: Duration::from_secs(120),
             detach_grace: Duration::from_secs(600),
             signature_auth: true,
+            authorized_keys: PathBuf::from("/home/u/.config/mysh/authorized_keys"),
         }
     }
 

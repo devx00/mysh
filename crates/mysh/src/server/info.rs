@@ -98,6 +98,7 @@ pub fn build(policy: &Policy) -> Info {
             denied,
         },
         uptime_secs: uptime().as_secs(),
+        authorized_keys: policy.authorized_keys.display().to_string(),
     }
 }
 

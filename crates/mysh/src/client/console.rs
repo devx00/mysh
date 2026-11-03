@@ -271,6 +271,20 @@ impl Console {
             Mode::Human | Mode::Plain => match ev {
                 Event::Notice { text } => self.notice(text),
                 Event::Error { message, .. } => self.println(&format!("error: {message}")),
+                Event::Accepted {
+                    name,
+                    fingerprint,
+                    addr,
+                    ..
+                } => self.println(&format!("accepted {name} ({fingerprint}) from {addr}")),
+                Event::Closed { name, reason, .. } => {
+                    self.println(&format!("closed {name}: {reason}"));
+                }
+                Event::Refused {
+                    fingerprint,
+                    addr,
+                    reason,
+                } => self.println(&format!("refused {fingerprint} from {addr}: {reason}")),
                 _ => {}
             },
         }
@@ -288,7 +302,18 @@ impl Console {
                     message: out.error.message,
                 });
             }
-            Mode::Human | Mode::Plain => self.println(&format!("error: {err:#}")),
+            // Like notices: on the terminal with the prompt, otherwise
+            // stderr so `mysh cat HOST f > out` never writes it into `out`.
+            Mode::Human | Mode::Plain => {
+                self.end_progress_line();
+                let mut bytes = self.translate(format!("error: {err:#}").as_bytes());
+                bytes.extend_from_slice(self.newline());
+                if self.inner.tty && self.inner.mode == Mode::Human {
+                    self.send(Op::Out(bytes));
+                } else {
+                    self.send(Op::Err(bytes));
+                }
+            }
         }
     }
 
@@ -597,6 +622,9 @@ impl Reporter for Console {
             | Event::Exit { .. }
             | Event::Error { .. }
             | Event::Result { .. }
+            | Event::Accepted { .. }
+            | Event::Closed { .. }
+            | Event::Refused { .. }
             | Event::Host { .. } => Console::event(self, ev),
         }
     }

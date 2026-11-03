@@ -51,6 +51,17 @@ pub enum Event {
     Denied,
 }
 
+/// Who opened the TCP connection a line belongs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    /// The client dialed the server (a listener accepted it).
+    #[default]
+    Inbound,
+    /// The server dialed the client (`--connect-back`).
+    Outbound,
+}
+
 /// One line of the log, exactly as written (`ts` is stamped by the writer,
 /// so lines are in non-decreasing timestamp order).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,6 +74,10 @@ pub struct Line {
     pub key: String,
     /// `x25519` or `ssh-ed25519`.
     pub kind: String,
+    /// Who dialed; absent in logs written before the field existed means
+    /// `inbound`.
+    #[serde(default)]
+    pub direction: Direction,
     pub event: Event,
     /// Event-specific facts; always an object.
     pub detail: Value,
@@ -158,6 +173,7 @@ impl Audit {
             peer: peer.to_string(),
             key: key.map_or_else(|| "?".to_owned(), |k| k.fingerprint().to_string()),
             kind: key.map_or("", Peer::kind).to_owned(),
+            direction: Direction::Inbound,
         }
     }
 
@@ -177,6 +193,7 @@ pub struct Handle {
     peer: String,
     key: String,
     kind: String,
+    direction: Direction,
 }
 
 impl Handle {
@@ -190,6 +207,13 @@ impl Handle {
     #[must_use]
     pub fn enabled(&self) -> bool {
         self.sink.enabled()
+    }
+
+    /// The same handle for a connection the server dialed (or not).
+    #[must_use]
+    pub fn with_direction(mut self, direction: Direction) -> Self {
+        self.direction = direction;
+        self
     }
 
     /// Record `event` with the detail `detail()` builds; the closure runs
@@ -212,6 +236,7 @@ impl Handle {
             peer: self.peer.clone(),
             key: self.key.clone(),
             kind: self.kind.clone(),
+            direction: self.direction,
             event,
             detail,
             exit: extra.exit,

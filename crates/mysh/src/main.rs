@@ -117,10 +117,10 @@ fn mode_for(opts: &ConnectOpts) -> Mode {
     Mode::select(opts.json, opts.json_stream, opts.plain, stdout_tty)
 }
 
-async fn run(cli: Cli) -> ExitCode {
-    // The connect options are parsed for every command; a subcommand that
-    // takes no HOST leaves them at their defaults (human/plain).
-    let mode = match &cli.command {
+/// The output mode of one command line: the connection options of a host
+/// command, the explicit `--json` of the others, else human.
+fn output_mode(cli: &Cli) -> Mode {
+    match &cli.command {
         Some(Command::Put(h)) => mode_for(&h.opts),
         Some(Command::Get(h)) => mode_for(&h.opts),
         Some(Command::Cat(h)) => mode_for(&h.opts),
@@ -139,11 +139,21 @@ async fn run(cli: Cli) -> ExitCode {
         Some(Command::Session(h)) => mode_for(&h.opts),
         Some(Command::Master(h)) => mode_for(&h.opts),
         Some(Command::Pair(h)) => mode_for(&h.opts),
+        Some(Command::Bind(h)) => mode_for(&h.opts),
+        // `accept` reports one event per connection, as NDJSON with
+        // `--json`.
+        Some(Command::Accept(args)) if args.json => Mode::JsonStream,
         Some(Command::Run(args)) => mode_for(&args.opts),
         None => mode_for(&cli.connect.opts),
         Some(Command::Help(args)) if args.json => Mode::Json,
         Some(_) => Mode::Human,
-    };
+    }
+}
+
+async fn run(cli: Cli) -> ExitCode {
+    // The connect options are parsed for every command; a subcommand that
+    // takes no HOST leaves them at their defaults (human/plain).
+    let mode = output_mode(&cli);
     if let Some(Command::Help(args)) = &cli.command {
         return match mysh::cli::help_text(args) {
             Ok(text) => {
@@ -184,7 +194,11 @@ async fn run(cli: Cli) -> ExitCode {
             Err(e) => fail(&e, EXIT_USAGE, mode),
         },
         Some(Command::Pair(h)) => pair(&h, &config, &paths, &baked, mode).await,
-        Some(Command::Run(args)) => fleet_exit(
+        Some(Command::Accept(args)) => exit_code(
+            mysh::client::accept::run(&args, &paths, &baked, mode).await,
+            mode,
+        ),
+        Some(Command::Run(args)) => exit_code(
             mysh::client::fleet::run(args, &config, paths, baked, mode).await,
             mode,
         ),
@@ -196,7 +210,7 @@ async fn run(cli: Cli) -> ExitCode {
         Some(Command::Put(h)) if h.opts.fan_out() => {
             let mut args = h.args;
             args.paths.insert(0, h.host);
-            fleet_exit(
+            exit_code(
                 mysh::client::fleet::put(&h.opts, &args, &config, paths, baked, mode).await,
                 mode,
             )
@@ -204,7 +218,7 @@ async fn run(cli: Cli) -> ExitCode {
         Some(Command::Get(h)) if h.opts.fan_out() => {
             let mut args = h.args;
             args.paths.insert(0, h.host);
-            fleet_exit(
+            exit_code(
                 mysh::client::fleet::get(&h.opts, &args, &config, paths, baked, mode).await,
                 mode,
             )
@@ -218,9 +232,9 @@ async fn run(cli: Cli) -> ExitCode {
     }
 }
 
-/// Exit code of a fan-out: the command's, or usage (2) for a bad host
-/// selection.
-fn fleet_exit(result: Result<i32>, mode: Mode) -> ExitCode {
+/// Exit code of a command that returns one: the command's, or usage (2)
+/// for a failure before it could run.
+fn exit_code(result: Result<i32>, mode: Mode) -> ExitCode {
     match result {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(255)),
         Err(e) => fail(&e, EXIT_USAGE, mode),
@@ -283,6 +297,7 @@ fn client_request(command: Option<Command>, bare: ConnectArgs) -> Result<ClientR
         Some(Command::Hash(h)) => Ok((h.host, h.opts, ClientCommand::File(FileCmd::Hash(h.args)))),
         Some(Command::Sync(h)) => Ok((h.host, h.opts, ClientCommand::File(FileCmd::Sync(h.args)))),
         Some(Command::Authorize(h)) => Ok((h.host, h.opts, ClientCommand::Authorize(h.args))),
+        Some(Command::Bind(h)) => Ok((h.host, h.opts, ClientCommand::Bind(h.args))),
         Some(Command::Session(h)) => Ok((h.host, h.opts, ClientCommand::Session(h.args))),
         Some(Command::Master(h)) => Ok((h.host, h.opts, ClientCommand::Master(h.args))),
         Some(Command::Forward(h)) => {
@@ -298,6 +313,7 @@ fn client_request(command: Option<Command>, bare: ConnectArgs) -> Result<ClientR
             | Command::Help(_)
             | Command::Pair(_)
             | Command::Run(_)
+            | Command::Accept(_)
             | Command::Mcp(_),
         ) => {
             bail!("internal error: non-client command reached client dispatch")
@@ -334,6 +350,21 @@ async fn client(
     if matches!(cmd, ClientCommand::Forward(_)) {
         // `mysh forward` is `connect -N` with forwards.
         target.no_session = true;
+    }
+    if let ClientCommand::Master(args) = &cmd
+        && args.daemon
+    {
+        // Re-spawn detached and return once the socket answers (an already
+        // running master counts); the child runs `master` without `--daemon`.
+        return match mysh::client::master::ensure(&paths, &target, args.idle).await {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => fail(
+                &anyhow::anyhow!("master for {} did not come up", target.display),
+                EXIT_SERVE,
+                mode,
+            ),
+            Err(e) => fail(&e.context("starting the master"), EXIT_SERVE, mode),
+        };
     }
     if !target.no_ctl
         && !matches!(cmd, ClientCommand::Master(_))
@@ -428,6 +459,7 @@ fn ctl_argv(cmd: &ClientCommand, opts: &ConnectOpts) -> Option<Vec<String>> {
         ClientCommand::Put(args) => Some(args.to_argv()),
         ClientCommand::Get(args) => Some(args.to_argv()),
         ClientCommand::Authorize(args) => Some(args.to_argv()),
+        ClientCommand::Bind(args) => Some(args.to_argv()),
         ClientCommand::Session(args) => Some(args.to_argv()),
         ClientCommand::File(cmd) => {
             let mut argv = cmd.to_argv();

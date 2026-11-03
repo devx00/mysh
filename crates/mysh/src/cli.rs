@@ -93,6 +93,11 @@ pub enum Command {
     Master(HostAnd<MasterArgs>),
     /// Pair with HOST using the one-time code printed by `serve --pair`.
     Pair(HostAnd<PairArgs>),
+    /// Accept connections from servers that dial this client (`serve
+    /// --connect-back`).
+    Accept(AcceptArgs),
+    /// Ask HOST to bind a listener for ordinary clients (`bind off` closes it).
+    Bind(HostAnd<BindArgs>),
     /// Run one command on several hosts (`--hosts`, `--group`).
     Run(RunArgs),
     /// Serve the Model Context Protocol over stdio (`--hosts`, `--group`).
@@ -111,6 +116,32 @@ pub struct HelpArgs {
     /// Subcommand to describe (default: the whole tree).
     #[arg(value_name = "CMD")]
     pub cmd: Option<String>,
+}
+
+/// `mysh accept [ADDR] [--callers PATH] [--accept-new] [--json]`
+/// (docs/05-meta-shell.md "Accepting connections").
+#[derive(Args, Clone, Debug, Default)]
+pub struct AcceptArgs {
+    /// Address to listen on (default `[::]:7722`).
+    #[arg(value_name = "ADDR")]
+    pub addr: Option<String>,
+
+    /// Callers file: the servers allowed to connect back (default
+    /// `~/.config/mysh/callers`).
+    #[arg(long, value_name = "PATH")]
+    pub callers: Option<PathBuf>,
+
+    /// Record an unknown server key in the callers file and accept it.
+    #[arg(long)]
+    pub accept_new: bool,
+
+    /// Per-address limit on inbound handshakes (0: no limit).
+    #[arg(long, value_name = "N", default_value_t = 30)]
+    pub handshakes_per_minute: u32,
+
+    /// One JSON event per line instead of human-readable lines.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `mysh run [-j N] (--hosts a,b | --group NAME)… [--json] -- CMD…`.
@@ -301,6 +332,31 @@ pub struct ServeArgs {
     /// docs/02-security.md "Audit log".
     #[arg(long, value_name = "PATH")]
     pub audit: Option<PathBuf>,
+
+    /// Connect back to a client that accepts connections (`mysh accept`) at
+    /// ADDR (`host[:port]`, default port 7722; repeatable). Without
+    /// `--listen` nothing is bound.
+    #[arg(long, value_name = "ADDR")]
+    pub connect_back: Vec<String>,
+
+    /// Time from the start of one connect-back attempt to the start of the
+    /// next (default `5m`).
+    #[arg(long, value_name = "DURATION")]
+    pub connect_period: Option<String>,
+
+    /// Spread each connect-back period by ± this percentage (default 10).
+    #[arg(long, value_name = "PERCENT", value_parser = clap::value_parser!(u32).range(0..=100))]
+    pub connect_jitter: Option<u32>,
+
+    /// Close a connect-back connection the client has held for this long
+    /// (default `30m`).
+    #[arg(long, value_name = "DURATION")]
+    pub connect_max: Option<String>,
+
+    /// Let authorized clients ask the server to bind a listener
+    /// (`ControlMsg::Bind`, the client's `bind` command).
+    #[arg(long)]
+    pub allow_bind_request: bool,
 }
 
 /// `mysh keygen` options.
@@ -344,6 +400,58 @@ impl PairArgs {
     #[must_use]
     pub fn code(&self) -> String {
         self.code.join("-")
+    }
+}
+
+/// `bind [ADDR|off] [--for DURATION]` (CLI and prompt): ask the server to
+/// bind a listener of its own so ordinary clients can dial it
+/// (docs/05-meta-shell.md "Bind on request").
+#[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BindArgs {
+    /// `host:port`, a bare `PORT` (any address), or `off` to close the
+    /// listener again. Default: `0.0.0.0:7722`.
+    #[arg(value_name = "ADDR|off")]
+    pub addr: Option<String>,
+
+    /// Close the listener after DURATION without a connection; the
+    /// default keeps it until `bind off` or the server exits.
+    #[arg(long = "for", value_name = "DURATION", value_parser = parse_duration)]
+    pub idle: Option<Duration>,
+}
+
+impl BindArgs {
+    /// Whether this is `bind off` (close the listener).
+    #[must_use]
+    pub fn is_off(&self) -> bool {
+        self.addr.as_deref() == Some("off")
+    }
+
+    /// The address to ask for: as typed, a bare port on every address, or
+    /// the default.
+    #[must_use]
+    pub fn address(&self) -> String {
+        match self.addr.as_deref() {
+            None | Some("off") => format!("0.0.0.0:{}", crate::config::DEFAULT_PORT),
+            Some(addr) => match addr.parse::<u16>() {
+                Ok(port) => format!("0.0.0.0:{port}"),
+                Err(_) => addr.to_owned(),
+            },
+        }
+    }
+
+    /// The prompt words that reproduce this command (for the control socket).
+    #[must_use]
+    pub fn to_argv(&self) -> Vec<String> {
+        let mut argv = vec!["bind".to_owned()];
+        if let Some(idle) = self.idle {
+            argv.push("--for".to_owned());
+            argv.push(format!("{}ms", idle.as_millis()));
+        }
+        if let Some(addr) = &self.addr {
+            argv.push("--".to_owned());
+            argv.push(addr.clone());
+        }
+        argv
     }
 }
 
@@ -499,6 +607,9 @@ pub enum MetaCommand {
     Sync(SyncArgs),
     /// Show connection information.
     Info,
+    /// Ask the server to bind a listener for ordinary clients to dial;
+    /// `bind off` closes it again.
+    Bind(BindArgs),
     /// Measure round-trip time on the control stream.
     Ping {
         /// Number of pings (default: 4).

@@ -47,15 +47,19 @@ use tracing::{debug, info, warn};
 
 use crate::{
     config::{Paths, Target},
-    identity::{Baked, ClientIdentity, ClientTrust, TrustDecision, client_identities},
+    identity::{
+        Baked, Caller, Callers, ClientIdentity, ClientTrust, TrustDecision, client_identities,
+    },
     report::{Reporter, TrustPrompt},
-    types::{ConnectionOut, code_name, coded, codes, millis},
+    types::{ConnectionOut, Event, code_name, coded, codes, millis},
 };
 
 /// Per-address TCP connect budget.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Client-side bound on the whole handshake (the server allows 5 s).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long [`Connection::bind`] waits for the server's answer.
+const BIND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Handler for `Open::ForwardedTcp` streams; must answer the `OpenReply`
 /// itself (registered by `client::forward::Forwards`).
@@ -75,6 +79,8 @@ enum TrustError {
     Unknown { key: PublicKey },
     /// Not known and `--strict`.
     Strict { actual: Fingerprint },
+    /// An inbound connection from a server that is not in the callers file.
+    NotACaller { actual: Fingerprint },
 }
 
 impl fmt::Display for TrustError {
@@ -93,6 +99,12 @@ impl fmt::Display for TrustError {
                 write!(f, "server key {} is not known", key.fingerprint())
             }
             Self::Strict { actual } => write!(f, "server key {actual} is not known (--strict)"),
+            Self::NotACaller { actual } => {
+                write!(
+                    f,
+                    "server key {actual} is not a caller (not in the callers file)"
+                )
+            }
         }
     }
 }
@@ -115,6 +127,8 @@ struct Inner {
     last_rtt: Mutex<Option<Duration>>,
     /// `Some(reason)` once the connection is gone.
     closed: watch::Sender<Option<String>>,
+    /// The `bind` request waiting for `Bound`/`Unbound`.
+    bind_waiter: Mutex<Option<oneshot::Sender<Result<String, String>>>>,
     handler: Mutex<Option<ForwardedHandler>>,
     reporter: Arc<dyn Reporter>,
 }
@@ -339,6 +353,69 @@ impl Connection {
         let _ = rx.wait_for(std::option::Option::is_some).await;
     }
 
+    /// Ask the server to bind a listener at `addr` for ordinary clients to
+    /// dial (docs/03-protocol.md §6 "Bind on request"); `idle` closes it
+    /// after that long without an accepted connection (zero: until
+    /// [`Connection::unbind`] or the server exits). Returns the bound
+    /// address; a refusal carries the `denied` code.
+    pub async fn bind(&self, addr: &str, idle: Duration) -> Result<String> {
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut waiter = self
+                .inner
+                .bind_waiter
+                .lock()
+                .map_err(|_| anyhow!("bind table poisoned"))?;
+            if waiter.is_some() {
+                bail!("a bind request is already in flight");
+            }
+            *waiter = Some(tx);
+        }
+        let idle_secs = u32::try_from(idle.as_secs()).unwrap_or(u32::MAX);
+        let sent = self
+            .inner
+            .control
+            .send(ControlMsg::Bind {
+                addr: addr.to_owned(),
+                idle_secs,
+            })
+            .await;
+        if sent.is_err() {
+            self.forget_bind();
+            bail!("connection closed");
+        }
+        match timeout(BIND_TIMEOUT, rx).await {
+            Ok(Ok(Ok(bound))) => Ok(bound),
+            Ok(Ok(Err(reason))) => Err(coded(
+                codes::DENIED,
+                anyhow!("bind {addr}: server refused: {reason}"),
+            )),
+            Ok(Err(_)) => {
+                self.forget_bind();
+                bail!("connection closed")
+            }
+            Err(_) => {
+                self.forget_bind();
+                bail!("bind {addr}: no answer from the server")
+            }
+        }
+    }
+
+    fn forget_bind(&self) {
+        if let Ok(mut w) = self.inner.bind_waiter.lock() {
+            *w = None;
+        }
+    }
+
+    /// Close the listener a [`Connection::bind`] opened.
+    pub async fn unbind(&self) -> Result<()> {
+        self.inner
+            .control
+            .send(ControlMsg::Unbind)
+            .await
+            .map_err(|_| anyhow!("connection closed"))
+    }
+
     /// Graceful close: tell the server, close the mux, wait for the driver.
     pub async fn close(&self) {
         let _ = timeout(
@@ -447,29 +524,132 @@ impl Signer for AgentSigner {
     }
 }
 
+/// Per-connection Noise material for an identity: a key file is the static
+/// itself; an agent key gets a fresh static and proves itself by signature.
+enum Material<'a> {
+    Static(&'a SecretKey),
+    Agent {
+        fresh: SecretKey,
+        public: [u8; 32],
+        signer: AgentSigner,
+    },
+}
+
+impl<'a> Material<'a> {
+    async fn for_identity(identity: &'a ClientIdentity) -> Result<Self> {
+        Ok(match identity {
+            ClientIdentity::Static(id) => Self::Static(&id.secret),
+            ClientIdentity::Agent { socket, key } => Self::Agent {
+                fresh: SecretKey::generate(),
+                public: key.public,
+                signer: AgentSigner::connect(socket, key.clone()).await?,
+            },
+        })
+    }
+
+    fn parts(&mut self) -> (&SecretKey, ClientAuth<'_>) {
+        match self {
+            Self::Static(secret) => (secret, ClientAuth::Static),
+            Self::Agent {
+                fresh,
+                public,
+                signer,
+            } => (
+                fresh,
+                ClientAuth::Ed25519 {
+                    public: *public,
+                    sign: signer,
+                },
+            ),
+        }
+    }
+}
+
+/// Turn an inbound TCP connection from a server in connect-back mode into
+/// a [`Connection`] (docs/02-security.md "Callers"): the client is still
+/// the Noise initiator; the server's key is looked up in `callers` by
+/// fingerprint (its address means nothing), and with `accept_new` an
+/// unknown key is recorded there first. A key that is neither is refused
+/// with `trust_unknown` before our identity is revealed, and reported as
+/// an [`Event::Refused`].
+///
+/// The caller bounds the handshake; this function does not.
+pub async fn accept_connection(
+    stream: TcpStream,
+    identity: &ClientIdentity,
+    callers: &Callers,
+    accept_new: bool,
+    reporter: Arc<dyn Reporter>,
+) -> Result<(Connection, Caller)> {
+    let peer = stream.peer_addr().context("peer address")?;
+    let mut material = Material::for_identity(identity).await?;
+    let (static_key, auth) = material.parts();
+    let mut matched: Option<Caller> = None;
+    let verify = |key: &PublicKey,
+                  _hello: &ServerHello|
+     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(caller) = callers.lookup(key) {
+            matched = Some(caller);
+            return Ok(());
+        }
+        if accept_new {
+            let caller = callers.record(key)?;
+            info!(fingerprint = %key.fingerprint(), path = %callers.path().display(), "accepted new caller");
+            matched = Some(caller);
+            return Ok(());
+        }
+        Err(Box::new(TrustError::NotACaller {
+            actual: key.fingerprint(),
+        }))
+    };
+    let result = client_handshake(stream, static_key, 0, verify, auth).await;
+    let (handshaken, hello) = match result {
+        Ok(done) => done,
+        Err(HandshakeError::Trust(err)) => {
+            let fingerprint = match err.downcast_ref::<TrustError>() {
+                Some(TrustError::NotACaller { actual }) => actual.to_string(),
+                _ => String::new(),
+            };
+            let reason = err.to_string();
+            warn!(peer = %peer, %fingerprint, %reason, "inbound connection refused");
+            reporter.event(&Event::Refused {
+                fingerprint,
+                addr: peer.to_string(),
+                reason: reason.clone(),
+            });
+            return Err(coded(
+                codes::TRUST_UNKNOWN,
+                anyhow!("inbound connection from {peer} refused: {reason}"),
+            ));
+        }
+        Err(HandshakeError::Denied { code, message }) => {
+            return Err(coded(
+                code_name(code),
+                anyhow!("server at {peer} refused our identity: {code}: {message}"),
+            ));
+        }
+        Err(e) => return Err(e).with_context(|| format!("handshake with {peer} failed")),
+    };
+    let caller = matched.ok_or_else(|| anyhow!("handshake completed without a caller match"))?;
+    let conn = establish(
+        Target::accepted(&caller.label()),
+        identity.clone(),
+        handshaken,
+        hello,
+        caller.via.clone(),
+        reporter,
+    )
+    .await?;
+    Ok((conn, caller))
+}
+
 async fn attempt(
     target: &Target,
     identity: &ClientIdentity,
     trust: &ClientTrust,
 ) -> Result<Attempt> {
-    // Per-connection material: a key file is the Noise static itself; an
-    // agent key gets a fresh static and proves itself by signature.
-    let fresh;
-    let mut signer;
-    let (static_key, auth) = match identity {
-        ClientIdentity::Static(id) => (&id.secret, ClientAuth::Static),
-        ClientIdentity::Agent { socket, key } => {
-            signer = AgentSigner::connect(socket, key.clone()).await?;
-            fresh = SecretKey::generate();
-            (
-                &fresh,
-                ClientAuth::Ed25519 {
-                    public: key.public,
-                    sign: &mut signer,
-                },
-            )
-        }
-    };
+    let mut material = Material::for_identity(identity).await?;
+    let (static_key, auth) = material.parts();
     let tcp = dial(&target.host, target.port).await?;
     let mut via = String::new();
     let verify = |key: &PublicKey,
@@ -525,7 +705,7 @@ async fn attempt(
                     codes::TRUST_MISMATCH,
                     mismatch_error(target, &source, line, &expected, &actual),
                 )),
-                other @ TrustError::Strict { .. } => {
+                other @ (TrustError::Strict { .. } | TrustError::NotACaller { .. }) => {
                     Err(coded(codes::TRUST_UNKNOWN, anyhow!("{other}")))
                 }
             },
@@ -624,6 +804,15 @@ pub async fn connect(
     reporter: Arc<dyn Reporter>,
     prompt: &dyn TrustPrompt,
 ) -> Result<Connection> {
+    if target.via_socket_only {
+        return Err(coded(
+            codes::CONNECT_FAILED,
+            anyhow!(
+                "no accepted connection named {} (is `mysh accept` running?)",
+                target.host.trim_start_matches('@')
+            ),
+        ));
+    }
     let identities = client_identities(target, paths, baked, &mut |source| {
         prompt.passphrase(source)
     })
@@ -752,6 +941,7 @@ async fn establish(
         next_nonce: AtomicU64::new(1),
         last_rtt: Mutex::new(None),
         closed,
+        bind_waiter: Mutex::new(None),
         handler: Mutex::new(None),
         reporter,
     });
@@ -825,6 +1015,42 @@ async fn control_reader(conn: Connection, mut rd: ReadHalf<Stream>) {
                 }
             }
             Ok(ControlMsg::Notice(text)) => conn.inner.reporter.notice(&format!("server: {text}")),
+            Ok(ControlMsg::Bound { addr }) => {
+                let waiter = conn
+                    .inner
+                    .bind_waiter
+                    .lock()
+                    .ok()
+                    .and_then(|mut w| w.take());
+                match waiter {
+                    Some(tx) => {
+                        let _ = tx.send(Ok(addr));
+                    }
+                    None => conn
+                        .inner
+                        .reporter
+                        .notice(&format!("server: listener bound at {addr}")),
+                }
+            }
+            Ok(ControlMsg::Unbound { addr, reason }) => {
+                let waiter = conn
+                    .inner
+                    .bind_waiter
+                    .lock()
+                    .ok()
+                    .and_then(|mut w| w.take());
+                match waiter {
+                    Some(tx) => {
+                        let _ = tx.send(Err(reason));
+                    }
+                    None => conn
+                        .inner
+                        .reporter
+                        .notice(&format!("server: listener {addr} closed: {reason}")),
+                }
+            }
+            // Client → server messages; a server never sends them.
+            Ok(ControlMsg::Bind { .. } | ControlMsg::Unbind) => {}
             Ok(ControlMsg::Shutdown { reason }) => {
                 conn.inner
                     .mark_closed(&format!("server shutting down: {reason}"));

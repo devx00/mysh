@@ -49,6 +49,9 @@ pub struct Paths {
     pub authorized_keys: PathBuf,
     /// `config_dir/known_hosts`.
     pub known_hosts: PathBuf,
+    /// `config_dir/callers`: servers allowed to connect back
+    /// (docs/02-security.md "Callers").
+    pub callers: PathBuf,
     /// `config_dir/config.toml`.
     pub config_file: PathBuf,
     /// Prompt history: `$XDG_STATE_HOME/mysh/history` → `~/.local/state/mysh/history`.
@@ -119,6 +122,7 @@ impl Paths {
             host_key: config_dir.join("host_key"),
             authorized_keys: config_dir.join("authorized_keys"),
             known_hosts: config_dir.join("known_hosts"),
+            callers: config_dir.join("callers"),
             config_file: config_dir.join("config.toml"),
             config_dir,
             history,
@@ -600,6 +604,72 @@ pub struct Target {
     pub cwd: Option<String>,
     /// `--master` / `master = …`: background master policy.
     pub master: MasterMode,
+    /// `@NAME`: an accepted connection (docs/05-meta-shell.md "Accepted
+    /// connections"), reachable only through its control socket; the
+    /// client never dials such a target.
+    pub via_socket_only: bool,
+}
+
+impl Target {
+    /// The target an accepted connection is known as: `@NAME` with the
+    /// defaults of a bare `mysh @NAME` call.
+    #[must_use]
+    pub fn accepted(name: &str) -> Self {
+        accepted_target(
+            name,
+            &ConnectOpts::default(),
+            parse_meta_key(DEFAULT_META_KEY).ok().flatten(),
+        )
+    }
+}
+
+/// `NAME` of an `@NAME` host argument (an accepted connection), `None` for
+/// anything else, including a lone `@`.
+#[must_use]
+pub fn accepted_name(host: &str) -> Option<&str> {
+    host.strip_prefix('@').filter(|name| !name.is_empty())
+}
+
+/// `mysh @NAME …`: the flags apply, the config file's `escape` default
+/// applies, nothing else does (there is no host to alias).
+fn resolve_accepted(name: &str, opts: &ConnectOpts, config: &Config) -> Result<Target, String> {
+    let meta_key_text = opts
+        .escape
+        .as_deref()
+        .or(config.defaults.escape.as_deref())
+        .unwrap_or(DEFAULT_META_KEY);
+    Ok(accepted_target(name, opts, parse_meta_key(meta_key_text)?))
+}
+
+/// The [`Target`] of `mysh @NAME …`: no address, no alias, no master.
+fn accepted_target(name: &str, opts: &ConnectOpts, meta_key: Option<u8>) -> Target {
+    let display = format!("@{name}");
+    Target {
+        host: display.clone(),
+        display,
+        port: DEFAULT_PORT,
+        identity: opts.identity.clone(),
+        pin: None,
+        local: Vec::new(),
+        remote: Vec::new(),
+        dynamic: Vec::new(),
+        env: opts.env.iter().map(|s| parse_env_item(s)).collect(),
+        shell: opts.shell,
+        meta_key,
+        accept_new: false,
+        strict: false,
+        quiet: opts.quiet,
+        baked_only: opts.baked_only,
+        force_pty: opts.force_pty,
+        no_pty: opts.no_pty,
+        no_session: opts.no_session,
+        attach: opts.attach,
+        no_ctl: opts.no_ctl,
+        timeout: opts.timeout,
+        cwd: opts.cwd.clone(),
+        master: MasterMode::Never,
+        via_socket_only: true,
+    }
 }
 
 fn parse_env_item(s: &str) -> (String, Option<String>) {
@@ -635,12 +705,17 @@ fn parse_alias_forward(s: &str) -> Result<(char, ForwardSpec), String> {
 /// Merge flags, alias, `[defaults]` and built-ins into a [`Target`].
 ///
 /// Precedence: flags > alias > defaults > built-ins. Port: `-p` >
-/// `HOST:PORT` as typed > alias host port > alias `port` > 7722.
+/// `HOST:PORT` as typed > alias host port > alias `port` > 7722. An
+/// `@NAME` host is an accepted connection and takes none of this: it has
+/// no address and is reached through its control socket.
 pub fn resolve_target(
     host_arg: &str,
     opts: &ConnectOpts,
     config: &Config,
 ) -> Result<Target, String> {
+    if let Some(name) = accepted_name(host_arg) {
+        return resolve_accepted(name, opts, config);
+    }
     let empty = HostAlias::default();
     let (alias, typed) = if let Some(alias) = config.hosts.get(host_arg) {
         (
@@ -740,6 +815,7 @@ pub fn resolve_target(
             .or(alias.master)
             .or(config.defaults.master)
             .unwrap_or_default(),
+        via_socket_only: false,
     })
 }
 
@@ -1222,6 +1298,43 @@ shell = true           # `mysh pi` goes straight to a shell
                 std::option::Option<std::string::String>
             ); 0]
         );
+    }
+
+    #[test]
+    fn resolve_accepted_connections_by_name() {
+        let t = resolve_target("@host-a", &ConnectOpts::default(), &fixture()).expect("resolves");
+        assert_eq!(t.display, "@host-a");
+        assert_eq!(t.host, "@host-a");
+        assert!(t.via_socket_only);
+        assert_eq!(
+            t.master,
+            MasterMode::Never,
+            "an @NAME never spawns a master"
+        );
+        assert!(!t.accept_new && !t.strict && t.pin.is_none());
+        assert_eq!(accepted_name("@host-a"), Some("host-a"));
+        // An alias of the same name does not apply: there is no host.
+        let t = resolve_target("@pi", &ConnectOpts::default(), &fixture()).expect("resolves");
+        assert_eq!(t.host, "@pi");
+        assert_eq!(t.port, DEFAULT_PORT);
+        // Flags still apply.
+        let opts = ConnectOpts {
+            no_session: true,
+            timeout: Some(Duration::from_millis(250)),
+            ..ConnectOpts::default()
+        };
+        let t = resolve_target("@pi", &opts, &Config::default()).expect("resolves");
+        assert!(t.no_session);
+        assert_eq!(t.timeout, Some(Duration::from_millis(250)));
+        // `Target::accepted` agrees with the parsed form.
+        assert_eq!(Target::accepted("host-a").host, "@host-a");
+        assert!(Target::accepted("host-a").via_socket_only);
+        // A lone `@` is an ordinary (if useless) host name, not a target.
+        assert_eq!(accepted_name("@"), None);
+        assert_eq!(accepted_name("pi@host"), None);
+        let t = resolve_target("@", &ConnectOpts::default(), &Config::default())
+            .expect("resolves as a host");
+        assert!(!t.via_socket_only);
     }
 
     #[test]

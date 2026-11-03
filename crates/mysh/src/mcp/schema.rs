@@ -505,8 +505,9 @@ fn server_info() -> Value {
                              "idle_timeout_secs", "handshakes_per_minute", "denied"],
             },
             "uptime_secs": {"type": "integer"},
+            "authorized_keys": {"type": "string", "description": "the authorized_keys file the server reads; `authorize` appends to it"},
         },
-        "required": ["name", "version", "platform", "shell", "home", "user", "caps", "limits", "uptime_secs"],
+        "required": ["name", "version", "platform", "shell", "home", "user", "caps", "limits", "uptime_secs", "authorized_keys"],
     })
 }
 

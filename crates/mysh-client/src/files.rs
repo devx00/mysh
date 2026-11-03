@@ -132,13 +132,34 @@ pub async fn realpath(conn: &Connection, path: &str, cwd: Option<&str>) -> Resul
 }
 
 /// `Mkdir`, ignoring an existing directory (a `Stat` runs first so the
-/// server never has to report "exists").
+/// server never has to report "exists"). `Stat` does not follow symlinks,
+/// so a link is resolved and checked again: a link to a directory is a
+/// directory for mkdir's purposes (`/tmp` on macOS).
 pub async fn mkdir(conn: &Connection, path: &str, mode: u32, cwd: Option<&str>) -> Result<()> {
     match stat(conn, path, cwd).await? {
         Some(Attrs {
             kind: FileKind::Dir,
             ..
         }) => return Ok(()),
+        Some(Attrs {
+            kind: FileKind::Symlink { .. },
+            ..
+        }) => {
+            let is_dir = match realpath(conn, path, cwd).await {
+                Ok(resolved) => matches!(
+                    stat(conn, &resolved, cwd).await?,
+                    Some(Attrs {
+                        kind: FileKind::Dir,
+                        ..
+                    })
+                ),
+                Err(_) => false, // dangling
+            };
+            if is_dir {
+                return Ok(());
+            }
+            bail!("{path}: exists and is not a directory");
+        }
         Some(_) => bail!("{path}: exists and is not a directory"),
         None => {}
     }
@@ -1622,8 +1643,6 @@ pub fn stat_out(path: &str, attrs: &Attrs) -> StatOut {
 // authorize
 // ---------------------------------------------------------------------------
 
-const REMOTE_CONFIG_DIR: &str = "~/.config";
-const REMOTE_MYSH_DIR: &str = "~/.config/mysh";
 const REMOTE_AUTHORIZED_KEYS: &str = "~/.config/mysh/authorized_keys";
 
 /// Second whitespace-separated token of a public key line (the key itself).
@@ -1651,34 +1670,42 @@ fn append_line(existing: &[u8], line: &str) -> Vec<u8> {
     out
 }
 
-/// Append `pubkey_line` to the server's `~/.config/mysh/authorized_keys`
-/// unless the key is already present (the `ssh-copy-id` equivalent).
+/// Append `pubkey_line` to the server's `authorized_keys` unless the key is
+/// already present (the `ssh-copy-id` equivalent). The file is the one the
+/// server reports in `Info` (`--authorized-keys`, else its config dir);
+/// `~/.config/mysh/authorized_keys` for a server without `Info`.
 pub async fn authorize(conn: &Connection, console: &dyn Reporter, pubkey_line: &str) -> Result<()> {
     let line = pubkey_line.trim();
     let key = key_token(line)
         .ok_or_else(|| anyhow!("malformed public key line: expected `TYPE KEY [COMMENT]`"))?;
 
-    mkdir(conn, REMOTE_CONFIG_DIR, DEFAULT_DIR_MODE, None).await?;
-    mkdir(conn, REMOTE_MYSH_DIR, 0o700, None).await?;
+    let target = match conn.info().await? {
+        Some(info) if !info.authorized_keys.is_empty() => info.authorized_keys,
+        _ => REMOTE_AUTHORIZED_KEYS.to_owned(),
+    };
+    // Missing ancestors: the file's own directory is private, the rest
+    // default.
+    let dirs = crate::fileops::prefixes(&target);
+    let dirs = dirs.get(..dirs.len().saturating_sub(1)).unwrap_or_default();
+    for (i, dir) in dirs.iter().enumerate() {
+        let mode = if i + 1 == dirs.len() {
+            0o700
+        } else {
+            DEFAULT_DIR_MODE
+        };
+        mkdir(conn, dir, mode, None).await?;
+    }
 
     let mut existing: Vec<u8> = Vec::new();
     let mut no_progress = |_: u64, _: u64| {};
-    match stat(conn, REMOTE_AUTHORIZED_KEYS, None).await? {
+    match stat(conn, &target, None).await? {
         None => {}
         Some(Attrs {
             kind: FileKind::Dir,
             ..
-        }) => bail!("{REMOTE_AUTHORIZED_KEYS}: is a directory"),
+        }) => bail!("{target}: is a directory"),
         Some(_) => {
-            get_to(
-                conn,
-                REMOTE_AUTHORIZED_KEYS,
-                0,
-                None,
-                &mut existing,
-                &mut no_progress,
-            )
-            .await?;
+            get_to(conn, &target, 0, None, &mut existing, &mut no_progress).await?;
         }
     }
 
@@ -1691,7 +1718,7 @@ pub async fn authorize(conn: &Connection, console: &dyn Reporter, pubkey_line: &
 
     let content = append_line(&existing, line);
     let op = FileOp::Put {
-        path: REMOTE_AUTHORIZED_KEYS.to_owned(),
+        path: target.clone(),
         mode: 0o600,
         mtime: None,
         offset: 0,

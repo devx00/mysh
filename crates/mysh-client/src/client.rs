@@ -79,8 +79,14 @@ pub struct Client {
     conn: Connection,
     forwards: Forwards,
     reporter: Arc<dyn Reporter>,
+    /// How to dial again; `None` for an accepted connection, which the
+    /// server re-establishes on its own schedule.
+    dial: Option<Dial>,
+}
+
+/// What [`Client::reconnect`] needs to open the same connection again.
+struct Dial {
     prompt: Arc<dyn TrustPrompt>,
-    target: Target,
     paths: Paths,
     baked: Baked,
 }
@@ -88,8 +94,9 @@ pub struct Client {
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
-            .field("target", &self.target.display)
+            .field("target", &self.conn.target().display)
             .field("closed", &self.conn.is_closed())
+            .field("accepted", &self.dial.is_none())
             .finish_non_exhaustive()
     }
 }
@@ -111,11 +118,27 @@ impl Client {
             conn,
             forwards,
             reporter,
-            prompt,
-            target: target.clone(),
-            paths: paths.clone(),
-            baked: baked.clone(),
+            dial: Some(Dial {
+                prompt,
+                paths: paths.clone(),
+                baked: baked.clone(),
+            }),
         })
+    }
+
+    /// A client on a connection that already exists: one accepted from a
+    /// server in connect-back mode ([`crate::accept::Acceptor`] builds
+    /// these). Such a client cannot [`Client::reconnect`]; when the
+    /// connection ends, the next one arrives when the server dials again.
+    #[must_use]
+    pub fn from_connection(conn: Connection, reporter: Arc<dyn Reporter>) -> Self {
+        let forwards = Forwards::new(conn.clone(), Arc::clone(&reporter));
+        Self {
+            conn,
+            forwards,
+            reporter,
+            dial: None,
+        }
     }
 
     /// [`Client::connect`] after honouring `target.master`
@@ -157,13 +180,26 @@ impl Client {
 
     /// Open a fresh connection to the same target after the old one was
     /// lost. Forwards do not survive: the new [`Client::forwards`] is empty.
+    /// A client built by [`Client::from_connection`] fails with
+    /// `connect_failed`: an accepted connection is only re-established by
+    /// the server.
     pub async fn reconnect(&mut self) -> Result<()> {
+        let Some(dial) = &self.dial else {
+            return Err(coded(
+                codes::CONNECT_FAILED,
+                anyhow::anyhow!(
+                    "{} is an accepted connection; the server re-establishes it on its own schedule",
+                    self.conn.target().display
+                ),
+            )
+            .into());
+        };
         let conn = connect(
-            &self.target,
-            &self.paths,
-            &self.baked,
+            self.conn.target(),
+            &dial.paths,
+            &dial.baked,
             Arc::clone(&self.reporter),
-            self.prompt.as_ref(),
+            dial.prompt.as_ref(),
         )
         .await?;
         self.forwards = Forwards::new(conn.clone(), Arc::clone(&self.reporter));
