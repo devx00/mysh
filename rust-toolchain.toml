@@ -3,12 +3,21 @@
 # together with `rust-version` in Cargo.toml.
 channel = "1.99.1"
 components = ["rustfmt", "clippy"]
-# Every platform in the support matrix. `cargo check --target <t>` works for
-# all of these without a cross linker; see docs/01-architecture.md for linking.
+# Every required release target (the `required` rows of scripts/release.sh),
+# sorted. `cargo check-matrix` type-checks them without a cross linker; see
+# docs/01-architecture.md "Build" for linking.
 targets = [
   "aarch64-apple-darwin",
-  "x86_64-apple-darwin",
-  "aarch64-unknown-linux-musl",
-  "x86_64-unknown-linux-musl",
   "aarch64-linux-android",
+  "aarch64-unknown-freebsd",
+  "aarch64-unknown-linux-musl",
+  "arm-unknown-linux-musleabihf",
+  "armv7-linux-androideabi",
+  "armv7-unknown-linux-musleabihf",
+  "i686-unknown-linux-musl",
+  "riscv64gc-unknown-linux-musl",
+  "x86_64-apple-darwin",
+  "x86_64-linux-android",
+  "x86_64-unknown-freebsd",
+  "x86_64-unknown-linux-musl",
 ]

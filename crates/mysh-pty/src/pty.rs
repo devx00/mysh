@@ -74,7 +74,7 @@ pub fn open_pty(size: WinSize) -> io::Result<(PtyMaster, PtySlave)> {
     let master = rustix::pty::openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
     rustix::pty::grantpt(&master)?;
     rustix::pty::unlockpt(&master)?;
-    let name = rustix::pty::ptsname(&master, Vec::new())?;
+    let name = slave_name(&master)?;
     let slave = rustix::fs::open(
         name.as_c_str(),
         OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
@@ -90,6 +90,37 @@ pub fn open_pty(size: WinSize) -> io::Result<(PtyMaster, PtySlave)> {
     let master = PtyMaster(master);
     master.resize(size)?;
     Ok((master, PtySlave(slave)))
+}
+
+/// Path of the slave side of `master`.
+///
+/// rustix has no `ptsname` for NetBSD, so that target calls libc's
+/// reentrant `ptsname_r` instead; everywhere else rustix's wrapper is used.
+#[cfg(not(target_os = "netbsd"))]
+fn slave_name(master: &OwnedFd) -> io::Result<std::ffi::CString> {
+    Ok(rustix::pty::ptsname(master, Vec::new())?)
+}
+
+/// NetBSD: `ptsname_r(3)` into a `PATH_MAX` buffer (compiled only on NetBSD;
+/// statically inspected, not run — see `docs/04-sessions.md`).
+#[cfg(target_os = "netbsd")]
+fn slave_name(master: &OwnedFd) -> io::Result<std::ffi::CString> {
+    use std::ffi::{CStr, c_char};
+
+    let mut buf = vec![0 as c_char; libc::PATH_MAX as usize];
+    // SAFETY: `buf` is a writable buffer of exactly `buf.len()` bytes and
+    // `master` is an open fd owned by the caller.
+    let rc = unsafe { libc::ptsname_r(master.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    if let Some(last) = buf.last_mut() {
+        *last = 0;
+    }
+    // SAFETY: `rc == 0` means `ptsname_r` wrote a NUL-terminated string into
+    // `buf`, and the last byte was forced to NUL above.
+    let name = unsafe { CStr::from_ptr(buf.as_ptr()) };
+    Ok(name.to_owned())
 }
 
 /// `tcgetpgrp` errors (ENOTTY, no foreground group) are not actionable for

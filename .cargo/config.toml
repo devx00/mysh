@@ -2,8 +2,11 @@
 # exercises it separately with throwaway inputs.
 [alias]
 lint = "clippy --workspace --all-targets -- -D warnings"
-# Type-check every supported target without needing cross linkers installed.
-check-matrix = "check --workspace --target aarch64-apple-darwin --target x86_64-apple-darwin --target aarch64-unknown-linux-musl --target x86_64-unknown-linux-musl --target aarch64-linux-android"
+# Type-check every required release target without cross linkers. The target
+# list mirrors the table in scripts/release.sh.
+check-matrix = "check --workspace --target aarch64-apple-darwin --target x86_64-apple-darwin --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl --target i686-unknown-linux-musl --target armv7-unknown-linux-musleabihf --target arm-unknown-linux-musleabihf --target riscv64gc-unknown-linux-musl --target x86_64-unknown-freebsd --target aarch64-unknown-freebsd --target aarch64-linux-android --target armv7-linux-androideabi --target x86_64-linux-android"
+# Stretch targets that ship `std` (needs `rustup target add` for each).
+check-matrix-stretch = "check --workspace --target powerpc64le-unknown-linux-musl --target loongarch64-unknown-linux-musl --target s390x-unknown-linux-gnu --target i686-linux-android"
 
-# Android linking is intentionally not configured here: use `cargo ndk` or
-# `cross`, which supply the NDK toolchain. See docs/01-architecture.md.
+# Linking is not configured here: scripts/release.sh picks the linker per
+# target family (zig, NDK clang, host clang). See docs/01-architecture.md.

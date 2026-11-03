@@ -184,38 +184,62 @@ ssh, not reimplementing it), `crossterm` (too much for raw mode + winsize),
 
 ## Platform matrix
 
-|                 | Linux                              | macOS                          | Android                                                |
-| --------------- | ---------------------------------- | ------------------------------ | ------------------------------------------------------ |
-| client          | yes                                | yes                            | Termux                                                 |
-| server          | yes                                | yes                            | Termux, `adb shell` (shell uid), rooted                |
-| targets         | `{x86_64,aarch64}-unknown-linux-musl` (static) | `{aarch64,x86_64}-apple-darwin` | `aarch64-linux-android` (+`armv7`, `x86_64` for emulators) |
-| pty open        | `posix_openpt`/`/dev/ptmx`         | same                           | same (bionic); needs `devpts`, present in Termux/adb   |
-| cwd probe       | `/proc/<pid>/cwd`                  | `proc_pidinfo(PROC_PIDVNODEPATHINFO)` | `/proc/<pid>/cwd` (may be denied cross-uid; same uid is fine) |
-| shell detection | `--shell` → `$SHELL` → passwd → `/bin/sh` | same                   | `--shell` → `$SHELL` → `/system/bin/sh`                |
-| home            | `$HOME` → passwd → `/`             | same                           | `$HOME` → `/data/local/tmp` → `/`                      |
-| config dir      | `$XDG_CONFIG_HOME/mysh` → `~/.config/mysh` | `~/.config/mysh` (not `~/Library`, keep one path) | `~/.config/mysh` under Termux `$HOME`    |
-| run as service  | systemd unit (`contrib/`)          | launchd plist (`contrib/`)     | Termux:Boot script; or `adb shell nohup ... &`         |
-| notes           | `getpwuid` via libc                | SIP irrelevant; no sandbox     | PIE required (Rust default); no `getpwnam` data; SELinux may block `/proc` of other uids |
+|                 | Linux                              | macOS                          | Android                                                | FreeBSD (cross-compiled only) |
+| --------------- | ---------------------------------- | ------------------------------ | ------------------------------------------------------ | ----------------------------- |
+| client          | yes                                | yes                            | Termux                                                 | yes (static inspection only, no BSD runtime in CI) |
+| server          | yes                                | yes                            | Termux, `adb shell` (shell uid), rooted                | yes (same caveat)             |
+| targets         | musl, static: `x86_64`, `aarch64`, `i686`, `armv7` (eabihf), `arm` (v6 eabihf), `riscv64gc`; stretch `powerpc64le`, `loongarch64` (musl), `s390x` (gnu) | `aarch64`, `x86_64` + `universal` (`lipo`) | `aarch64`, `armv7`, `x86_64` (API 24); stretch `i686` | `{x86_64,aarch64}-unknown-freebsd` |
+| pty open        | `posix_openpt`/`/dev/ptmx`         | same                           | same (bionic); needs `devpts`, present in Termux/adb   | same (`pts(4)`; rustix `ptsname` works; NetBSD uses `libc::ptsname_r` behind cfg) |
+| cwd probe       | `/proc/<pid>/cwd`                  | `proc_pidinfo(PROC_PIDVNODEPATHINFO)` | `/proc/<pid>/cwd` (may be denied cross-uid; same uid is fine) | `sysctl(kern.proc.cwd.<pid>)` → one `kinfo_file`, `kf_path` |
+| shell detection | `--shell` → `$SHELL` → passwd → `/bin/sh` | same                   | `--shell` → `$SHELL` → `/system/bin/sh`                | same as Linux                 |
+| home            | `$HOME` → passwd → `/`             | same                           | `$HOME` → `/data/local/tmp` → `/`                      | same as Linux                 |
+| config dir      | `$XDG_CONFIG_HOME/mysh` → `~/.config/mysh` | `~/.config/mysh` (not `~/Library`, keep one path) | `~/.config/mysh` under Termux `$HOME`    | `~/.config/mysh`              |
+| run as service  | systemd unit (`contrib/`)          | launchd plist (`contrib/`)     | Termux:Boot script; or `adb shell nohup ... &`         | `rc.d` script (not shipped)   |
+| notes           | `getpwuid` via libc                | SIP irrelevant; no sandbox     | PIE required (Rust default); no `getpwnam` data; SELinux may block `/proc` of other uids | default `PATH` adds `/usr/local/sbin:/usr/sbin:/sbin`; linked dynamically against base libc via `cargo zigbuild`; NetBSD is a stretch target (`/usr/pkg` on `PATH`) |
 
 ## Build
 
 ```sh
 cargo build --release                                    # native
-cargo build --release --target aarch64-unknown-linux-musl   # static linux (needs a musl linker)
-scripts/android-build.sh [TARGET] [API]                  # android: NDK clang as linker (ANDROID_NDK_HOME or the Homebrew cask)
+scripts/release.sh [--stretch] [TARGET...]               # the release matrix into dist/ (+ SHA256SUMS)
+scripts/validate-dist.sh [VERSION]                       # run every Linux artifact under docker + qemu-user
+scripts/android-build.sh [TARGET] [API]                  # one android target: NDK clang as linker
 MYSH_BAKED_IDENTITY=fleet.secret MYSH_BAKED_PEERS=fleet.pub \
   cargo build --release --features baked                 # baked
-cargo check-matrix                                       # type-check every target, no linkers needed
+cargo check-matrix                                       # type-check every required target, no linkers needed
+cargo check-matrix-stretch                               # the stretch targets that ship std
 cargo lint                                               # clippy -D warnings
 scripts/lima-test.sh                                     # full test suite on Linux in a lima VM (scripts/lima.yaml)
 ```
 
-There are no C dependencies, so Android needs only the NDK's clang as the
-linker; `cross` is not used because its images are x86_64-only and would
-need emulation on Apple silicon.
+There are no C dependencies, so every target needs only a *linker*;
+`scripts/release.sh` holds the single target table (target, family, tier,
+required/stretch) and picks the linker by family:
 
-Release artifacts are the five `mysh` binaries above, built by a release
-workflow (06-roadmap.md M4). Android binaries are pushed with
+| family                 | linker                                                   | note                                                                    |
+| ---------------------- | -------------------------------------------------------- | ----------------------------------------------------------------------- |
+| darwin                 | host clang (`cargo build`)                               | both archs, then `lipo -create` → `mysh-<v>-universal-apple-darwin`     |
+| linux-musl, linux-gnu  | zig (`cargo zigbuild`)                                   | `brew install zig && cargo install cargo-zigbuild`; musl output is static |
+| freebsd                | zig (`cargo zigbuild`)                                   | dynamic against FreeBSD libc; zig's `-nostartfiles` warning on 32-bit ARM musl is harmless |
+| android                | NDK clang, API 24 (`scripts/android-build.sh`)           | `ANDROID_NDK_HOME` or the Homebrew cask; `armv7a-` clang name mapping   |
+
+`MUSL_LINKER_AARCH64`/`MUSL_LINKER_X86_64` name a musl cross gcc instead of
+zig for those two targets. `cross` is not used: its images are x86_64-only
+and would need emulation on Apple silicon, while zig links every target
+from any host. The required set is 13 targets plus the universal binary;
+`--stretch` (or `MYSH_STRETCH=1`) adds the stretch rows.
+
+`scripts/validate-dist.sh` runs each Linux artifact in `dist/` under
+`docker run --platform <p>` (qemu-user via binfmt, `alpine:3.20` for musl,
+`debian:bookworm-slim` for glibc): `--version`, `keygen`, a loopback
+`serve` and an `exec` round trip, reporting `PASS`/`FAIL` per target and
+`SKIP` for darwin, FreeBSD and Android, which have no emulator here.
+FreeBSD binaries are cross-compiled and statically inspected only.
+
+The release workflow runs the same script per runner: macOS for darwin and
+the universal binary, ubuntu + zig for linux-musl/freebsd, ubuntu + the
+preinstalled NDK for android; a final job merges the artifacts, writes
+`SHA256SUMS` and uploads. Android binaries are pushed with
 `adb push target/aarch64-linux-android/release/mysh /data/local/tmp/`.
 
 ## Repository conventions

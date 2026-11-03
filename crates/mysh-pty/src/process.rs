@@ -11,9 +11,38 @@ use rustix::process::Pid;
 /// Current working directory of `pid`.
 ///
 /// Linux/Android: `readlink("/proc/<pid>/cwd")` (may be denied across uids
-/// under `SELinux`). macOS: `proc_pidinfo(PROC_PIDVNODEPATHINFO)`.
+/// under `SELinux`). macOS: `proc_pidinfo(PROC_PIDVNODEPATHINFO)`. FreeBSD:
+/// `sysctl(kern.proc.cwd.<pid>)` returning one `kinfo_file`.
 pub fn process_cwd(pid: u32) -> io::Result<PathBuf> {
     imp::process_cwd(pid)
+}
+
+/// Byte offset of `kf_path` inside FreeBSD's `struct kinfo_file`
+/// (`sys/user.h`): `kf_structsize..kf_flags` (5 × `int`) + pad + `kf_offset`
+/// (`i64`) + the 304-byte union + `kf_status`/pad/spare (8) +
+/// `kf_cap_rights` (`cap_rights_t`, 2 × `u64`) + `_kf_cap_spare` (`u64`).
+/// Identical on every FreeBSD architecture (all fields are fixed-width);
+/// asserted against libc's layout under `cfg(target_os = "freebsd")` below.
+#[cfg(any(test, target_os = "freebsd"))]
+const KF_PATH_OFFSET: usize = 5 * 4 + 4 + 8 + 304 + 8 + 16 + 8;
+
+/// Extract the cwd from the bytes `sysctl(KERN_PROC_CWD)` filled in: a
+/// single `kinfo_file` whose `kf_structsize` (first `int`, native endian)
+/// bounds the record and whose `kf_path` is a NUL-terminated string.
+/// `None` for a short/empty reply or an empty path.
+#[cfg(any(test, target_os = "freebsd"))]
+fn cwd_from_kinfo(buf: &[u8]) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let size = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?);
+    let size = usize::try_from(size).ok()?;
+    if size <= KF_PATH_OFFSET || size > buf.len() {
+        return None;
+    }
+    let path = &buf[KF_PATH_OFFSET..size];
+    let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    (end > 0).then(|| PathBuf::from(OsStr::from_bytes(&path[..end])))
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -79,7 +108,54 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+#[cfg(target_os = "freebsd")]
+mod imp {
+    use std::ffi::{c_int, c_void};
+    use std::io;
+    use std::mem::offset_of;
+    use std::path::PathBuf;
+
+    const _: () = assert!(
+        offset_of!(libc::kinfo_file, kf_path) == super::KF_PATH_OFFSET,
+        "kinfo_file layout differs from KF_PATH_OFFSET"
+    );
+
+    pub(super) fn process_cwd(pid: u32) -> io::Result<PathBuf> {
+        let pid = c_int::try_from(pid)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid out of range"))?;
+        let mib: [c_int; 4] = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_CWD, pid];
+        // The reply is exactly one `kinfo_file`; it is a plain-old-data
+        // struct, so a zeroed byte buffer of its size is a valid target.
+        let mut buf = vec![0u8; size_of::<libc::kinfo_file>()];
+        let mut len = buf.len();
+        // SAFETY: `mib` is a valid array of 4 ints, `buf` is a
+        // writable buffer of `len` bytes and `len` is a valid in/out pointer;
+        // no new value is passed (null/0).
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_ptr(),
+                4,
+                buf.as_mut_ptr().cast::<c_void>(),
+                &raw mut len,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        buf.truncate(len);
+        super::cwd_from_kinfo(&buf)
+            .ok_or_else(|| io::Error::other("kern.proc.cwd returned no usable path"))
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd"
+)))]
 mod imp {
     use std::io;
     use std::path::PathBuf;
@@ -262,6 +338,13 @@ pub fn user_name() -> String {
 pub fn default_path() -> &'static str {
     if cfg!(target_os = "android") {
         "/system/bin:/system/xbin"
+    } else if cfg!(target_os = "freebsd") {
+        // Ports live under `/usr/local`; sbin dirs are included because BSD
+        // base tools (`ifconfig`, `sysctl`) live there and are not root-only.
+        "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+    } else if cfg!(target_os = "netbsd") {
+        // pkgsrc lives under `/usr/pkg`.
+        "/usr/pkg/bin:/usr/local/bin:/usr/bin:/bin:/usr/pkg/sbin:/usr/sbin:/sbin"
     } else {
         "/usr/local/bin:/usr/bin:/bin"
     }
@@ -284,6 +367,49 @@ mod tests {
     #[test]
     fn cwd_of_bogus_pid_errors() {
         assert!(process_cwd(u32::MAX).is_err());
+    }
+
+    /// Build a synthetic `kinfo_file` reply: `kf_structsize` then the path
+    /// at `KF_PATH_OFFSET`, padded to `total` bytes.
+    fn kinfo(structsize: i32, path: &[u8], total: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; total];
+        buf[..4].copy_from_slice(&structsize.to_ne_bytes());
+        buf[KF_PATH_OFFSET..KF_PATH_OFFSET + path.len()].copy_from_slice(path);
+        buf
+    }
+
+    #[test]
+    fn kinfo_path_is_extracted_up_to_nul() {
+        let total = KF_PATH_OFFSET + 1024;
+        let size = i32::try_from(total).expect("fits");
+        let buf = kinfo(size, b"/usr/home/me\0junk", total);
+        assert_eq!(cwd_from_kinfo(&buf), Some(PathBuf::from("/usr/home/me")));
+        // Unterminated path runs to `kf_structsize`.
+        let short = kinfo(
+            i32::try_from(KF_PATH_OFFSET + 2).expect("fits"),
+            b"/x",
+            total,
+        );
+        assert_eq!(cwd_from_kinfo(&short), Some(PathBuf::from("/x")));
+    }
+
+    #[test]
+    fn kinfo_rejects_short_empty_or_oversized_replies() {
+        let total = KF_PATH_OFFSET + 64;
+        let size = i32::try_from(total).expect("fits");
+        assert_eq!(cwd_from_kinfo(&[]), None);
+        assert_eq!(cwd_from_kinfo(&[1, 0]), None);
+        assert_eq!(cwd_from_kinfo(&kinfo(size, b"", total)), None);
+        assert_eq!(
+            cwd_from_kinfo(&kinfo(
+                i32::try_from(KF_PATH_OFFSET).expect("fits"),
+                b"/",
+                total
+            )),
+            None
+        );
+        assert_eq!(cwd_from_kinfo(&kinfo(size + 1, b"/", total)), None);
+        assert_eq!(cwd_from_kinfo(&kinfo(-1, b"/", total)), None);
     }
 
     #[test]

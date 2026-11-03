@@ -4,8 +4,10 @@
 #
 #   ANDROID_NDK_HOME=/path/to/ndk scripts/android-build.sh [TARGET] [API]
 #
-# TARGET defaults to aarch64-linux-android, API to 24. Falls back to the
-# Homebrew cask location when ANDROID_NDK_HOME is unset.
+# TARGET is one of aarch64-linux-android, armv7-linux-androideabi,
+# x86_64-linux-android or i686-linux-android (default aarch64), API 24.
+# Falls back to the Homebrew cask location when ANDROID_NDK_HOME is unset.
+# scripts/release.sh calls this for every android row of its target table.
 set -euo pipefail
 
 target="${1:-aarch64-linux-android}"

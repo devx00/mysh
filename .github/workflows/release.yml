@@ -1,8 +1,13 @@
 name: release
 
-# Builds the five release binaries on a tag push and attaches them, with
+# Builds the release matrix on a tag push and attaches the binaries, with
 # SHA256SUMS and the contrib/ files, to a GitHub release. Locally the same
-# set is produced by scripts/release.sh.
+# set is produced by scripts/release.sh; every job here calls that script so
+# target naming and linker selection live in one place.
+#
+#   darwin   macOS runner, host clang, `lipo` universal binary
+#   zig      ubuntu runner, zig + cargo-zigbuild for linux-musl and freebsd
+#   android  ubuntu runner, the preinstalled NDK (ANDROID_NDK_LATEST_HOME)
 
 on:
   push:
@@ -16,25 +21,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  darwin:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: darwin
+      - run: scripts/release.sh aarch64-apple-darwin x86_64-apple-darwin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mysh-darwin
+          path: dist/mysh-*
+
+  zig:
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            cross: true
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            cross: true
-          - target: aarch64-linux-android
-            os: ubuntu-latest
-            android: true
-    runs-on: ${{ matrix.os }}
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - i686-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - arm-unknown-linux-musleabihf
+          - riscv64gc-unknown-linux-musl
+          - x86_64-unknown-freebsd
+          - aarch64-unknown-freebsd
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -43,32 +59,43 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --locked
-      - name: Build (cross)
-        if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }} -p mysh
-      - name: Build (android)
-        if: matrix.android
-        run: scripts/android-build.sh ${{ matrix.target }} 24
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
-      - name: Build (native)
-        if: ${{ !matrix.cross && !matrix.android }}
-        run: cargo build --release --target ${{ matrix.target }} -p mysh
-      - name: Package
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/mysh dist/mysh-$version-${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0 # verified locally with cargo-zigbuild 0.24
+      - run: cargo install cargo-zigbuild --locked
+      - run: scripts/release.sh ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
           name: mysh-${{ matrix.target }}
-          path: dist/*
+          path: dist/mysh-*
+
+  android:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-linux-android
+          - armv7-linux-androideabi
+          - x86_64-linux-android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: scripts/release.sh ${{ matrix.target }}
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mysh-${{ matrix.target }}
+          path: dist/mysh-*
 
   release:
-    needs: build
+    needs: [darwin, zig, android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,7 +104,7 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Checksums
-        run: cd dist && shasum -a 256 mysh-* > SHA256SUMS && cat SHA256SUMS
+        run: cd dist && sha256sum mysh-* > SHA256SUMS && cat SHA256SUMS
       - name: Bundle contrib
         run: tar -C contrib -czf dist/mysh-contrib.tar.gz .
       - uses: softprops/action-gh-release@v2

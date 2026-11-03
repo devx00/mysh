@@ -140,6 +140,20 @@ server.
 - **Release** (M4): `scripts/release.sh` links all five targets and writes
   `SHA256SUMS`; `.github/workflows/release.yml` does the same on tags;
   `contrib/` has a systemd unit, a launchd plist and a Termux:Boot script.
+- **Build matrix** (M11, in progress): `scripts/release.sh` builds the
+  required set from one target table — Linux musl `x86_64`, `aarch64`,
+  `i686`, `armv7`, `arm` (v6), `riscv64gc` (static, via zig /
+  `cargo zigbuild`), FreeBSD `x86_64`, `aarch64` (zig), Android `aarch64`,
+  `armv7`, `x86_64` (NDK clang, API 24), macOS `aarch64`, `x86_64` and a
+  `lipo` universal binary — 14 artifacts plus a verified `SHA256SUMS` and a
+  summary table; `--stretch` adds `powerpc64le`/`loongarch64` musl,
+  `s390x` gnu and `i686` android. `scripts/validate-dist.sh` runs every
+  Linux artifact under docker + qemu-user with a keygen and loopback
+  serve/exec round trip (`PASS`/`FAIL`/`SKIP` per target). `cargo
+  check-matrix` / `check-matrix-stretch`, `rust-toolchain.toml` and the CI
+  `cross-check` matrix list the same targets; the release workflow builds
+  darwin on macOS, musl/FreeBSD with zig and Android with the NDK on
+  ubuntu (docs/01 "Build", "Platform matrix").
 - **Verification**: 441 tests (unit plus integration against an in-process
   loopback server, including real-pty interactive, persistence,
   control-socket, JSON, session-API, fleet, audit, pairing, library-API and
