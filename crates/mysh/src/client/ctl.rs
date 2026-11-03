@@ -24,7 +24,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use mysh_net::framing::{read_msg, write_msg};
 use tokio::{
-    io::AsyncReadExt as _,
+    io::{AsyncRead, AsyncReadExt as _},
     net::{UnixListener, UnixStream},
     task::JoinHandle,
 };
@@ -411,16 +411,40 @@ async fn reply_error(stream: &mut UnixStream, msg: &str) -> std::io::Result<()> 
 // Requesting side (CLI subcommands); the request itself is
 // `mysh_client::ctl::request`.
 
+/// Bytes a control-socket probe consumed from stdin before deciding the
+/// input was too large to carry; handed back by [`stdin`] so the fallback
+/// connection still sees every byte.
+static STDIN_PREFIX: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
 /// Standard input for a control request: at most [`CTL_STDIN_MAX`] bytes
 /// read from this process's stdin. `None` means "too much to carry", and
-/// the caller should open its own connection instead.
+/// the caller should open its own connection instead and read [`stdin`],
+/// which replays what was consumed here.
 pub async fn read_ctl_stdin() -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     let mut reader = tokio::io::stdin().take(CTL_STDIN_MAX as u64 + 1);
     if reader.read_to_end(&mut buf).await.is_err() {
         return Some(Vec::new());
     }
-    (buf.len() <= CTL_STDIN_MAX).then_some(buf)
+    if buf.len() <= CTL_STDIN_MAX {
+        return Some(buf);
+    }
+    *STDIN_PREFIX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = buf;
+    None
+}
+
+/// This process's standard input, prefixed by anything a control-socket
+/// probe already consumed. Every direct-connection reader of stdin must use
+/// this instead of `tokio::io::stdin()`.
+pub fn stdin() -> impl AsyncRead + Send + Unpin {
+    let prefix = std::mem::take(
+        &mut *STDIN_PREFIX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    std::io::Cursor::new(prefix).chain(tokio::io::stdin())
 }
 
 #[cfg(test)]

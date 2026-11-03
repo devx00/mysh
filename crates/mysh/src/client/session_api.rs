@@ -25,7 +25,7 @@ pub async fn run(
     let mut own = Vec::new();
     let stdin = match (&args.cmd, stdin) {
         (SessionCmd::Send(send), None) if send.stdin => {
-            tokio::io::stdin()
+            crate::client::ctl::stdin()
                 .read_to_end(&mut own)
                 .await
                 .context("reading stdin")?;

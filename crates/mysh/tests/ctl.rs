@@ -500,3 +500,90 @@ async fn parallel_recursive_transfers_are_byte_identical() {
     conn.close().await;
     server.stop().await;
 }
+
+/// `put -` / `write` / `CMD` with more stdin than a control request may
+/// carry fall back to a connection of their own; the bytes the socket probe
+/// already consumed must not be lost (regression: the first 64 KiB vanished).
+#[tokio::test]
+async fn large_stdin_survives_the_control_socket_fallback() {
+    let server = common::start_server(common::ServerOpts {
+        shell: Some(PathBuf::from("/bin/sh")),
+        ..common::ServerOpts::default()
+    })
+    .await;
+    let run = TempDir::short("ctls");
+    let env = env_with_runtime(&server, run.path());
+    let lcwd = server.dir.join("lcwd");
+    std::fs::create_dir_all(&lcwd).expect("lcwd");
+    let payload = random_bytes(300_000, 11); // > CTL_STDIN_MAX (64 KiB)
+
+    let mut m = Driver::spawn(&server, &env, lcwd.clone());
+    m.wait_prompt(&server).await;
+
+    for (sub, post, dest) in [
+        ("put", vec!["-", "~/piped"], "piped"),
+        ("write", vec!["~/written"], "written"),
+    ] {
+        let mut cmd = tokio::process::Command::new(common::mysh_bin());
+        cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+        cmd.current_dir(&lcwd);
+        cmd.arg(sub)
+            .arg("--accept-new")
+            .arg(server.host_arg())
+            .args(&post);
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn cli");
+        let mut stdin = child.stdin.take().expect("stdin");
+        let bytes = payload.clone();
+        let feeder = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            stdin.write_all(&bytes).await.expect("feed stdin");
+            stdin.shutdown().await.expect("close stdin");
+        });
+        let out = tokio::time::timeout(WAIT, child.wait_with_output())
+            .await
+            .expect("cli timed out")
+            .expect("cli");
+        feeder.await.expect("feeder");
+        assert!(
+            out.status.success(),
+            "{sub} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read(server.home.join(dest)).expect("landed"),
+            payload,
+            "{sub}: remote bytes differ from what was piped in"
+        );
+    }
+
+    // Same for a remote command's stdin.
+    let mut cmd = tokio::process::Command::new(common::mysh_bin());
+    cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+    cmd.current_dir(&lcwd);
+    cmd.arg("--accept-new").arg(server.host_arg()).arg("wc -c");
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn cli");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let bytes = payload.clone();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt as _;
+        let _ = stdin.write_all(&bytes).await;
+        let _ = stdin.shutdown().await;
+    });
+    let out = tokio::time::timeout(WAIT, child.wait_with_output())
+        .await
+        .expect("cli timed out")
+        .expect("cli");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        payload.len().to_string(),
+        "wc -c over the fallback: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    m.send("disconnect\r").await;
+}

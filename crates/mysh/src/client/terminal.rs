@@ -196,7 +196,7 @@ async fn recv_signal(signal: Option<&mut Signal>) -> Option<()> {
 }
 
 async fn stdin_reader(tx: mpsc::Sender<Vec<u8>>) {
-    let mut stdin = tokio::io::stdin();
+    let mut stdin = crate::client::ctl::stdin();
     let mut buf = vec![0u8; CHUNK];
     loop {
         match stdin.read(&mut buf).await {

@@ -13,7 +13,7 @@ use mysh_net::keys::{
     parse_secret_key, write_public_key, write_secret_key,
 };
 use mysh_net::trust::AuthorizedKeys;
-use tracing::info;
+use tracing::{info, warn};
 
 pub use mysh_client::identity::*;
 
@@ -142,12 +142,18 @@ impl TrustSource {
         };
         let set = source.load();
         if set.is_empty() {
-            bail!(
-                "no authorized client keys (checked baked peers, --authorized-key, {}); refusing to start",
-                source.describe_files()
-            );
+            // Fail closed, except when the operator asked for a pairing
+            // window: pairing is exactly how the first key gets installed.
+            if args.pair.is_none() {
+                bail!(
+                    "no authorized client keys (checked baked peers, --authorized-key, {}); refusing to start (use --pair to install the first key)",
+                    source.describe_files()
+                );
+            }
+            warn!("no authorized client keys yet; only pairing will be accepted");
+        } else {
+            info!(keys = set.len(), "authorized client keys loaded");
         }
-        info!(keys = set.len(), "authorized client keys loaded");
         Ok(source)
     }
 
@@ -344,6 +350,13 @@ mod tests {
             ..ServeArgs::default()
         };
         assert!(TrustSource::for_server(&args, &paths, &Baked::default()).is_err());
+        // A pairing window is how the first key gets installed: allowed empty.
+        let pairing = ServeArgs {
+            pair: Some(None),
+            ..args.clone()
+        };
+        let source = TrustSource::for_server(&pairing, &paths, &Baked::default()).expect("pair");
+        assert!(source.load().is_empty());
         let args = ServeArgs {
             authorized_key: vec![key().to_line(None).trim().to_owned()],
             ..args

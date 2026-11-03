@@ -119,7 +119,7 @@ async fn dispatch(
     let local_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let code = match cmd {
         ClientCommand::Put(args) => {
-            let mut stdin = tokio::io::stdin();
+            let mut stdin = crate::client::ctl::stdin();
             one_shot(
                 console,
                 target.timeout,
@@ -139,7 +139,7 @@ async fn dispatch(
                 // `tail -f` ends on its own deadline (clean exit, not 124).
                 tail.timeout = tail.timeout.or(target.timeout);
             }
-            let mut stdin = tokio::io::stdin();
+            let mut stdin = crate::client::ctl::stdin();
             let fut = fileops::run(
                 conn,
                 Arc::new(console.clone()),

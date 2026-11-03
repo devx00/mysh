@@ -1371,7 +1371,7 @@ async fn handle_cmd(ctx: &mut Ctx, cmd: MetaCommand, term: &mut Terminal) -> Flo
 /// a job; at end of input the script waits for running jobs and fails if
 /// one of them did.
 pub async fn run_script(ctx: &mut Ctx) -> Result<i32> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut lines = BufReader::new(crate::client::ctl::stdin()).lines();
     loop {
         tokio::select! {
             line = lines.next_line() => {
