@@ -119,6 +119,141 @@ Workspace, lints, CI, this spec.
   0.10 exposes no ML-KEM; a hybrid KEX would be a separate crypto path and
   a trust-model decision in its own right.
 
+### M6 — M10: an interface for agents
+
+M1–M5 make mysh a good ssh replacement for a person. The next five
+milestones make it a good **remote process API** for a program — an LLM
+agent or any orchestrator — without inventing a second protocol. Three
+principles hold throughout:
+
+1. **Same wire protocol.** New capabilities are new stream kinds or new
+   fields; "agent mode" is structured output and a few flags, never a
+   different dialect.
+2. **Structured, complete, addressable output.** `--json` on every command;
+   byte offsets and sequence numbers instead of truncation or pagination;
+   the consumer decides how much to read.
+3. **Boring defaults.** Every call bounded by a timeout, every error carries
+   a stable machine-readable code, every long-running thing is a session
+   with an id.
+
+### M6 — structured I/O
+
+- `--json` on every command that prints data: `info`, `sessions`, `jobs`,
+  `ls`, `stat`, `forward ls`, `ping`, `exec` and `mysh HOST CMD` (one object
+  `{stdout, stderr, exit, signal, duration_ms}`; `--json-stream` emits NDJSON
+  events `{"stdout":…}` / `{"stderr":…}` / `{"exit":…}` as they happen,
+  base64 for non-UTF-8 chunks). Errors become
+  `{"error": {"code": "unauthorized", "message": …}}` on stderr with the
+  same codes as `ErrorCode` plus client-side ones (`trust_unknown`,
+  `trust_mismatch`, `connect_failed`, `timeout`, `usage`).
+- `--plain`: no ANSI, no progress lines, no banner, no prompt hooks
+  (implied by `--json` and when stdout is not a tty).
+- `--timeout DURATION` on `exec`, `CMD`, `put`, `get` (sends `Signal(Term)`
+  then `Kill` after 2 s; exit code 124 like `timeout(1)`), `--cwd DIR` on
+  `exec`/`CMD` (uses `SessionRequest.cwd`).
+- `info --json` reports server facts without running a command: a new
+  `Open::Info` stream returning `{name, version, platform: {os, arch,
+  kernel}, shell, home, user, caps, limits, uptime, detach_grace}`.
+- `help --json`: the clap command tree with arguments, types and defaults,
+  for tool discovery.
+- Docs: 05 gains an "Agent interface" section with the JSON schemas.
+- Tests: every `--json` output round-trips through `serde_json` into typed
+  structs in the test; NDJSON ordering (`exit` last); error code mapping
+  for each failure class; `--timeout` kills a `sleep 30` in ≈1 s with 124;
+  `--cwd`; `Open::Info` fields match `uname`.
+
+### M7 — remote process API
+
+- `exec` over the control socket: `mysh HOST exec CMD` and `mysh HOST CMD`
+  reuse a live client's connection when the socket exists (today only
+  `put/get/forward/authorize` do). `mysh -M HOST` (or `--persist`) starts a
+  background master that holds the connection open with no prompt and
+  exits after `--idle 10m` without clients, like ssh ControlMaster; the
+  first socket-less call may auto-spawn it (`master = auto` in config).
+- Session I/O without a terminal: `mysh HOST session new [--cwd] [--pty]
+  CMD` → `{id, pid}`; `session send ID BYTES` (`--stdin` for raw, `--eof`);
+  `session read ID --since OFFSET [--wait DURATION] [--max BYTES]` →
+  `{offset, next, bytes, exited: …}`; `session list`, `session kill ID
+  [-s SIG]`, `session wait ID`. Server side: every session (attached or not)
+  keeps its ring with an absolute byte offset counter; new stream kinds
+  `Open::Read { session, offset, max }` (one `Msg<ReadReply>`, blocking up
+  to `wait` for new bytes) and `Open::Write { session }` (raw stdin, then
+  close). Reads are idempotent: the same offset returns the same bytes
+  until they age out of the ring, and the reply says so (`oldest`).
+- Sessions created this way persist by default (they are the detached
+  kind); `--pty` is optional and off by default so stdout/stderr stay
+  separate (`ReadReply` carries both streams for non-PTY sessions).
+- Docs: 03 §7 (offsets), new §10ter (`Read`/`Write`), 05 (master mode,
+  `session` command family).
+- Tests: 200 `exec` calls through one master complete in a bounded time
+  and the server logs a single handshake; `session new 'sh -c "for i in
+  $(seq 1 5); do echo $i; sleep 0.2; done"'` + incremental `read --since`
+  reassembles `1..5` exactly once; `read` past the ring reports `oldest`;
+  `send` to a `cat` session echoes; `kill`; master idle exit; auto-spawn.
+
+### M8 — files as primitives
+
+- Streaming: `get REMOTE -` and `put - REMOTE` (stdout/stdin), `cat`,
+  `write REMOTE` (from stdin, atomic, `--mode`, `--append`), `tail [-f -n]`,
+  `stat --json`, `mkdir -p`, `rm [-r]`, `mv`, `realpath` as CLI and prompt
+  commands (all exist on the wire already; `tail -f` adds
+  `FileOp::Get { follow: true }`).
+- `put --checksum` / `get --checksum`: skip files whose size and BLAKE2s
+  hash match (`FileOp::Hash { path, algo }` → `Msg<[u8;32]>`), `sync
+  [--delete] LOCAL REMOTE` = recursive checksum transfer in both
+  directions, parallel like `-r`, with a `--dry-run` JSON plan.
+- Docs: 03 §9 (`Hash`, `follow`), 04 "File transfer", 05 rows.
+- Tests: `put -`/`get -` byte-identical through pipes; `tail -f` streams
+  appended lines; `sync` of a 100-file tree transfers only the 3 changed
+  files (asserted via `--json` plan and server traffic counters);
+  `--delete` removes extras; `--dry-run` changes nothing.
+
+### M9 — fleet
+
+- Fan-out: `mysh run [-j N] [--hosts a,b,c | --group NAME] [--json] -- CMD`
+  runs the same command on many hosts through per-host masters, prints
+  `host: line` interleaved or a JSON array of per-host results; `mysh put
+  --hosts …` likewise. `[groups.NAME] hosts = [...]` in `config.toml`.
+- Audit log: `mysh serve --audit PATH` appends JSON lines `{ts, peer,
+  key_fingerprint, kind, event: connect|session|exec|file|forward|
+  disconnect, detail, exit, bytes_in, bytes_out, duration_ms}`; rotated by
+  the host's logrotate (no built-in rotation).
+- Pairing (**trust-model change — escalate before implementing**):
+  `mysh serve --pair [DURATION]` prints a one-time 8-word code; `mysh pair
+  HOST CODE` runs a PAKE (SPAKE2 or CPace) over the normal Noise channel
+  established with an *unverified* server key, both sides derive the
+  shared secret from the code, the server installs the client's public key
+  in `authorized_keys` and the client pins the server key in
+  `known_hosts`. The code is single-use and expires; a wrong code
+  terminates the pairing window. Decision to be logged with the chosen
+  PAKE and its crate.
+- Docs: 05 (`run`, groups, `pair`), 02 (pairing section, audit log), 06.
+- Tests: `run` across three loopback servers with `-j 2` returns per-host
+  exit codes and keeps output attributed; a down host yields
+  `connect_failed` without blocking the others; audit lines for each event
+  type validate against a schema; pairing round trip, wrong code,
+  expired code, replayed code.
+
+### M10 — embedding
+
+- `mysh-client` library crate: the client half (`connect`, sessions,
+  files, forwards, masters) behind a small async API with no terminal
+  dependencies, versioned separately; the binary becomes a thin consumer.
+- `mysh mcp [--hosts …]`: an MCP server over stdio exposing `exec`,
+  `read_file`, `write_file`, `list_dir`, `session_new/send/read/kill`,
+  `put`, `get` as tools, one persistent connection per host, structured
+  errors from M6, offsets from M7. Resources: `mysh://HOST/path` for files.
+- Docs: a `docs/07-embedding.md` with the library API and the MCP tool
+  schemas.
+- Tests: the library's public API drives a loopback server through every
+  tool without the binary; an MCP conformance test speaks the protocol
+  over pipes (`initialize`, `tools/list`, `tools/call` for each tool,
+  error mapping).
+
+Suggested order: M6 → M7 (they make everything else scriptable), M8, then
+M9 and M10 in either order; pairing is the only item that needs a design
+sign-off before code.
+
 ## Decisions log
 
 Defaults chosen without asking; each is cheap to change now and expensive

@@ -19,7 +19,10 @@ and Android.
 
 **Status:** milestones M1–M5 of [docs/06-roadmap.md](docs/06-roadmap.md)
 are implemented and tested on Linux, macOS and Android; static release
-binaries are built by `scripts/release.sh`.
+binaries are built by `scripts/release.sh`. Next up: M6–M10 turn mysh into
+a remote process API for agents and orchestrators (`--json` everywhere, a
+session read/write API with offsets, file primitives, fleet fan-out, an
+MCP server) — see the roadmap.
 
 | doc                                              | contents                                  |
 | ------------------------------------------------ | ----------------------------------------- |
