@@ -7,6 +7,7 @@ mod common;
 use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -68,11 +69,25 @@ async fn setup(opts: ServerOpts) -> Ctx {
 
 impl Ctx {
     async fn put(&self, args: PutArgs) -> anyhow::Result<()> {
-        put(&self.conn, &self.console, &args, None, &self.local).await
+        put(
+            &self.conn,
+            Arc::new(self.console.clone()),
+            &args,
+            None,
+            &self.local,
+        )
+        .await
     }
 
     async fn get(&self, args: GetArgs) -> anyhow::Result<()> {
-        get(&self.conn, &self.console, &args, None, &self.local).await
+        get(
+            &self.conn,
+            Arc::new(self.console.clone()),
+            &args,
+            None,
+            &self.local,
+        )
+        .await
     }
 
     async fn finish(self) {

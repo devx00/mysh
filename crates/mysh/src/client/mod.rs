@@ -37,8 +37,8 @@ use crate::{
 };
 
 use self::{
-    conn::{Connection, connect},
-    console::Console,
+    conn::Connection,
+    console::{Console, ConsolePrompt},
     ctl::CtlServer,
     forward::Forwards,
     meta::{Ctx, History, Outcome},
@@ -47,8 +47,25 @@ use self::{
     terminal::{Input, Terminal},
 };
 
-/// Exit code when the connection drops or the ping timer fires.
-pub const EXIT_LOST: i32 = 255;
+pub use mysh_client::types::EXIT_LOST;
+
+/// [`mysh_client::conn::connect`] reporting on `console`, with the
+/// terminal TOFU prompt and passphrase prompt of the binary.
+pub async fn connect(
+    target: &Target,
+    paths: &Paths,
+    baked: &Baked,
+    console: &Console,
+) -> Result<Connection> {
+    mysh_client::conn::connect(
+        target,
+        paths,
+        baked,
+        Arc::new(console.clone()),
+        &ConsolePrompt::new(console.clone()),
+    )
+    .await
+}
 
 /// What `mysh HOST …` was asked to do once connected.
 #[derive(Debug, Clone)]
@@ -82,7 +99,7 @@ pub async fn run(
 ) -> Result<i32> {
     let console = Console::with_mode(mode);
     let conn = connect(&target, &paths, &baked, &console).await?;
-    let forwards = Forwards::new(conn.clone(), console.clone());
+    let forwards = Forwards::new(conn.clone(), Arc::new(console.clone()));
     let result = match add_cli_forwards(&forwards, &target).await {
         Ok(()) => dispatch(&conn, &console, &target, &paths, &forwards, cmd).await,
         Err(e) => Err(e),
@@ -102,16 +119,17 @@ async fn dispatch(
     let local_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let code = match cmd {
         ClientCommand::Put(args) => {
+            let mut stdin = tokio::io::stdin();
             one_shot(
                 console,
                 target.timeout,
                 files::put_with_input(
                     conn,
-                    console,
+                    Arc::new(console.clone()),
                     &args,
                     None,
                     &local_cwd,
-                    Some(fileops::Input::Process),
+                    Some(fileops::Input::Reader(&mut stdin)),
                 ),
             )
             .await
@@ -121,13 +139,14 @@ async fn dispatch(
                 // `tail -f` ends on its own deadline (clean exit, not 124).
                 tail.timeout = tail.timeout.or(target.timeout);
             }
+            let mut stdin = tokio::io::stdin();
             let fut = fileops::run(
                 conn,
-                console,
+                Arc::new(console.clone()),
                 &cmd,
                 None,
                 &local_cwd,
-                Some(fileops::Input::Process),
+                Some(fileops::Input::Reader(&mut stdin)),
             );
             if cmd.follows() {
                 until_interrupted(console, fut).await
@@ -139,7 +158,7 @@ async fn dispatch(
             one_shot(
                 console,
                 target.timeout,
-                files::get(conn, console, &args, None, &local_cwd),
+                files::get(conn, Arc::new(console.clone()), &args, None, &local_cwd),
             )
             .await
         }
@@ -332,7 +351,7 @@ async fn exec_mode(
         }
         console.notice("pseudo-terminal will not be allocated because stdin is not a terminal");
     }
-    let (mut stack, mut events) = Stack::new(console.clone());
+    let (mut stack, mut events) = Stack::new(Arc::new(console.clone()));
     let label = meta::kind_label(&command);
     let req = meta::session_request(
         target,

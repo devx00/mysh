@@ -7,6 +7,7 @@ pub mod cli;
 pub mod client;
 pub mod config;
 pub mod identity;
+pub mod mcp;
 pub mod output;
 pub mod server;
 pub mod wordlist;

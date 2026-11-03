@@ -443,7 +443,7 @@ async fn parallel_recursive_transfers_are_byte_identical() {
 
     files::put(
         &conn,
-        &console,
+        Arc::new(console.clone()),
         &PutArgs {
             recursive: true,
             preserve: true,
@@ -462,7 +462,7 @@ async fn parallel_recursive_transfers_are_byte_identical() {
     let down = local.join("down");
     files::get(
         &conn,
-        &console,
+        Arc::new(console.clone()),
         &GetArgs {
             recursive: true,
             jobs: 4,
@@ -483,7 +483,7 @@ async fn parallel_recursive_transfers_are_byte_identical() {
     std::fs::create_dir_all(down2.join("up").join("a").join("f1")).expect("blocking dir");
     let err = files::get(
         &conn,
-        &console,
+        Arc::new(console.clone()),
         &GetArgs {
             recursive: true,
             jobs: 4,

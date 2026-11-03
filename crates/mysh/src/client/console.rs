@@ -13,7 +13,9 @@
 
 use std::{
     fs::File,
+    future::Future,
     io::Write as _,
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -21,6 +23,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use mysh_client::{Reporter, TrustPrompt};
+use mysh_net::keys::Fingerprint;
 use serde::Serialize;
 use tokio::{
     io::AsyncWriteExt as _,
@@ -28,6 +32,8 @@ use tokio::{
 };
 
 use crate::output::{Bytes, ErrorOut, Event, Mode};
+
+pub use mysh_client::types::human;
 
 /// Minimum interval between two redraws of the progress line.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -575,20 +581,119 @@ fn format_progress(label: &str, done: u64, total: Option<u64>) -> String {
     }
 }
 
-/// `1.5 MiB`-style size.
-pub fn human(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    #[allow(clippy::cast_precision_loss)]
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
+/// The library reports through the console: session bytes, notices and
+/// progress go through the mode-aware writers; results render as
+/// [`Console::report`] does.
+impl Reporter for Console {
+    fn event(&self, ev: &Event) {
+        match ev {
+            Event::Stdout { data } => Console::write_bytes(self, data.as_bytes()),
+            Event::Stderr { data } => Console::write_stderr(self, data.as_bytes()),
+            Event::Notice { text } => Console::notice(self, text),
+            Event::Progress { label, done, total } => {
+                Console::progress(self, label, *done, *total);
+            }
+            Event::Started { .. }
+            | Event::Exit { .. }
+            | Event::Error { .. }
+            | Event::Result { .. }
+            | Event::Host { .. } => Console::event(self, ev),
+        }
     }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
+
+    fn is_interactive(&self) -> bool {
+        self.is_tty()
+    }
+
+    fn mode(&self) -> Mode {
+        Console::mode(self)
+    }
+
+    fn print(&self, text: &str) {
+        Console::print(self, text);
+    }
+
+    fn println(&self, text: &str) {
+        Console::println(self, text);
+    }
+
+    fn result(&self, value: serde_json::Value, human: &mut dyn FnMut() -> String) {
+        Console::report(self, &value, human);
+    }
+
+    fn emit(&self, value: serde_json::Value) {
+        Console::emit(self, &value);
+    }
+
+    fn write_raw(&self, bytes: &[u8]) {
+        Console::write_raw(self, bytes);
+    }
+
+    fn write_raw_err(&self, bytes: &[u8]) {
+        Console::write_raw_err(self, bytes);
+    }
+
+    fn progress_done(&self) {
+        Console::progress_done(self);
+    }
+
+    fn take_exec_capture(&self) -> (Vec<u8>, Vec<u8>) {
+        Console::take_exec_capture(self)
+    }
+
+    fn flush(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(Console::flush(self))
+    }
+
+    fn error(&self, err: &anyhow::Error) {
+        Console::error(self, err);
+    }
+}
+
+/// The binary's TOFU prompt: asks on the terminal when stdout and stdin
+/// are terminals and the mode is `Human`; otherwise refuses (so `--json`
+/// and scripted calls fail with `trust_unknown` instead of hanging).
+/// Passphrases come from [`crate::identity::passphrase_prompt`].
+#[derive(Debug, Clone)]
+pub struct ConsolePrompt {
+    console: Console,
+}
+
+impl ConsolePrompt {
+    /// Prompt on `console`.
+    #[must_use]
+    pub fn new(console: Console) -> Self {
+        Self { console }
+    }
+}
+
+impl TrustPrompt for ConsolePrompt {
+    fn confirm_unknown(&self, host: &str, port: u16, fp: &Fingerprint) -> bool {
+        let stdin_tty = mysh_pty::terminal::is_terminal(std::io::stdin());
+        if !(self.console.is_tty() && stdin_tty && Console::mode(&self.console) == Mode::Human) {
+            return false;
+        }
+        Console::print(
+            &self.console,
+            &format!(
+                "The authenticity of host {host}:{port} can't be established.\n\
+                 Fingerprint {fp}\n\
+                 Are you sure you want to continue connecting (yes/no)? "
+            ),
+        );
+        let console = self.console.clone();
+        // The handshake is paused on this answer; block this thread rather
+        // than the runtime (the prompt is only ever reached from a tty).
+        let answer = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(console.flush());
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).map(|_| line)
+        });
+        answer.is_ok_and(|a| a.trim().eq_ignore_ascii_case("yes"))
+    }
+
+    fn passphrase(&self, source: &str) -> std::io::Result<String> {
+        crate::identity::passphrase_prompt()(source)
     }
 }
 

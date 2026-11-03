@@ -7,6 +7,10 @@
 //! `Msg<CtlEvent>` (the capture-console events of the command) ending in
 //! `Done { code }`. Both sides use `mysh_proto::frame` framing.
 
+pub use mysh_client::ctl::{
+    CTL_STDIN_MAX, CtlEvent, CtlRequest, request, socket_path, socket_ready,
+};
+
 use std::{
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
@@ -19,7 +23,6 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use mysh_net::framing::{read_msg, write_msg};
-use serde::{Deserialize, Serialize};
 use tokio::{
     io::AsyncReadExt as _,
     net::{UnixListener, UnixStream},
@@ -38,62 +41,7 @@ use super::{
 use crate::{
     cli::{MetaCommand, parse_meta_argv},
     config::{Paths, Target},
-    output::Mode,
 };
-
-/// Largest stdin a CLI call may hand to the serving client; a bigger input
-/// is streamed over a connection of the requester's own instead.
-pub const CTL_STDIN_MAX: usize = 64 * 1024;
-
-/// What a CLI subcommand asks the interactive client to run.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CtlRequest {
-    /// Prompt words, e.g. `["put", "-r", "--", "a", "dest"]`.
-    pub argv: Vec<String>,
-    /// The requester's working directory for local paths.
-    pub cwd: String,
-    /// The requester's output mode; the command renders in it.
-    #[serde(default)]
-    pub mode: Mode,
-    /// Standard input for `exec`/`CMD` and `session send --stdin`.
-    #[serde(default)]
-    pub stdin: Vec<u8>,
-}
-
-/// One event of the reply stream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CtlEvent {
-    Out(Vec<u8>),
-    Err(Vec<u8>),
-    Progress {
-        label: String,
-        done: u64,
-        total: Option<u64>,
-    },
-    /// Last event; `code` is the exit status for the requester.
-    Done {
-        code: i32,
-    },
-}
-
-/// `runtime_dir/<host>_<port>.sock` with every byte outside
-/// `[A-Za-z0-9.-]` of the host replaced by `_`.
-pub fn socket_path(paths: &Paths, target: &Target) -> PathBuf {
-    let host: String = target
-        .host
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    paths
-        .runtime_dir
-        .join(format!("{host}_{}.sock", target.port))
-}
 
 /// Why a command is refused over the socket, if it is.
 pub fn refusal(cmd: &MetaCommand) -> Option<&'static str> {
@@ -317,7 +265,7 @@ pub(crate) async fn run_command(ctx: &mut Ctx, cmd: MetaCommand, stdin: Vec<u8>)
             let remote = mru_cwd(ctx).await;
             files::put_with_input(
                 &conn,
-                &ctx.console,
+                Arc::new(ctx.console.clone()),
                 &args,
                 remote.as_deref(),
                 &ctx.local_cwd,
@@ -331,7 +279,7 @@ pub(crate) async fn run_command(ctx: &mut Ctx, cmd: MetaCommand, stdin: Vec<u8>)
             let remote = mru_cwd(ctx).await;
             fileops::run(
                 &conn,
-                &ctx.console,
+                Arc::new(ctx.console.clone()),
                 &crate::cli::FileCmd::Write(args),
                 remote.as_deref(),
                 &ctx.local_cwd,
@@ -460,7 +408,8 @@ async fn reply_error(stream: &mut UnixStream, msg: &str) -> std::io::Result<()> 
 }
 
 // ---------------------------------------------------------------------------
-// Requesting side (CLI subcommands)
+// Requesting side (CLI subcommands); the request itself is
+// `mysh_client::ctl::request`.
 
 /// Standard input for a control request: at most [`CTL_STDIN_MAX`] bytes
 /// read from this process's stdin. `None` means "too much to carry", and
@@ -474,112 +423,9 @@ pub async fn read_ctl_stdin() -> Option<Vec<u8>> {
     (buf.len() <= CTL_STDIN_MAX).then_some(buf)
 }
 
-/// Whether a client or master is serving `target`'s control socket.
-pub async fn socket_ready(paths: &Paths, target: &Target) -> bool {
-    UnixStream::connect(socket_path(paths, target))
-        .await
-        .is_ok()
-}
-
-/// Run `argv` through the interactive client serving `target`, relaying
-/// its output to `console`. `Ok(None)` when there is no usable socket (the
-/// caller opens its own connection); `Err` only for a failure after the
-/// request was accepted.
-pub async fn request(
-    paths: &Paths,
-    target: &Target,
-    argv: Vec<String>,
-    console: &Console,
-    stdin: Vec<u8>,
-) -> Result<Option<i32>> {
-    let path = socket_path(paths, target);
-    let mut stream = match UnixStream::connect(&path).await {
-        Ok(s) => s,
-        Err(e) => {
-            debug!(path = %path.display(), error = %e, "no control socket");
-            return Ok(None);
-        }
-    };
-    let cwd = std::env::current_dir()
-        .map_or_else(|_| ".".to_owned(), |p| p.to_string_lossy().into_owned());
-    write_msg(
-        &mut stream,
-        &CtlRequest {
-            argv,
-            cwd,
-            mode: console.mode(),
-            stdin,
-        },
-    )
-    .await
-    .context("sending control request")?;
-    debug!(path = %path.display(), "control request sent");
-    let mut progress_active = false;
-    loop {
-        let ev: CtlEvent = read_msg(&mut stream)
-            .await
-            .context("reading control reply")?;
-        match ev {
-            CtlEvent::Out(b) => {
-                if progress_active {
-                    console.progress_done();
-                    progress_active = false;
-                }
-                console.write_raw(&b);
-            }
-            CtlEvent::Err(b) => {
-                if progress_active {
-                    console.progress_done();
-                    progress_active = false;
-                }
-                console.write_raw_err(&b);
-            }
-            CtlEvent::Progress { label, done, total } => {
-                console.progress(&label, done, total);
-                progress_active = true;
-            }
-            CtlEvent::Done { code } => {
-                if progress_active {
-                    console.progress_done();
-                }
-                console.flush().await;
-                return Ok(Some(code));
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        cli::ConnectOpts,
-        config::{Config, resolve_target},
-    };
-
-    #[test]
-    fn socket_path_is_sanitised() {
-        let paths = Paths {
-            runtime_dir: PathBuf::from("/run/mysh"),
-            ..Paths::with_config_dir(PathBuf::from("/cfg"))
-        };
-        let t = resolve_target(
-            "[fe80::1]:7000",
-            &ConnectOpts::default(),
-            &Config::default(),
-        )
-        .expect("target");
-        assert_eq!(
-            socket_path(&paths, &t),
-            PathBuf::from("/run/mysh/fe80__1_7000.sock")
-        );
-        let t =
-            resolve_target("pi.lan", &ConnectOpts::default(), &Config::default()).expect("target");
-        assert_eq!(
-            socket_path(&paths, &t),
-            PathBuf::from("/run/mysh/pi.lan_7722.sock")
-        );
-    }
 
     #[test]
     fn refusals() {
@@ -620,22 +466,5 @@ mod tests {
         ] {
             assert!(refusal(&parse(refused)).is_some(), "{refused}");
         }
-    }
-
-    #[tokio::test]
-    async fn request_without_socket_falls_back() {
-        let dir = std::env::temp_dir().join(format!("mysh-ctl-unit-{}", std::process::id()));
-        let paths = Paths {
-            runtime_dir: dir.clone(),
-            ..Paths::with_config_dir(dir.join("cfg"))
-        };
-        let t = resolve_target("127.0.0.1:1", &ConnectOpts::default(), &Config::default())
-            .expect("target");
-        let console = Console::new();
-        let r = request(&paths, &t, vec!["ping".into()], &console, Vec::new())
-            .await
-            .expect("no socket is not an error");
-        assert_eq!(r, None);
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -188,6 +188,10 @@ async fn run(cli: Cli) -> ExitCode {
             mysh::client::fleet::run(args, &config, paths, baked, mode).await,
             mode,
         ),
+        Some(Command::Mcp(args)) => match mysh::mcp::serve(args, &config, paths, baked).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, EXIT_USAGE, mode),
+        },
         // `--hosts`/`--group`: HOST's slot holds the first PATH.
         Some(Command::Put(h)) if h.opts.fan_out() => {
             let mut args = h.args;
@@ -293,7 +297,8 @@ fn client_request(command: Option<Command>, bare: ConnectArgs) -> Result<ClientR
             | Command::Fingerprint(_)
             | Command::Help(_)
             | Command::Pair(_)
-            | Command::Run(_),
+            | Command::Run(_)
+            | Command::Mcp(_),
         ) => {
             bail!("internal error: non-client command reached client dispatch")
         }

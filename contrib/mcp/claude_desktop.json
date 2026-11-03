@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "mysh": {
+      "command": "mysh",
+      "args": [
+        "mcp",
+        "--hosts", "pi,nas",
+        "--group", "lab",
+        "--allow-local-paths"
+      ],
+      "env": {
+        "MYSH_CONFIG_DIR": "/home/me/.config/mysh"
+      }
+    }
+  }
+}

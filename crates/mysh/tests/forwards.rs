@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use common::{ServerOpts, TestServer};
 use mysh::{
@@ -85,7 +85,7 @@ async fn setup(opts: ServerOpts) -> Ctx {
         .connect(ConnectOpts::default())
         .await
         .expect("connect");
-    let forwards = Forwards::new(conn.clone(), Console::new());
+    let forwards = Forwards::new(conn.clone(), Arc::new(Console::new()));
     let echo = Echo::start().await;
     Ctx {
         server,

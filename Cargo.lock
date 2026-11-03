@@ -894,6 +894,7 @@ dependencies = [
  "clap",
  "dirs",
  "indicatif",
+ "mysh-client",
  "mysh-net",
  "mysh-proto",
  "mysh-pty",
@@ -908,6 +909,26 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "mysh-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "blake2",
+ "clap",
+ "dirs",
+ "mysh-net",
+ "mysh-proto",
+ "serde",
+ "serde_json",
+ "shlex",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

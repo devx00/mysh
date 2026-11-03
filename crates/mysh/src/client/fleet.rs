@@ -15,7 +15,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 use tracing::debug;
 
 use super::{
-    conn::connect,
+    connect,
     console::{CaptureEvent, Console},
     ctl,
     forward::Forwards,
@@ -33,52 +33,7 @@ use crate::{
     },
 };
 
-/// Split a `--hosts` value on commas; surrounding whitespace is dropped
-/// and empty items are skipped.
-#[must_use]
-pub fn parse_hosts(list: &str) -> Vec<String> {
-    list.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-/// The hosts of `--hosts` (each split by [`parse_hosts`]) followed by those
-/// of every `--group`, in order, duplicates removed. `Err` names an unknown
-/// group, or says that nothing was selected.
-pub fn expand_hosts(
-    hosts: &[String],
-    groups: &[String],
-    config: &Config,
-) -> Result<Vec<String>, String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut push = |host: &str| {
-        if !out.iter().any(|h| h == host) {
-            out.push(host.to_owned());
-        }
-    };
-    for list in hosts {
-        for host in parse_hosts(list) {
-            push(&host);
-        }
-    }
-    for name in groups {
-        let group = config
-            .groups
-            .get(name)
-            .ok_or_else(|| format!("no [groups.{name}] in the config file"))?;
-        for host in &group.hosts {
-            for host in parse_hosts(host) {
-                push(&host);
-            }
-        }
-    }
-    if out.is_empty() {
-        return Err("no hosts: give --hosts a,b,… or --group NAME".to_owned());
-    }
-    Ok(out)
-}
+pub use mysh_client::fleet::{expand_hosts, parse_hosts};
 
 /// What the fan-out runs on each host and how its output is read back.
 #[derive(Clone)]
@@ -383,7 +338,7 @@ async fn run_host(target: &Target, plan: &Plan, console: &Console) -> Result<i32
         bail!("`&` is not accepted here");
     }
     let conn = connect(target, &plan.paths, &plan.baked, console).await?;
-    let forwards = Forwards::new(conn.clone(), console.clone());
+    let forwards = Forwards::new(conn.clone(), Arc::new(console.clone()));
     let shared = Shared::new(
         conn.clone(),
         console.clone(),
@@ -815,44 +770,6 @@ fn print_summary(console: &Console, results: &[RunResult], to_stdout: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_hosts_splits_trims_and_drops_empties() {
-        assert_eq!(parse_hosts("a, b ,,c,"), vec!["a", "b", "c"]);
-        assert_eq!(parse_hosts(" , "), Vec::<String>::new());
-    }
-
-    #[test]
-    fn expand_hosts_merges_lists_and_groups_in_order_without_duplicates() {
-        let config = Config::parse(
-            r#"
-[groups.lab]
-hosts = ["pi", "nuc", "10.0.0.5:7722"]
-[groups.web]
-hosts = ["nuc", "www"]
-"#,
-        )
-        .expect("config");
-        let hosts = expand_hosts(
-            &["nuc,extra".to_owned()],
-            &["lab".to_owned(), "web".to_owned()],
-            &config,
-        )
-        .expect("hosts");
-        assert_eq!(hosts, vec!["nuc", "extra", "pi", "10.0.0.5:7722", "www"]);
-    }
-
-    #[test]
-    fn expand_hosts_rejects_unknown_group_and_empty_selection() {
-        let config = Config::default();
-        assert!(
-            expand_hosts(&[], &["nope".to_owned()], &config)
-                .unwrap_err()
-                .contains("groups.nope")
-        );
-        assert!(expand_hosts(&[], &[], &config).is_err());
-        assert!(expand_hosts(&[" , ".to_owned()], &[], &config).is_err());
-    }
 
     #[test]
     fn lines_prefix_each_complete_line_and_flush_the_rest() {

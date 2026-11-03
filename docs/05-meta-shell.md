@@ -260,6 +260,7 @@ mysh session [OPTIONS] HOST list|kill ID [-s SIG]|wait ID [--timeout D]
 mysh master [OPTIONS] HOST [--idle D] [--daemon]   hold the connection open for other calls
 mysh run [OPTIONS] [-j N] (--hosts a,b | --group NAME)... -- CMD ...   the same command on several hosts ("Fleet")
 mysh put/get [OPTIONS] (--hosts a,b | --group NAME)... PATH...        the same transfer to/from several hosts ("Fleet")
+mysh mcp (--hosts a,b | --group NAME)... [--accept-new] [-i PATH] [--allow-local-paths]   MCP server over stdio for agents (07-embedding.md "MCP server")
 ```
 
 Subcommand names are reserved words that cannot be used as bare `HOST`; use

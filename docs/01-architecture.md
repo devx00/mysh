@@ -98,29 +98,57 @@ crates/
                key files, ssh key conversion, authorized_keys/known_hosts. #![forbid(unsafe_code)]
   mysh-pty     platform layer: openpty, spawn with controlling tty, winsize,
                termios raw mode, signal plumbing, cwd-of-pid. Only crate with unsafe.
-  mysh         bin: cli, client (terminal driver, meta shell, forwards),
-               server (sessions, files, forwards), config, baked keys (build.rs)
+  mysh-client  lib: everything that drives a server without a terminal —
+               config/paths, identities + trust, Connection, sessions (ring,
+               remote process API), files/sync, forwards, control-socket
+               requester, fleet fan-out, pairing, the `--json` types, and the
+               `Client` facade (07-embedding.md). #![forbid(unsafe_code)]
+  mysh         bin: cli, console + terminal driver, meta shell, jobs, control-socket
+               server, master, MCP server, server (sessions, files, forwards),
+               baked keys (build.rs)
 ```
 
-Dependency direction: `mysh → {mysh-net, mysh-pty} → mysh-proto`. All
-`cfg(target_os = …)` lives in `mysh-pty` and in `mysh::config` (default
-paths), nowhere else.
+Dependency direction: `mysh → {mysh-client, mysh-pty} → {mysh-net} → mysh-proto`
+(`mysh-client` never depends on `mysh-pty`). All `cfg(target_os = …)` lives in
+`mysh-pty` and in `mysh_client::config` (default paths), nowhere else.
 
-Planned module layout inside `crates/mysh`:
+Module layout:
 
 ```
-src/
+crates/mysh-client/src/
+  lib.rs           Client facade re-exports, Reporter/TrustPrompt, Error
+  config.rs        paths, config file, HOST parsing, identity/trust resolution order
+  identity.rs      client identities (files, agent), ClientTrust (pin/baked/known_hosts)
+  conn.rs          connect: dial, preamble, handshake, trust check, yamux, control stream
+  session.rs       session stack (foreground/background, ring replay), exit code mapping
+  session_api.rs   remote process API: new/read/send/list/kill/wait by id
+  files.rs         put/get/ls/stat/authorize and the file primitives
+  fileops.rs       cat/write/tail/mkdir/rm/mv/realpath/hash command runners
+  sync.rs          tree comparison and push/pull
+  forward.rs       -L/-R/-D listeners, SOCKS5
+  ctl.rs           control-socket requester, master spawn (`ensure`)
+  fleet.rs         host selection, fan-out
+  pair.rs          SPAKE2 pairing client
+  types.rs         --json result types, Event stream, error codes
+  args.rs          request structs shared with the CLI (clap `Args`)
+  report.rs        Reporter (replaces the console), TrustPrompt
+  client.rs        Client / Sessions / Files facade
+crates/mysh/src/
   main.rs          entry; tracing init; dispatch
-  cli.rs           clap definitions (05-meta-shell.md "CLI")
-  config.rs        paths, HOST parsing, identity/trust resolution order
+  cli.rs           clap definitions (05-meta-shell.md "CLI"); re-exports mysh_client::args
+  config.rs, identity.rs, output.rs   re-exports plus the binary-only parts
+                   (server identity/trust source, keygen/fingerprint, HelpTree)
   client/
-    mod.rs         connect: dial, preamble, handshake, trust check, yamux
+    mod.rs         `mysh HOST` modes: exec, interactive, wait, attach
+    console.rs     the terminal writer; implements Reporter and TrustPrompt
     terminal.rs    raw mode, SIGWINCH/SIGTSTP, meta-key interception
-    session.rs     pty/exec session driver, session stack (foreground/background,
-                   ring replay), exit code mapping
-    meta.rs        meta shell: line editor, tokenizer, dispatcher, commands
-    forward.rs     -L/-R/-D listeners, SOCKS5
-    files.rs       put/get/ls with progress
+    editor.rs      line editor + history
+    meta.rs        meta shell: tokenizer, dispatcher, commands
+    jobs.rs        background jobs
+    ctl.rs         control-socket server; master.rs  `mysh master`
+    fleet.rs       `run`/`put`/`get --hosts` over capture consoles
+    conn.rs, session.rs, files.rs, …   thin re-exports of mysh_client
+  mcp/             `mysh mcp` (07-embedding.md "MCP server")
   server/
     mod.rs         listen loop, per-connection accept, authorization
     session.rs     pty + exec sessions
@@ -140,7 +168,7 @@ src/
 | `curve25519-dalek`, `sha2`     | ed25519 → X25519 conversion, fingerprints | same majors as `snow`/`ssh-key`                          |
 | `rustix`                       | pty, termios, ioctls, process          | one API for Linux/macOS/Android; no `nix`                  |
 | `libc` (macOS only)            | `proc_pidinfo` for cwd probe           |                                                            |
-| `clap`                         | CLI                                    | derive                                                     |
+| `clap`                         | CLI                                    | derive; `mysh-client` derives `Args` on its request structs (`args`) so the binary, the control socket and the library share one definition |
 | `shlex`                        | meta shell tokenizer                   |                                                            |
 | (built-in line editor)         | prompt line editing, history           | `client::meta` owns a small editor fed by the stdin reader task; `rustyline` was dropped because it would compete with that task for stdin |
 | `indicatif`                    | transfer progress bars                 |                                                            |
@@ -148,7 +176,7 @@ src/
 | `dirs`                         | XDG / platform directories             |                                                            |
 | `tracing`                      | logging                                | `-v` raises level; never logs key material                 |
 | `zeroize`                      | secret wiping                          |                                                            |
-| `anyhow` / `thiserror`         | errors in bin / libs                   |                                                            |
+| `anyhow` / `thiserror`         | errors in bin / libs                   | `mysh-client` keeps `anyhow` chains internally and tags them with the M6 code at the facade (`mysh_client::Error`) |
 
 Not used, deliberately: `rustls`/TLS (PKI-shaped), `russh` (we are replacing
 ssh, not reimplementing it), `crossterm` (too much for raw mode + winsize),

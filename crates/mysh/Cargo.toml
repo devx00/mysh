@@ -15,6 +15,7 @@ default = []
 baked = []
 
 [dependencies]
+mysh-client.workspace = true
 mysh-net.workspace = true
 mysh-proto.workspace = true
 mysh-pty.workspace = true

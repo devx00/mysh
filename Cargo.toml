@@ -15,6 +15,7 @@ publish = false
 mysh-proto = { path = "crates/mysh-proto" }
 mysh-net = { path = "crates/mysh-net" }
 mysh-pty = { path = "crates/mysh-pty" }
+mysh-client = { path = "crates/mysh-client" }
 
 anyhow = "1"
 base64 = "0.23"

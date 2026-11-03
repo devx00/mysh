@@ -159,7 +159,7 @@ impl TestServer {
         paths: &Paths,
     ) -> anyhow::Result<Connection> {
         let console = Console::new();
-        mysh::client::conn::connect(&self.target(opts), paths, &Baked::default(), &console).await
+        mysh::client::connect(&self.target(opts), paths, &Baked::default(), &console).await
     }
 
     /// A `Target` for this server with `--accept-new` plus `opts` overrides.

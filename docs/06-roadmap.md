@@ -282,19 +282,37 @@ principles hold throughout:
 
 ### M10 — embedding
 
-- `mysh-client` library crate: the client half (`connect`, sessions,
-  files, forwards, masters) behind a small async API with no terminal
-  dependencies, versioned separately; the binary becomes a thin consumer.
-- `mysh mcp [--hosts …]`: an MCP server over stdio exposing `exec`,
-  `read_file`, `write_file`, `list_dir`, `session_new/send/read/kill`,
-  `put`, `get` as tools, one persistent connection per host, structured
-  errors from M6, offsets from M7. Resources: `mysh://HOST/path` for files.
+- `mysh-client` library crate ✔ (07-embedding.md "Library", decisions
+  52–54): the client half (`config`, `identity`, `conn`, `session` +
+  `session_api`, `files`/`fileops`/`sync`, `forward`, `ctl` requester +
+  master spawn, `fleet`, `pair`, the `--json` `types`) moved out of the
+  binary with no terminal dependencies; output goes through a `Reporter`
+  trait and unknown host keys through a `TrustPrompt`; a `Client` facade
+  (`exec`/`exec_stream`, `info`, `sessions()`, `files()`, `forwards()`)
+  returns the same documents the CLI prints. The binary's `Console`
+  implements both traits and its old module paths re-export the library.
+- `mysh mcp [--hosts …]` ✔ (07-embedding.md "MCP server", decisions
+  50–51): an MCP server over stdio (JSON-RPC 2.0, newline-delimited, also
+  `Content-Length` input) exposing `exec`, `read_file`, `write_file`,
+  `list_dir`, `stat`, `session_new/send/read/kill/list`, `put`, `get`,
+  `info` and `hosts` as tools with hand-written input and output schemas,
+  one lazily opened and reconnected connection per host, structured errors
+  from M6 (`isError` + `{"error":{"code","message"}}`, never a JSON-RPC
+  error for a remote failure), offsets from M7. Resources: `mysh://HOST/`
+  per host and `mysh://{host}/{path}` for files (text, base64 blob, or a
+  JSON listing). Trust: `--accept-new` only; never a prompt. `put`/`get`
+  need `--allow-local-paths`. `contrib/mcp/` holds an example client config.
 - Docs: a `docs/07-embedding.md` with the library API and the MCP tool
   schemas.
 - Tests: the library's public API drives a loopback server through every
-  tool without the binary; an MCP conformance test speaks the protocol
-  over pipes (`initialize`, `tools/list`, `tools/call` for each tool,
-  error mapping).
+  `Client` method without the binary ✔ (`tests/client_api.rs`); an MCP conformance test ✔ (`tests/mcp.rs`)
+  speaks the protocol over pipes: `initialize` (version echo), `tools/list`
+  with both schemas, every tool with a real effect (exec, text/binary
+  file round trip, directory listing, stat, `cat` session fed and read by
+  offset, PTY session, put/get, info, hosts), the error mapping
+  (`-32601`, `-32602`, `-32700`, exit 3 as a result, `connect_failed`,
+  `trust_unknown`, `denied`), resources (text, blob, listing, `-32002`),
+  `Content-Length` framing, exit 0 on stdin EOF.
 
 Suggested order: M6 → M7 (they make everything else scriptable), M8, then
 M9 and M10 in either order; pairing is the only item that needs a design
@@ -356,6 +374,11 @@ later.
 | 47 | the file primitives share one `FileCmd` enum between the CLI subcommands, the prompt and the control socket (`mysh HOST cat …` → `ClientCommand::File`), and the prompt-flattened structs avoid the shared CLI shorts/longs (`mkdir -P`, `tail --for`) just as `put -P` does | per-frontend arg structs; a `files` subcommand namespace (`mysh HOST files cat …`) | one clap definition per command keeps help, `to_argv` relaying and tests in one place; the capital/renamed flags are the price already paid for `put`, documented in the same table |
 | 48 | a fan-out member runs the *prompt words* of its command (`exec … -- CMD`, `put …`) either over the host's control socket or on a fresh connection via the same detached `Ctx` the socket server uses, always under a capture console in a JSON mode (`--json-stream` for `run`, `--json` for transfers); the fleet code only parses those events into `RunResult`/`TransferResult` and prefixes lines. `--hosts`/`--group` live in the shared connection options, so for `put`/`get` the `HOST` positional holds the first `PATH` | a dedicated per-host exec path reading `SessionOut` directly; a `HostsAnd<T>` arg struct with an optional `HOST` positional | reusing the single-host printers means every mode, the timeout escalation, `--cwd` and error codes behave identically per host with no second implementation to drift, and the master/ctl reuse comes for free; clap cannot express "HOST is absent when `--hosts` is given" for positionals, so shifting the first value is the honest alternative to a duplicated `put`/`get` definition |
 | 49 | the audit log is a server-wide `Arc<Audit>` holding an `mpsc` to one writer task that stamps `ts` at write time, serializes and flushes each line; handlers emit through a per-connection `audit::Handle` (peer + key) with the detail built by a closure that only runs when the log is on; `ServerConfig.audit: Option<PathBuf>` opens the file (`O_APPEND`, 0600) in `Server::bind` | a `tracing` layer with a JSON formatter; stamping `ts` at emit time; a synchronous `Mutex<File>` | a separate channel keeps the schema stable and independent of `-v` filters, one writer gives monotonic timestamps and no interleaving for free, the closure keeps the disabled path allocation-free, and failing `bind` on an unopenable audit file is the right default for a log that exists to be trusted |
+| 50 | `mysh mcp` is a module of the binary (`crates/mysh/src/mcp/`), serves requests one at a time, and reaches the client library only through `mcp/backend.rs`; schemas are hand-written `serde_json` values that mirror the `--json` types | a separate `mysh-mcp` crate with an MCP SDK and `schemars`-derived schemas; concurrent request handling | the server is ~1500 lines over an API the binary already has, so a crate and two dependencies would buy nothing; one request at a time is the simplest thing that is correct with a per-host connection map, and the schemas double as the documented contract (a derive would leak internal field names and `Bytes`' custom serialization) |
+| 51 | a remote failure is a tool *result* (`isError: true` with the M6 `{"error":{"code","message"}}` as text and `structuredContent`), a non-zero exit is a plain result, and only malformed requests, unknown methods/tools and unconfigured hosts are JSON-RPC errors; trust is `--accept-new` or `trust_unknown`, never a prompt, and `put`/`get` are off without `--allow-local-paths` | JSON-RPC errors for everything; prompting through MCP elicitation; local paths always on | agents read tool results, not transport errors, and need the stable code to decide what to do; stdin is the protocol so a prompt is impossible, and a trust decision belongs to the person who configured the client; a tool that can write anywhere on the operator's disk must be opt-in |
+| 52 | the moved modules keep their shape and talk to a wide `Reporter` trait (`event` plus text/progress/result hooks with event-based defaults) that the binary's `Console` implements, instead of being rewritten to return every result; the typed surface is the `Client` facade on top of the typed protocol calls that already existed (`session_api::session_*`, the `files` primitives) | splitting every module into a pure core and a printing wrapper; a minimal `event`-only reporter with the human rendering reimplemented in the binary | the CLI-shaped runners (`put`/`get`/`ls`/`sync`/`session …`) render results in four modes and are covered by ~400 integration tests; moving them verbatim keeps that behaviour byte-identical, while a facade that returns `ExecResult`/`LsEntry`/`TransferOut`/`SyncOutcome` gives programs what they need without touching the CLI paths. `Mode` therefore lives in the library (`types::Mode`) because the control-socket request carries it |
+| 53 | the clap argument structs of the file, session and connection commands move into `mysh_client::args` with their `#[derive(Args)]`, and `cli.rs` re-exports them; the library depends on `clap` | plain request structs in the library mirrored by clap structs in the binary with `From` conversions; `cfg_attr`-gated derives | one definition serves the CLI, the meta prompt, the control socket and library callers (they are plain structs with `Default`); the mirrored pair would be ~20 structs of duplicated fields that drift, and `clap` is a parser, not a terminal dependency |
+| 54 | the library never prompts or spawns itself: unknown keys go to `TrustPrompt::confirm_unknown`, encrypted keys to `TrustPrompt::passphrase` (both refuse by default), the compiled-in keys arrive as `Baked::parse(identity, peers)` text, and `ctl::ensure` takes the path of the `mysh` binary to start a master with; `Client::connect_or_ctl` honours `target.master` by starting that master and then opens its own connection | reading stdin from the library when it is a tty; `current_exe()` in the library; a `Client` that speaks the prompt grammar over the control socket | a library has no business touching a terminal it does not own, and an embedding program re-spawning *itself* as `mysh master` would be wrong; the control socket speaks prompt words and renders in an output mode, so a facade on top of it would be a second, lossy protocol — `ctl::request` stays available for callers that want exactly that |
 
 ## Testing strategy
 

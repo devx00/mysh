@@ -16,13 +16,19 @@ and Android.
   with the output you missed.
 - Per-key `authorized_keys` options (`command=`, `from=`, `no-pty`, …),
   per-IP handshake rate limiting, automatic rekeying, fuzzed parsers.
+- A remote process API for programs: `--json` everywhere, sessions read by
+  byte offset, file primitives, fleet fan-out, and `mysh mcp`, an MCP
+  server that hands the same tools to an AI agent over stdio
+  (`contrib/mcp/`).
+- Embeddable: the `mysh-client` crate is the same client code behind a
+  Rust API with no terminal dependencies (`docs/07-embedding.md`).
 
-**Status:** milestones M1–M5 of [docs/06-roadmap.md](docs/06-roadmap.md)
+**Status:** milestones M1–M10 of [docs/06-roadmap.md](docs/06-roadmap.md)
 are implemented and tested on Linux, macOS and Android; static release
-binaries are built by `scripts/release.sh`. Next up: M6–M10 turn mysh into
-a remote process API for agents and orchestrators (`--json` everywhere, a
-session read/write API with offsets, file primitives, fleet fan-out, an
-MCP server) — see the roadmap.
+binaries are built by `scripts/release.sh`. M6–M10 turned mysh into a
+remote process API for agents and orchestrators (`--json` everywhere, a
+session read/write API with offsets, file primitives, fleet fan-out, the
+`mysh-client` crate, an MCP server) — see the roadmap.
 
 | doc                                              | contents                                  |
 | ------------------------------------------------ | ----------------------------------------- |
@@ -32,6 +38,7 @@ MCP server) — see the roadmap.
 | [04-sessions](docs/04-sessions.md)               | pty lifecycle, terminal driver, forwarding, files |
 | [05-meta-shell](docs/05-meta-shell.md)           | meta key, prompt, commands, CLI, config   |
 | [06-roadmap](docs/06-roadmap.md)                 | milestones, decisions log, testing        |
+| [07-embedding](docs/07-embedding.md)             | `mysh-client` library API, MCP server tools and schemas |
 
 ## Quickstart
 
@@ -48,6 +55,22 @@ mysh -s pi.lan              # straight to a shell, like ssh
 mysh pi.lan 'uptime'        # one command, exits with its status
 mysh put pi.lan ./file '~'  # one-shot transfer
 mysh forward pi.lan -L 8080:localhost:80
+mysh mcp --hosts pi.lan     # MCP server over stdio for an agent (docs/07-embedding.md)
+```
+
+## Embedding
+
+```rust
+use std::sync::Arc;
+use mysh_client::{Client, ExecRequest, NullReporter, RefuseUnknown, config, identity::Baked};
+
+let paths = config::Paths::from_env();
+let config = config::Config::load(&paths.config_file)?;
+let target = config::resolve_target("pi.lan", &Default::default(), &config)?;
+let client = Client::connect(&target, &paths, &Baked::default(),
+    Arc::new(NullReporter), Arc::new(RefuseUnknown)).await?;
+let out = client.exec(ExecRequest::argv(["uname", "-sm"])).await?;
+println!("{} exit={:?}", out.stdout.as_bytes().escape_ascii(), out.exit);
 ```
 
 ## Build and test

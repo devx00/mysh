@@ -112,6 +112,29 @@ and ships as static release binaries.
   `forward`, `pair`, `denied` — with peer, key fingerprint, detail, exit,
   bytes and duration, through one writer task (0600, `O_APPEND`, flushed
   per line, no rotation) (docs/02 "Audit log").
+- **`mysh-client` crate** (M10): the client half of the binary — config
+  and paths, identities and trust, `Connection`, the session stack and the
+  remote process API, files/sync, forwards, the control-socket requester
+  and master spawn, fleet fan-out, pairing, and every `--json` type — is
+  now a library with no terminal dependencies. Output goes through a
+  `Reporter` trait (the binary's console implements it) and unknown host
+  keys through a `TrustPrompt` (refuses by default; passphrases too). The
+  `Client` facade (`connect`, `exec`/`exec_stream`, `info`, `sessions()`,
+  `files()`, `forwards()`, `close`) returns the same documents the CLI
+  prints; `fleet::run` fans an exec out; `Error` carries the stable M6
+  code. The clap request structs (`PutArgs`, `SessionArgs`, …) live in
+  `mysh_client::args`; the binary re-exports everything at its old paths
+  (docs/07 "Library", docs/01 crate list).
+- **MCP server** (M10): `mysh mcp (--hosts a,b | --group NAME)…
+  [--accept-new] [-i PATH] [--allow-local-paths]` serves the Model Context
+  Protocol over stdio (JSON-RPC 2.0, newline-delimited or `Content-Length`
+  framed): tools `exec`, `read_file`, `write_file`, `list_dir`, `stat`,
+  `session_new/send/read/kill/list`, `put`, `get`, `info`, `hosts` with
+  input and output schemas, `mysh://HOST/path` resources, one lazily opened
+  connection per host reopened after a loss, the M6 error codes as
+  `isError` results, TOFU only through `--accept-new` (never a prompt),
+  local `put`/`get` only with `--allow-local-paths`. `contrib/mcp/` has an
+  example client configuration (docs/07 "MCP server").
 - **Release** (M4): `scripts/release.sh` links all five targets and writes
   `SHA256SUMS`; `.github/workflows/release.yml` does the same on tags;
   `contrib/` has a systemd unit, a launchd plist and a Termux:Boot script.

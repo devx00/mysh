@@ -35,8 +35,8 @@ use crate::{
     },
     config::{ForwardSpec, Target, decode_send_text, expand_tilde},
     output::{
-        self, ConnectionOut, CwdOut, EXIT_TIMEOUT, ExecResult, ForwardRow, InfoOut, JobOut, JobRow,
-        OkOut, PingOut, ProgressOut, SessionRow, SessionsOut, code_for, codes, millis,
+        self, CwdOut, EXIT_TIMEOUT, ExecResult, ForwardRow, InfoOut, JobOut, JobRow, OkOut,
+        PingOut, ProgressOut, SessionRow, SessionsOut, code_for, codes, millis,
     },
 };
 
@@ -98,7 +98,7 @@ impl std::fmt::Debug for Ctx {
 impl Ctx {
     /// The prompt's context.
     pub fn new(shared: Arc<Shared>, console: Console, local_cwd: PathBuf, auto_exit: bool) -> Self {
-        let (stack, events) = Stack::new(console.clone());
+        let (stack, events) = Stack::new(Arc::new(console.clone()));
         Self {
             shared,
             console,
@@ -176,33 +176,7 @@ impl Drop for Ctx {
 // ---------------------------------------------------------------------------
 // Session request helpers (shared with `client::run`)
 
-/// Environment to send: `LANG`, `LC_*`, `COLORTERM` from the local
-/// environment, plus `--env` items (`NAME` alone reads the local value).
-pub fn session_env(target: &Target) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| k == "LANG" || k == "COLORTERM" || k.starts_with("LC_"))
-        .collect();
-    for (name, value) in &target.env {
-        let value = match value {
-            Some(v) => v.clone(),
-            None => match std::env::var(name) {
-                Ok(v) => v,
-                Err(_) => continue,
-            },
-        };
-        env.retain(|(k, _)| k != name);
-        env.push((name.clone(), value));
-    }
-    env
-}
-
-/// `$TERM`, or a sane default.
-pub fn term_name() -> String {
-    std::env::var("TERM")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| "xterm-256color".to_owned())
-}
+pub use crate::client::session_api::{session_env, term_name};
 
 /// Build a `SessionRequest`; `pty` is the window size when a PTY is wanted.
 pub fn session_request(
@@ -522,7 +496,7 @@ async fn execute_transfer(
             let remote = mru_cwd(ctx).await;
             let fut = files::put(
                 &conn,
-                &ctx.console,
+                Arc::new(ctx.console.clone()),
                 &args,
                 remote.as_deref(),
                 &ctx.local_cwd,
@@ -536,7 +510,7 @@ async fn execute_transfer(
             let remote = mru_cwd(ctx).await;
             let fut = files::get(
                 &conn,
-                &ctx.console,
+                Arc::new(ctx.console.clone()),
                 &args,
                 remote.as_deref(),
                 &ctx.local_cwd,
@@ -578,7 +552,7 @@ async fn execute_transfer(
             };
             let fut = crate::client::fileops::run(
                 &conn,
-                &ctx.console,
+                Arc::new(ctx.console.clone()),
                 &cmd,
                 remote.as_deref(),
                 &ctx.local_cwd,
@@ -888,18 +862,7 @@ async fn cmd_forward(ctx: &Ctx, args: &crate::cli::ForwardArgs) -> Result<()> {
 
 /// `Open::Info`; `None` when the server does not implement it.
 pub async fn server_info(conn: &Connection) -> Result<Option<mysh_proto::info::Info>> {
-    use mysh_net::{framing::read_msg, mux::OpenError};
-    use mysh_proto::open::{ErrorCode, Open};
-    match conn.open(&Open::Info).await {
-        Ok(mut stream) => Ok(Some(
-            read_msg(&mut stream).await.context("reading server info")?,
-        )),
-        Err(OpenError::Rejected {
-            code: ErrorCode::Unsupported,
-            ..
-        }) => Ok(None),
-        Err(e) => Err(anyhow::Error::new(e).context("server info")),
-    }
+    conn.info().await
 }
 
 async fn cmd_info(ctx: &Ctx) -> Result<()> {
@@ -909,21 +872,7 @@ async fn cmd_info(ctx: &Ctx) -> Result<()> {
     let forwards = ctx.shared.forwards.list();
     let out = InfoOut {
         server,
-        connection: ConnectionOut {
-            host: conn.target().host.clone(),
-            port: conn.target().port,
-            peer: conn.peer_addr().to_string(),
-            peer_fingerprint: conn.remote_key().fingerprint().to_string(),
-            trusted_via: conn.trusted_via().to_owned(),
-            our_key: conn.identity().describe(),
-            protocol: conn.version(),
-            cipher: mysh_proto::NOISE_PATTERN.to_owned(),
-            connected_secs: conn.connected_at().elapsed().as_secs(),
-            rtt_ms: conn.last_rtt().map(millis),
-            bytes_in: stats.bytes_in,
-            bytes_out: stats.bytes_out,
-            rekeys: stats.rekeys_in + stats.rekeys_out,
-        },
+        connection: conn.connection_out(),
         sessions: ctx.session_rows().iter().map(session_row).collect(),
         forwards: forwards.iter().map(forward_row).collect(),
     };

@@ -1,0 +1,31 @@
+[package]
+name = "mysh-client"
+description = "Library for driving a mysh server: connections, trust, sessions, files, forwards, fleet fan-out (no terminal dependencies)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mysh-net.workspace = true
+mysh-proto.workspace = true
+
+anyhow.workspace = true
+base64.workspace = true
+blake2.workspace = true
+# The request structs double as the binary's clap argument structs
+# (`args`), so one definition serves the CLI, the control socket and the
+# library; clap is a parser, not a terminal dependency.
+clap.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shlex.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
