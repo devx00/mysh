@@ -6,7 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{file::FileOp, frame, session::SessionRequest};
+use crate::{
+    file::FileOp,
+    frame,
+    session::{SessionRequest, Signal},
+};
 
 /// Stream kinds. Numeric tags are wire-stable; append only.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,8 +47,12 @@ pub enum Open {
         wait_ms: u32,
     },
     /// Client → server; raw stdin bytes for a registered session until the
-    /// client half-closes (EOF to the child's stdin for non-PTY sessions).
-    Write { session: u32 },
+    /// client half-closes. `eof` then closes the child's stdin (non-PTY
+    /// sessions); without it the session keeps accepting further writes.
+    Write { session: u32, eof: bool },
+    /// Client → server; `kill(pid, signal)` for a registered session. One
+    /// `OpenReply` then close.
+    Signal { session: u32, signal: Signal },
     /// Client → server on a pairing-only connection; `PairMsg` exchange.
     Pair,
 }
@@ -66,6 +74,7 @@ pub enum OpenKind {
     Read = 10,
     Write = 11,
     Pair = 12,
+    Signal = 13,
 }
 
 impl OpenKind {
@@ -84,6 +93,7 @@ impl OpenKind {
             10 => Self::Read,
             11 => Self::Write,
             12 => Self::Pair,
+            13 => Self::Signal,
             _ => return None,
         })
     }
@@ -116,6 +126,7 @@ impl Open {
             Self::Read { .. } => OpenKind::Read,
             Self::Write { .. } => OpenKind::Write,
             Self::Pair => OpenKind::Pair,
+            Self::Signal { .. } => OpenKind::Signal,
         }
     }
 
@@ -137,8 +148,11 @@ impl Open {
             Self::File { op, cwd } => {
                 postcard::to_io(&(op, cwd), &mut out)?;
             }
-            Self::Cwd { session } | Self::Attach { session } | Self::Write { session } => {
+            Self::Cwd { session } | Self::Attach { session } => {
                 postcard::to_io(session, &mut out)?;
+            }
+            Self::Write { session, eof } => {
+                postcard::to_io(&(session, eof), &mut out)?;
             }
             Self::Read {
                 session,
@@ -147,6 +161,9 @@ impl Open {
                 wait_ms,
             } => {
                 postcard::to_io(&(session, offset, max, wait_ms), &mut out)?;
+            }
+            Self::Signal { session, signal } => {
+                postcard::to_io(&(session, signal), &mut out)?;
             }
         }
         Ok(out)
@@ -205,10 +222,15 @@ impl Open {
                     wait_ms,
                 }
             }
-            OpenKind::Write => Self::Write {
-                session: frame::decode(rest)?,
-            },
+            OpenKind::Write => {
+                let (session, eof) = frame::decode(rest)?;
+                Self::Write { session, eof }
+            }
             OpenKind::Pair => Self::Pair,
+            OpenKind::Signal => {
+                let (session, signal) = frame::decode(rest)?;
+                Self::Signal { session, signal }
+            }
         })
     }
 }
@@ -305,8 +327,15 @@ mod tests {
                 max: 65536,
                 wait_ms: 1500,
             },
-            Open::Write { session: 3 },
+            Open::Write {
+                session: 3,
+                eof: true,
+            },
             Open::Pair,
+            Open::Signal {
+                session: 5,
+                signal: Signal::Term,
+            },
         ];
         for open in cases {
             let frame = open.encode_frame().unwrap();

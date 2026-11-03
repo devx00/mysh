@@ -137,6 +137,10 @@ enum Open {
     Cwd { session: u32 },                      // client → server; one CwdReply then close
     Attach { session: u32 },                   // client → server; reattach a detached PTY session (§10bis)
     ListSessions,                              // client → server; one Msg<Vec<DetachedSession>> then close (§10bis)
+    Info,                                      // client → server; one Msg<Info> then close (§10quater)
+    Read { session: u32, offset: u64, max: u32, wait_ms: u32 }, // client → server; one Msg<ReadReply> then close (§10ter)
+    Write { session: u32, eof: bool },         // client → server; raw stdin, then close (§10ter)
+    Signal { session: u32, signal: Signal },   // client → server; kill(pid, signal), then close (§10ter)
 }
 
 enum OpenReply {
@@ -194,6 +198,7 @@ struct SessionRequest {
     env: Vec<(String, String)>,        // filtered by the server (02-security.md)
     pty: Option<PtyRequest>,
     cwd: Option<String>,               // start directory; `~/` expanded, relative to home; unusable → home
+    persist: bool,                     // register the session server-side and keep it when this stream closes (§10ter)
 }
 enum SessionKind { Shell, Exec { argv: Vec<String> } }
 struct PtyRequest { term: String, size: WinSize }
@@ -244,6 +249,24 @@ turns the new stream into the session stream: `Attached` (in place of
 `SessionIn`/`SessionOut` rules, ending in `Exited`. A client should send
 `Resize` right after `Attached`, since its terminal is not the one the
 session last saw. Exec (non-PTY) sessions never persist.
+
+**Offsets.** Every *registered* session — a PTY session (which may be
+detached and reattached) and any session opened with `persist: true` —
+has a server-side output ring addressed by **absolute byte offsets**:
+`next` counts every byte the session ever produced on either stream,
+`oldest` is the first byte still retained (the ring keeps 1 MiB), and the
+pump fills it whether or not a stream is attached. The attached stream
+still receives live `SessionOut` messages; the ring only records what was
+produced, so a reader using `Open::Read` (§10ter) and an attached client
+see the same bytes. Offsets are per session and never restart.
+
+A `persist: true` session is registered at `Started` and survives the
+stream that opened it: dropping that stream is a detach (for a PTY
+session, exactly as in §10bis), not a hang-up, and the session stays
+addressable until the grace window passes — including after its process
+exits, so a reader can still collect the output and the status. The
+server answers `Err { Unsupported }` to `persist: true` when its grace
+window is 0.
 
 ## 8. TCP forwarding streams
 
@@ -320,7 +343,11 @@ struct DetachedSession {
     kind: String,            // "shell" or the exec command line
     started: i64,            // unix seconds
     detached: Option<i64>,   // unix seconds; None while attached
-    buffered: u64,
+    buffered: u64,           // produced but not yet handed to a session stream
+    pty: bool,               // false for a `session new` exec session
+    next: u64,               // absolute offset past the newest byte (§7)
+    oldest: u64,             // absolute offset of the oldest byte still readable
+    exited: Option<ExitStatus>, // set once the process ended; the entry stays for the grace window
 }
 ```
 
@@ -339,6 +366,78 @@ Server side the detached session is owned by the server, not by any
 connection: a grace timer (default 10 min, `--detach-grace SECS`) hangs it
 up (close the master → `SIGHUP`, reap) when nobody reattaches; server
 shutdown hangs every detached session up.
+
+## 10ter. Reading, writing and signalling a session
+
+The three streams of the remote process API (05-meta-shell.md, "Session
+command family"). Each addresses a **registered** session (§7) by id and
+is refused with `Err { NotFound }` unless the connecting client key owns
+it — another key's sessions do not exist. Every call is a short-lived
+stream, so one connection serves any number of sessions and readers.
+
+`Open::Read { session, offset, max, wait_ms }` (kind 10) → `Ok` →
+`Msg<ReadReply>` → close.
+
+```rust
+struct ReadReply {
+    offset: u64,             // first byte returned: max(requested offset, oldest)
+    next: u64,               // offset to pass next
+    oldest: u64,             // oldest offset the server still has
+    chunks: Vec<Chunk>,      // runs of bytes in arrival order
+    exited: Option<ExitStatus>,
+}
+struct Chunk { stream: OutStream, bytes: Vec<u8> }
+enum OutStream { Stdout, Stderr }
+```
+
+`max` is clamped to 1 MiB and further to what one control message can
+carry (256 KiB less framing); the reader continues from `next`. `wait_ms`
+is clamped to 60 s: when nothing at or after `offset` is buffered and the
+process is still running, the server waits that long for new output
+before answering (an empty reply is a legitimate answer). Reads are
+**idempotent**: the same offset returns the same bytes until they age out
+of the ring, and `offset > requested` says exactly how much was lost.
+Non-PTY sessions keep stdout and stderr apart through `Chunk.stream`; a
+PTY session has one stream, as a terminal does.
+
+`Open::Write { session, eof }` (kind 11) → `Ok` → raw bytes until the
+client half-closes → close. The bytes go to the session's stdin (the pty
+master, or the child's stdin pipe); with `eof` the child's stdin is
+closed afterwards, which is how a `cat` session is ended. Without it the
+session keeps accepting further writes. A write that the child does not
+read within 5 s is dropped rather than stalling the pump that drains its
+output.
+
+`Open::Signal { session, signal }` (kind 13) → `Ok` → close, after
+`kill(child_pid, signal)`; `Err { Io }` carries the OS message. It is the
+streamless form of `SessionIn::Signal`, usable while no stream is open.
+
+## 10quater. Server info
+
+`Open::Info` (kind 9) → `Ok` → `Msg<Info>` → close. Nothing runs on the
+server: the reply is assembled from the connection's effective policy
+(per-key options applied, §2), the process environment and `uname(2)`. A
+client — or a program driving one (05-meta-shell.md "Agent interface") —
+learns what it is talking to before opening a session.
+
+```rust
+struct Info {
+    name: String,            // ServerHello.name
+    version: String,         // mysh version of the server binary
+    platform: Platform,      // { os: "linux"|"macos"|"android", arch: "aarch64"|…, kernel: "6.8.0-…" (uname -r; "" if unknown) }
+    shell: String,           // what a Shell session runs (--shell → $SHELL → passwd → /bin/sh)
+    home: String,
+    user: String,
+    caps: u32,               // the ServerHello.caps bits
+    limits: Limits,          // { max_sessions, max_listeners, max_streams, detach_grace_secs, idle_timeout_secs, handshakes_per_minute, denied: ["exec", …] }
+    uptime_secs: u64,        // since the server process started
+}
+```
+
+`limits.denied` lists the features switched off for **this** connection
+by `--deny` and the key's options, with the `--deny` spellings (`pty`,
+`exec`, `files`, `forward-local`, `forward-remote`). No `Denied` case: the
+reply is always answered for an authorized client.
 
 ## 11. Versioning and extensibility
 
@@ -368,3 +467,5 @@ shutdown hangs every detached session up.
 | server idle close             | 120 s (`--idle-timeout`) |
 | rekey (bytes / age of key)    | 1 GiB / 1 h |
 | detach grace / detached ring  | 600 s (`--detach-grace`) / 1 MiB |
+| `Open::Read` max / wait       | 1 MiB / 60 s |
+| master idle exit              | 600 s (`--idle`) |

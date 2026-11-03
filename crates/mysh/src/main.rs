@@ -11,6 +11,7 @@ use mysh::cli::{Cli, Command, ConnectArgs, ConnectOpts};
 use mysh::client::ClientCommand;
 use mysh::config::{Config, Paths, Target, resolve_target};
 use mysh::identity::{self, Baked};
+use mysh::output::{ErrorOut, Mode, code_for, codes};
 use tracing_subscriber::EnvFilter;
 
 /// Exit code for usage, configuration, and identity errors.
@@ -19,7 +20,10 @@ const EXIT_USAGE: u8 = 2;
 const EXIT_SERVE: u8 = 1;
 
 fn main() -> ExitCode {
-    let cli = mysh::cli::parse();
+    let cli = match mysh::cli::try_parse_from(std::env::args_os()) {
+        Ok(cli) => cli,
+        Err(e) => return usage_failure(&e),
+    };
     init_logging(cli.verbose);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -30,6 +34,7 @@ fn main() -> ExitCode {
             return fail(
                 &anyhow::Error::from(e).context("starting runtime"),
                 EXIT_SERVE,
+                Mode::Human,
             );
         }
     };
@@ -63,13 +68,76 @@ fn init_logging(verbose: u8) {
         .init();
 }
 
-/// Print an anyhow chain as `mysh: error: …` and return `code`.
-fn fail(err: &anyhow::Error, code: u8) -> ExitCode {
-    eprintln!("mysh: error: {err:#}");
+/// A clap parse failure: clap's own diagnostics (and exit code 0 for
+/// `--help`/`--version`), or a `usage` [`ErrorOut`] when the command line
+/// asked for JSON.
+fn usage_failure(err: &clap::Error) -> ExitCode {
+    use clap::error::ErrorKind;
+    let wants_json = std::env::args_os()
+        .skip(1)
+        .any(|a| a == "--json" || a == "--json-stream");
+    if !wants_json
+        || matches!(
+            err.kind(),
+            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+        )
+    {
+        err.exit();
+    }
+    let message = err.render().to_string();
+    eprintln!(
+        "{}",
+        ErrorOut::new(codes::USAGE, message.trim_end()).to_line()
+    );
+    ExitCode::from(EXIT_USAGE)
+}
+
+/// Print an anyhow chain as `mysh: error: …` (an [`ErrorOut`] line in the
+/// JSON modes) and return `code`. An unclassified error that exits with
+/// the usage code reports `usage`.
+fn fail(err: &anyhow::Error, code: u8, mode: Mode) -> ExitCode {
+    if mode.is_json() {
+        let mut out = ErrorOut::from_error(err);
+        if out.error.code == codes::INTERNAL && code == EXIT_USAGE {
+            codes::USAGE.clone_into(&mut out.error.code);
+        }
+        eprintln!("{}", out.to_line());
+    } else {
+        eprintln!("mysh: error: {err:#}");
+    }
     ExitCode::from(code)
 }
 
+/// The output mode the connection options ask for.
+fn mode_for(opts: &ConnectOpts) -> Mode {
+    let stdout_tty = mysh_pty::terminal::is_terminal(std::io::stdout());
+    Mode::select(opts.json, opts.json_stream, opts.plain, stdout_tty)
+}
+
 async fn run(cli: Cli) -> ExitCode {
+    // The connect options are parsed for every command; a subcommand that
+    // takes no HOST leaves them at their defaults (human/plain).
+    let mode = match &cli.command {
+        Some(Command::Put(h)) => mode_for(&h.opts),
+        Some(Command::Get(h)) => mode_for(&h.opts),
+        Some(Command::Forward(h)) => mode_for(&h.opts),
+        Some(Command::Authorize(h)) => mode_for(&h.opts),
+        Some(Command::Connect(args)) => mode_for(&args.opts),
+        Some(Command::Session(h)) => mode_for(&h.opts),
+        Some(Command::Master(h)) => mode_for(&h.opts),
+        None => mode_for(&cli.connect.opts),
+        Some(Command::Help(args)) if args.json => Mode::Json,
+        Some(_) => Mode::Human,
+    };
+    if let Some(Command::Help(args)) = &cli.command {
+        return match mysh::cli::help_text(args) {
+            Ok(text) => {
+                print!("{text}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&anyhow::anyhow!(e), EXIT_USAGE, mode),
+        };
+    }
     let paths = Paths::from_env();
     let config = match Config::load(&paths.config_file) {
         Ok(c) => c,
@@ -78,30 +146,33 @@ async fn run(cli: Cli) -> ExitCode {
                 &anyhow::Error::from(e)
                     .context(format!("loading config {}", paths.config_file.display())),
                 EXIT_USAGE,
+                mode,
             );
         }
     };
     let baked = match identity::baked() {
         Ok(b) => b,
-        Err(e) => return fail(&e, EXIT_USAGE),
+        Err(e) => return fail(&e, EXIT_USAGE, mode),
     };
 
     match cli.command {
         Some(Command::Serve(args)) => match mysh::server::serve(args, paths).await {
             Ok(()) => ExitCode::SUCCESS,
-            Err(e) => fail(&e, EXIT_SERVE),
+            Err(e) => fail(&e, EXIT_SERVE, mode),
         },
         Some(Command::Keygen(args)) => match identity::keygen(&args, &paths) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(e) => fail(&e, EXIT_USAGE),
+            Err(e) => fail(&e, EXIT_USAGE, mode),
         },
         Some(Command::Fingerprint(args)) => match identity::fingerprint(&args) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(e) => fail(&e, EXIT_USAGE),
+            Err(e) => fail(&e, EXIT_USAGE, mode),
         },
         other => match client_request(other, cli.connect) {
-            Ok((host, opts, cmd)) => client(&host, &opts, &config, cmd, paths, baked).await,
-            Err(e) => fail(&e, EXIT_USAGE),
+            Ok((host, opts, cmd)) => {
+                Box::pin(client(&host, &opts, &config, cmd, paths, baked, mode)).await
+            }
+            Err(e) => fail(&e, EXIT_USAGE, mode),
         },
     }
 }
@@ -125,21 +196,28 @@ fn client_request(command: Option<Command>, bare: ConnectArgs) -> Result<ClientR
         Some(Command::Put(h)) => Ok((h.host, h.opts, ClientCommand::Put(h.args))),
         Some(Command::Get(h)) => Ok((h.host, h.opts, ClientCommand::Get(h.args))),
         Some(Command::Authorize(h)) => Ok((h.host, h.opts, ClientCommand::Authorize(h.args))),
+        Some(Command::Session(h)) => Ok((h.host, h.opts, ClientCommand::Session(h.args))),
+        Some(Command::Master(h)) => Ok((h.host, h.opts, ClientCommand::Master(h.args))),
         Some(Command::Forward(h)) => {
             if h.opts.local.is_empty() && h.opts.remote.is_empty() && h.opts.dynamic.is_empty() {
                 bail!("mysh forward needs at least one of -L, -R, or -D");
             }
             Ok((h.host, h.opts, ClientCommand::Forward(h.args)))
         }
-        Some(Command::Serve(_) | Command::Keygen(_) | Command::Fingerprint(_)) => {
+        Some(
+            Command::Serve(_) | Command::Keygen(_) | Command::Fingerprint(_) | Command::Help(_),
+        ) => {
             bail!("internal error: non-client command reached client dispatch")
         }
     }
 }
 
-/// Resolve `host` against the config and run the client command. File and
-/// forward subcommands first try the control socket of an interactive
-/// client for the same target (docs/05 "Control socket") unless `--no-ctl`.
+/// Resolve `host` against the config and run the client command. File,
+/// forward, `session` and `exec`/`CMD` calls first try the control socket
+/// of a running client or master for the same target (docs/05 "Control
+/// socket", "Master mode") unless `--no-ctl`; `master = auto` starts one
+/// when the socket is missing.
+#[allow(clippy::too_many_arguments)] // one call site; the request is already split into its parts
 async fn client(
     host: &str,
     opts: &ConnectOpts,
@@ -147,29 +225,99 @@ async fn client(
     cmd: ClientCommand,
     paths: Paths,
     baked: Baked,
+    mode: Mode,
 ) -> ExitCode {
     let mut target = match resolve(host, opts, config) {
         Ok(t) => t,
-        Err(e) => return fail(&e, EXIT_USAGE),
+        Err(e) => return fail(&e, EXIT_USAGE, mode),
     };
     if matches!(cmd, ClientCommand::Forward(_)) {
         // `mysh forward` is `connect -N` with forwards.
         target.no_session = true;
     }
     if !target.no_ctl
+        && !matches!(cmd, ClientCommand::Master(_))
         && let Some(argv) = ctl_argv(&cmd, opts)
     {
-        let console = mysh::client::console::Console::new();
-        match mysh::client::ctl::request(&paths, &target, argv, &console).await {
-            Ok(Some(code)) => return ExitCode::from(u8::try_from(code).unwrap_or(255)),
-            Ok(None) => {}
-            Err(e) => return fail(&e.context("control socket request"), EXIT_SERVE),
+        let console = mysh::client::console::Console::with_mode(mode);
+        if target.master.spawns()
+            && let Err(e) = mysh::client::master::ensure(&paths, &target, None).await
+        {
+            if target.master == mysh::config::MasterMode::Always {
+                return fail(&e.context("starting the master"), EXIT_SERVE, mode);
+            }
+            console.notice(&format!("master not started: {e:#}"));
+        }
+        // Stdin is only read once a socket answers: a fallback to this
+        // process's own connection must still see every byte of it.
+        if mysh::client::ctl::socket_ready(&paths, &target).await {
+            // Only `exec`/`CMD` and `session send --stdin` consume stdin,
+            // and only up to the request cap; a larger input runs on a
+            // connection of this process's own.
+            match ctl_stdin(&cmd).await {
+                Err(TooMuchStdin) => {}
+                Ok(stdin) => {
+                    match mysh::client::ctl::request(&paths, &target, argv, &console, stdin).await {
+                        Ok(Some(code)) => {
+                            return ExitCode::from(u8::try_from(code).unwrap_or(255));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            return fail(&e.context("control socket request"), EXIT_SERVE, mode);
+                        }
+                    }
+                }
+            }
+        }
+        if target.master == mysh::config::MasterMode::Always {
+            return fail(
+                &anyhow::anyhow!("no control socket for {}", target.display),
+                EXIT_SERVE,
+                mode,
+            );
         }
     }
-    match mysh::client::run(target, cmd, paths, baked).await {
+    run_client(target, cmd, paths, baked, mode).await
+}
+
+async fn run_client(
+    target: Target,
+    cmd: ClientCommand,
+    paths: Paths,
+    baked: Baked,
+    mode: Mode,
+) -> ExitCode {
+    match mysh::client::run(target, cmd, paths, baked, mode).await {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(255)),
-        Err(e) => fail(&e, EXIT_USAGE),
+        Err(e) => {
+            let code = if code_for(&e) == codes::TIMEOUT {
+                u8::try_from(mysh::output::EXIT_TIMEOUT).unwrap_or(EXIT_USAGE)
+            } else {
+                EXIT_USAGE
+            };
+            fail(&e, code, mode)
+        }
     }
+}
+
+/// Stdin is larger than a control request may carry.
+struct TooMuchStdin;
+
+/// Standard input to hand to the serving client, if this command reads any.
+async fn ctl_stdin(cmd: &ClientCommand) -> Result<Vec<u8>, TooMuchStdin> {
+    let reads_stdin = match cmd {
+        ClientCommand::Connect { command } => !command.is_empty(),
+        ClientCommand::Session(args) => {
+            matches!(&args.cmd, mysh::cli::SessionCmd::Send(send) if send.stdin)
+        }
+        _ => false,
+    };
+    if !reads_stdin {
+        return Ok(Vec::new());
+    }
+    mysh::client::ctl::read_ctl_stdin()
+        .await
+        .ok_or(TooMuchStdin)
 }
 
 /// The prompt words for a subcommand that can run over the control socket.
@@ -178,6 +326,7 @@ fn ctl_argv(cmd: &ClientCommand, opts: &ConnectOpts) -> Option<Vec<String>> {
         ClientCommand::Put(args) => Some(args.to_argv()),
         ClientCommand::Get(args) => Some(args.to_argv()),
         ClientCommand::Authorize(args) => Some(args.to_argv()),
+        ClientCommand::Session(args) => Some(args.to_argv()),
         ClientCommand::Forward(_) => {
             let mut argv = vec!["forward".to_owned()];
             for (flag, specs) in [
@@ -192,7 +341,27 @@ fn ctl_argv(cmd: &ClientCommand, opts: &ConnectOpts) -> Option<Vec<String>> {
             }
             Some(argv)
         }
-        ClientCommand::Connect { .. } => None,
+        // `mysh HOST CMD` runs as `exec CMD` on the serving client. A
+        // command that needs the local terminal (`-t`, or stdin that is a
+        // tty) keeps its own connection.
+        ClientCommand::Connect { command } if !command.is_empty() => {
+            if opts.force_pty || mysh_pty::terminal::is_terminal(std::io::stdin()) {
+                return None;
+            }
+            let mut argv = vec!["exec".to_owned()];
+            if let Some(dir) = &opts.cwd {
+                argv.push("--cwd".to_owned());
+                argv.push(dir.clone());
+            }
+            if let Some(limit) = opts.timeout {
+                argv.push("--timeout".to_owned());
+                argv.push(format!("{}ms", limit.as_millis()));
+            }
+            argv.push("--".to_owned());
+            argv.extend(command.iter().cloned());
+            Some(argv)
+        }
+        ClientCommand::Connect { .. } | ClientCommand::Master(_) => None,
     }
 }
 

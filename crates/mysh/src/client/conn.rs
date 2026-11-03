@@ -51,6 +51,7 @@ use crate::{
     client::console::Console,
     config::{Paths, Target},
     identity::{Baked, ClientIdentity, ClientTrust, TrustDecision, client_identities},
+    output::{code_name, coded, codes},
 };
 
 /// Per-address TCP connect budget.
@@ -318,14 +319,23 @@ impl Inner {
     }
 }
 
-/// Resolve and dial `host:port`, trying each address in order.
+/// Resolve and dial `host:port`, trying each address in order. Failures
+/// carry the `connect_failed` code.
 async fn dial(host: &str, port: u16) -> Result<TcpStream> {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .with_context(|| format!("resolving {host}"))?
-        .collect();
+    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host, port)).await {
+        Ok(addrs) => addrs.collect(),
+        Err(e) => {
+            return Err(coded(
+                codes::CONNECT_FAILED,
+                anyhow::Error::from(e).context(format!("resolving {host}")),
+            ));
+        }
+    };
     if addrs.is_empty() {
-        bail!("{host}: no addresses");
+        return Err(coded(
+            codes::CONNECT_FAILED,
+            anyhow!("{host}: no addresses"),
+        ));
     }
     let mut last: Option<anyhow::Error> = None;
     for addr in addrs {
@@ -339,7 +349,10 @@ async fn dial(host: &str, port: u16) -> Result<TcpStream> {
             Err(_) => last = Some(anyhow!("{addr}: connect timed out")),
         }
     }
-    Err(last.unwrap_or_else(|| anyhow!("{host}:{port}: connect failed")))
+    Err(coded(
+        codes::CONNECT_FAILED,
+        last.unwrap_or_else(|| anyhow!("{host}:{port}: connect failed")),
+    ))
 }
 
 /// Outcome of one handshake attempt.
@@ -461,8 +474,13 @@ async fn attempt(
                     line,
                     expected,
                     actual,
-                } => Err(mismatch_error(target, &source, line, &expected, &actual)),
-                other @ TrustError::Strict { .. } => Err(anyhow!("{other}")),
+                } => Err(coded(
+                    codes::TRUST_MISMATCH,
+                    mismatch_error(target, &source, line, &expected, &actual),
+                )),
+                other @ TrustError::Strict { .. } => {
+                    Err(coded(codes::TRUST_UNKNOWN, anyhow!("{other}")))
+                }
             },
             Err(other) => Err(anyhow!("server not trusted: {other}")),
         },
@@ -471,16 +489,16 @@ async fn attempt(
             message,
         })) => Ok(Attempt::Refused(message)),
         Ok(Err(HandshakeError::SigAuthUnsupported)) => Ok(Attempt::SigAuthUnsupported),
-        Ok(Err(HandshakeError::Denied { code, message })) => {
-            Err(anyhow!("server refused the connection: {code}: {message}"))
-        }
+        Ok(Err(HandshakeError::Denied { code, message })) => Err(coded(
+            code_name(code),
+            anyhow!("server refused the connection: {code}: {message}"),
+        )),
         Ok(Err(e)) => {
             Err(e).with_context(|| format!("handshake with {}:{} failed", target.host, target.port))
         }
-        Err(_) => Err(anyhow!(
-            "handshake with {}:{} timed out",
-            target.host,
-            target.port
+        Err(_) => Err(coded(
+            codes::CONNECT_FAILED,
+            anyhow!("handshake with {}:{} timed out", target.host, target.port),
         )),
     }
 }
@@ -540,18 +558,24 @@ async fn accept_unknown(
     console: &Console,
 ) -> Result<()> {
     let stdin_tty = mysh_pty::terminal::is_terminal(std::io::stdin());
-    if !(console.is_tty() && stdin_tty) {
-        bail!(
-            "host key verification failed: {}:{} is not in known_hosts (key {}); \
-             use --accept-new or add it to {}",
-            target.host,
-            target.port,
-            key.fingerprint(),
-            trust.write_to.display()
-        );
+    if !(console.is_tty() && stdin_tty && console.mode() == crate::output::Mode::Human) {
+        return Err(coded(
+            codes::TRUST_UNKNOWN,
+            anyhow!(
+                "host key verification failed: {}:{} is not in known_hosts (key {}); \
+                 use --accept-new or add it to {}",
+                target.host,
+                target.port,
+                key.fingerprint(),
+                trust.write_to.display()
+            ),
+        ));
     }
     if !tofu_prompt(target, &key, console).await? {
-        bail!("host key verification failed");
+        return Err(coded(
+            codes::TRUST_UNKNOWN,
+            anyhow!("host key verification failed"),
+        ));
     }
     KnownHosts::append(&trust.write_to, &target.host, target.port, &key)
         .with_context(|| format!("writing {}", trust.write_to.display()))?;
@@ -643,18 +667,19 @@ pub async fn connect(
     } else {
         ""
     };
-    match refused.as_slice() {
-        [] => bail!(
+    let err = match refused.as_slice() {
+        [] => anyhow!(
             "no usable identity for {}:{}{agent_note}",
             target.host,
             target.port
         ),
-        [only] => bail!("server refused our key {only}: {last_message}{agent_note}"),
-        many => bail!(
+        [only] => anyhow!("server refused our key {only}: {last_message}{agent_note}"),
+        many => anyhow!(
             "server refused every identity: {last_message} (tried {}){agent_note}",
             many.join(", ")
         ),
-    }
+    };
+    Err(coded(codes::UNAUTHORIZED, err))
 }
 
 async fn establish(

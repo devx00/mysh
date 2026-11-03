@@ -34,6 +34,10 @@ use crate::{
         terminal::{Input, Terminal},
     },
     config::{ForwardSpec, Target, decode_send_text, expand_tilde},
+    output::{
+        self, ConnectionOut, CwdOut, EXIT_TIMEOUT, ExecResult, ForwardRow, InfoOut, JobOut, JobRow,
+        OkOut, PingOut, ProgressOut, SessionRow, SessionsOut, code_for, codes, millis,
+    },
 };
 
 pub use crate::client::editor::{HISTORY_CAP, History};
@@ -360,7 +364,7 @@ fn ms(d: Duration) -> String {
 /// session commands are refused and nothing is cancellable.
 pub async fn execute(ctx: &mut Ctx, cmd: MetaCommand, term: Option<&mut Terminal>) -> Result<Flow> {
     match cmd {
-        MetaCommand::Help { cmd } => ctx.console.print(&meta_help(cmd.as_deref())),
+        MetaCommand::Help { json, cmd } => cmd_help(ctx, json, cmd.as_deref())?,
         MetaCommand::Shell(_)
         | MetaCommand::Fg { .. }
         | MetaCommand::Sessions { .. }
@@ -372,15 +376,28 @@ pub async fn execute(ctx: &mut Ctx, cmd: MetaCommand, term: Option<&mut Terminal
         MetaCommand::Put(_)
         | MetaCommand::Get(_)
         | MetaCommand::Ls(_)
+        | MetaCommand::Stat { .. }
         | MetaCommand::Authorize(_) => execute_transfer(ctx, cmd, term).await?,
         MetaCommand::Cwd => cmd_cwd(ctx).await,
         MetaCommand::Lcd { dir } => cmd_lcd(ctx, dir.as_deref())?,
         MetaCommand::Forward(args) => cmd_forward(ctx, &args).await?,
-        MetaCommand::Exec { command } => {
-            let code = exec_command(ctx, command, term).await?;
-            ctx.console.println(&format!("[exit {code}]"));
+        MetaCommand::Exec {
+            timeout,
+            cwd,
+            command,
+        } => {
+            let timeout = timeout.or(ctx.shared.conn.target().timeout);
+            let code = exec_command(ctx, command, cwd, timeout, None, term).await?;
+            if !ctx.console.mode().is_json() {
+                ctx.console.println(&format!("[exit {code}]"));
+            }
         }
-        MetaCommand::Info => cmd_info(ctx),
+        MetaCommand::Session(args) => {
+            let conn = ctx.shared.conn.clone();
+            let console = ctx.console.clone();
+            crate::client::session_api::run(&conn, &console, &args, None).await?;
+        }
+        MetaCommand::Info => cmd_info(ctx).await?,
         MetaCommand::Ping { count } => cmd_ping(ctx, count.unwrap_or(4).max(1), term).await?,
         MetaCommand::Log { target } => cmd_log(ctx, &target)?,
         MetaCommand::Jobs { wait, id } => cmd_jobs(ctx, wait, id).await?,
@@ -427,15 +444,7 @@ async fn execute_session(
             Ok(Flow::Foreground(id))
         }
         MetaCommand::Sessions { all } => {
-            if ctx.session_count() == 0 {
-                ctx.console.println("no sessions");
-            } else {
-                ctx.console.print(&format_sessions(ctx));
-            }
-            if all {
-                ctx.console.println("server:");
-                attach::print_remote(&ctx.shared.conn, &ctx.console).await?;
-            }
+            cmd_sessions(ctx, all).await?;
             Ok(Flow::Continue)
         }
         MetaCommand::Attach { id } => {
@@ -452,6 +461,7 @@ async fn execute_session(
                 bail!("detach: only at the prompt");
             }
             attach::detach(&ctx.shared.conn, &ctx.console, &mut ctx.stack, id)?;
+            ctx.console.report(&OkOut::OK, String::new);
             Ok(Flow::Continue)
         }
         MetaCommand::Kill { signal, id } => {
@@ -480,21 +490,24 @@ async fn execute_session(
                 .ok_or_else(|| anyhow!("resize: no sessions"))?;
             let ws = t.winsize();
             ctx.stack.resize(id, ws)?;
-            ctx.console
-                .println(&format!("session {id}: {}x{}", ws.cols, ws.rows));
+            ctx.console.report(&OkOut::OK, || {
+                format!("session {id}: {}x{}\n", ws.cols, ws.rows)
+            });
             Ok(Flow::Continue)
         }
         other => bail!("internal: {other:?} is not a session command"),
     }
 }
 
-/// File commands; cancellable with `Ctrl-C` at an interactive prompt.
+/// File commands; cancellable with `Ctrl-C` at an interactive prompt and
+/// bounded by the connection's `--timeout`.
 async fn execute_transfer(
     ctx: &mut Ctx,
     cmd: MetaCommand,
     term: Option<&mut Terminal>,
 ) -> Result<()> {
     let conn = ctx.shared.conn.clone();
+    let limit = conn.target().timeout;
     let (name, done) = match cmd {
         MetaCommand::Put(args) => {
             let remote = mru_cwd(ctx).await;
@@ -505,7 +518,10 @@ async fn execute_transfer(
                 remote.as_deref(),
                 &ctx.local_cwd,
             );
-            ("put", cancellable(term, fut).await?.is_some())
+            (
+                "put",
+                cancellable(term, bounded(limit, fut)).await?.is_some(),
+            )
         }
         MetaCommand::Get(args) => {
             let remote = mru_cwd(ctx).await;
@@ -516,12 +532,20 @@ async fn execute_transfer(
                 remote.as_deref(),
                 &ctx.local_cwd,
             );
-            ("get", cancellable(term, fut).await?.is_some())
+            (
+                "get",
+                cancellable(term, bounded(limit, fut)).await?.is_some(),
+            )
         }
         MetaCommand::Ls(args) => {
             let remote = mru_cwd(ctx).await;
             let fut = files::ls(&conn, &ctx.console, &args, remote.as_deref());
             ("ls", cancellable(term, fut).await?.is_some())
+        }
+        MetaCommand::Stat { path } => {
+            let remote = mru_cwd(ctx).await;
+            let fut = files::stat_cmd(&conn, &ctx.console, &path, remote.as_deref());
+            ("stat", cancellable(term, fut).await?.is_some())
         }
         MetaCommand::Authorize(args) => {
             let line = pubkey_line(
@@ -538,6 +562,87 @@ async fn execute_transfer(
     if !done {
         ctx.console.println(&format!("{name}: cancelled"));
     }
+    Ok(())
+}
+
+/// Run `fut` within `limit` (none: unbounded); expiry is a `timeout` error.
+pub async fn bounded<T>(
+    limit: Option<Duration>,
+    fut: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match limit {
+        None => fut.await,
+        Some(d) => match tokio::time::timeout(d, fut).await {
+            Ok(r) => r,
+            Err(_) => Err(output::coded(
+                codes::TIMEOUT,
+                anyhow!("timed out after {}", format_duration(d)),
+            )),
+        },
+    }
+}
+
+/// `sessions [-a]`: the stack, and with `-a` the server's registered
+/// sessions below it.
+async fn cmd_sessions(ctx: &Ctx, all: bool) -> Result<()> {
+    if ctx.console.mode().is_json() {
+        let server = if all {
+            Some(attach::list(&ctx.shared.conn).await?)
+        } else {
+            None
+        };
+        let out = SessionsOut {
+            sessions: ctx.session_rows().iter().map(session_row).collect(),
+            server,
+        };
+        ctx.console.report(&out, String::new);
+        return Ok(());
+    }
+    if ctx.session_count() == 0 {
+        ctx.console.println("no sessions");
+    } else {
+        ctx.console.print(&format_sessions(ctx));
+    }
+    if all {
+        ctx.console.println("server:");
+        attach::print_remote(&ctx.shared.conn, &ctx.console).await?;
+    }
+    Ok(())
+}
+
+fn session_row(s: &SessionInfo) -> SessionRow {
+    SessionRow {
+        id: s.id,
+        pid: s.pid,
+        kind: s.kind.clone(),
+        buffered: s.buffered as u64,
+        mru: s.mru,
+        foreground: s.foreground,
+    }
+}
+
+/// `help [--json] [CMD]`: the prompt grammar as text or as a tree.
+fn cmd_help(ctx: &Ctx, json: bool, cmd: Option<&str>) -> Result<()> {
+    if json || ctx.console.mode().is_json() {
+        let tree = crate::cli::meta_help_tree();
+        let tree = match cmd {
+            Some(name) => tree
+                .subcommand(name)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown command {name:?}; type `help` for the list"))?,
+            None => tree,
+        };
+        if ctx.console.mode().is_json() {
+            ctx.console.report(&tree, String::new);
+        } else {
+            ctx.console.print(&format!(
+                "{}\n",
+                serde_json::to_string(&tree).unwrap_or_default()
+            ));
+        }
+        return Ok(());
+    }
+    ctx.console.print(&meta_help(cmd));
     Ok(())
 }
 
@@ -567,7 +672,8 @@ fn cmd_kill(ctx: &Ctx, signal: Option<&str>, id: &str) -> Result<()> {
             .parse()
             .map_err(|_| anyhow!("kill: invalid job id {id:?}"))?;
         ctx.shared.jobs.cancel(job)?;
-        ctx.console.println(&format!("job {job} cancelled"));
+        ctx.console
+            .report(&OkOut::OK, || format!("job {job} cancelled\n"));
         return Ok(());
     }
     let sig = match signal {
@@ -577,7 +683,31 @@ fn cmd_kill(ctx: &Ctx, signal: Option<&str>, id: &str) -> Result<()> {
     let id: u32 = id
         .parse()
         .map_err(|_| anyhow!("kill: invalid session id {id:?} (jobs are `%ID`)"))?;
-    ctx.signal(id, sig)
+    ctx.signal(id, sig)?;
+    ctx.console.report(&OkOut::OK, String::new);
+    Ok(())
+}
+
+fn job_row(j: &jobs::JobInfo) -> JobRow {
+    let (state, exit, error) = match &j.state {
+        jobs::JobState::Running => ("running", None, None),
+        jobs::JobState::Done { code } => ("done", Some(*code), None),
+        jobs::JobState::Failed { msg } => ("failed", None, Some(msg.clone())),
+        jobs::JobState::Cancelled => ("cancelled", None, None),
+    };
+    JobRow {
+        id: j.id,
+        state: state.to_owned(),
+        exit,
+        error,
+        elapsed_ms: u64::try_from(j.elapsed().as_millis()).unwrap_or(u64::MAX),
+        command: j.line.clone(),
+        progress: j.progress.as_ref().map(|p| ProgressOut {
+            label: p.label.clone(),
+            done: p.done,
+            total: p.total,
+        }),
+    }
 }
 
 /// `jobs [-w] [ID]`: list jobs, show one job's state and output, or wait
@@ -585,11 +715,15 @@ fn cmd_kill(ctx: &Ctx, signal: Option<&str>, id: &str) -> Result<()> {
 async fn cmd_jobs(ctx: &Ctx, wait: bool, id: Option<u32>) -> Result<()> {
     let jobs = &ctx.shared.jobs;
     let Some(id) = id else {
-        if jobs.list().is_empty() {
-            ctx.console.println("no jobs");
-        } else {
-            ctx.console.print(&jobs.format_list());
-        }
+        let list = jobs.list();
+        let rows: Vec<JobRow> = list.iter().map(job_row).collect();
+        ctx.console.report(&rows, || {
+            if list.is_empty() {
+                "no jobs\n".to_owned()
+            } else {
+                jobs.format_list()
+            }
+        });
         return Ok(());
     };
     if wait {
@@ -598,28 +732,39 @@ async fn cmd_jobs(ctx: &Ctx, wait: bool, id: Option<u32>) -> Result<()> {
             .ok_or_else(|| anyhow!("jobs: no job {id}"))?;
     }
     let (info, output) = jobs.get(id).ok_or_else(|| anyhow!("jobs: no job {id}"))?;
-    ctx.console
-        .println(&format!("job {id} {}: {}", info.state, info.summary()));
-    if !output.is_empty() {
-        let text = String::from_utf8_lossy(&output);
-        ctx.console.print(text.trim_end_matches('\n'));
-        ctx.console.print("\n");
-    }
+    let out = JobOut {
+        job: job_row(&info),
+        output: output::Bytes::new(output.clone()),
+    };
+    ctx.console.report(&out, || {
+        let mut text = format!("job {id} {}: {}\n", info.state, info.summary());
+        if !output.is_empty() {
+            text.push_str(String::from_utf8_lossy(&output).trim_end_matches('\n'));
+            text.push('\n');
+        }
+        text
+    });
     Ok(())
 }
 
 async fn cmd_cwd(ctx: &Ctx) {
-    let remote = if let Some(id) = ctx.mru() {
-        match ctx.shared.conn.cwd_probe(id).await {
-            Some(cwd) => format!("{cwd} (session {id})"),
-            None => format!("~ (probe failed for session {id}; server home)"),
-        }
-    } else {
-        "~ (no session; server home)".to_owned()
+    let (session, cwd) = match ctx.mru() {
+        Some(id) => (Some(id), ctx.shared.conn.cwd_probe(id).await),
+        None => (None, None),
     };
-    ctx.console.println(&format!("remote: {remote}"));
-    ctx.console
-        .println(&format!("local:  {}", ctx.local_cwd.display()));
+    let out = CwdOut {
+        remote: cwd.clone(),
+        session,
+        local: ctx.local_cwd.display().to_string(),
+    };
+    ctx.console.report(&out, || {
+        let remote = match (session, cwd) {
+            (Some(id), Some(cwd)) => format!("{cwd} (session {id})"),
+            (Some(id), None) => format!("~ (probe failed for session {id}; server home)"),
+            (None, _) => "~ (no session; server home)".to_owned(),
+        };
+        format!("remote: {remote}\nlocal:  {}\n", ctx.local_cwd.display())
+    });
 }
 
 fn cmd_lcd(ctx: &mut Ctx, dir: Option<&str>) -> Result<()> {
@@ -637,76 +782,174 @@ fn cmd_lcd(ctx: &mut Ctx, dir: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn forward_row(f: &ForwardInfo) -> ForwardRow {
+    ForwardRow {
+        id: f.id,
+        kind: match f.kind {
+            ForwardKind::Local => "local",
+            ForwardKind::Remote => "remote",
+            ForwardKind::Dynamic => "dynamic",
+        }
+        .to_owned(),
+        bind: f.bind.to_string(),
+        target: f.target.as_ref().map(|(h, p)| format!("{h}:{p}")),
+        accepted: f.accepted,
+    }
+}
+
 async fn cmd_forward(ctx: &Ctx, args: &crate::cli::ForwardArgs) -> Result<()> {
     match args.action().map_err(|e| anyhow!(e))? {
         ForwardAction::Add => {
+            let mut added = Vec::new();
+            let mut text = String::new();
             for s in &args.local {
                 let spec = ForwardSpec::parse_local(s).map_err(|e| anyhow!(e))?;
                 let id = ctx.shared.forwards.add_local(&spec).await?;
-                ctx.console.println(&format!("forward {id}: -L {s}"));
+                added.push(id);
+                let _ = writeln!(text, "forward {id}: -L {s}");
             }
             for s in &args.remote {
                 let spec = ForwardSpec::parse_local(s).map_err(|e| anyhow!(e))?;
                 let id = ctx.shared.forwards.add_remote(&spec).await?;
-                ctx.console.println(&format!("forward {id}: -R {s}"));
+                added.push(id);
+                let _ = writeln!(text, "forward {id}: -R {s}");
             }
             for s in &args.dynamic {
                 let spec = ForwardSpec::parse_dynamic(s).map_err(|e| anyhow!(e))?;
                 let id = ctx.shared.forwards.add_dynamic(&spec).await?;
-                ctx.console.println(&format!("forward {id}: -D {s}"));
+                added.push(id);
+                let _ = writeln!(text, "forward {id}: -D {s}");
             }
+            let rows: Vec<ForwardRow> = ctx
+                .shared
+                .forwards
+                .list()
+                .iter()
+                .filter(|f| added.contains(&f.id))
+                .map(forward_row)
+                .collect();
+            ctx.console.report(&rows, || text);
         }
         ForwardAction::List => {
             let list = ctx.shared.forwards.list();
-            if list.is_empty() {
-                ctx.console.println("no forwards");
-            }
-            for f in &list {
-                ctx.console.println(&format_forward(f));
-            }
+            let rows: Vec<ForwardRow> = list.iter().map(forward_row).collect();
+            ctx.console.report(&rows, || {
+                if list.is_empty() {
+                    return "no forwards\n".to_owned();
+                }
+                let mut text = String::new();
+                for f in &list {
+                    let _ = writeln!(text, "{}", format_forward(f));
+                }
+                text
+            });
         }
         ForwardAction::Remove(id) => {
             if !ctx.shared.forwards.remove(id).await {
                 bail!("forward rm: no forward {id}");
             }
-            ctx.console.println(&format!("forward {id} removed"));
+            ctx.console
+                .report(&OkOut::OK, || format!("forward {id} removed\n"));
         }
     }
     Ok(())
 }
 
-fn cmd_info(ctx: &Ctx) {
-    let conn = &ctx.shared.conn;
-    let stats = conn.stats();
-    let rtt = conn.last_rtt().map_or_else(|| "n/a".to_owned(), ms);
-    let mut out = format!(
-        "server:    {} ({})\n\
-         protocol:  v{}\n\
-         peer key:  {} (trusted via {})\n\
-         our key:   {}\n\
-         cipher:    {}\n\
-         uptime:    {}\n\
-         traffic:   {} in, {} out\n\
-         rtt:       {rtt}\n\
-         sessions:  {}\n",
-        conn.server_hello().name,
-        conn.peer_addr(),
-        conn.version(),
-        conn.remote_key().fingerprint(),
-        conn.trusted_via(),
-        conn.identity().describe(),
-        mysh_proto::NOISE_PATTERN,
-        format_duration(conn.connected_at().elapsed()),
-        human(stats.bytes_in),
-        human(stats.bytes_out),
-        ctx.session_count(),
-    );
-    let forwards = ctx.shared.forwards.list();
-    let _ = writeln!(out, "forwards:  {}", forwards.len());
-    for f in &forwards {
-        let _ = writeln!(out, "  {}", format_forward(f));
+/// `Open::Info`; `None` when the server does not implement it.
+pub async fn server_info(conn: &Connection) -> Result<Option<mysh_proto::info::Info>> {
+    use mysh_net::{framing::read_msg, mux::OpenError};
+    use mysh_proto::open::{ErrorCode, Open};
+    match conn.open(&Open::Info).await {
+        Ok(mut stream) => Ok(Some(
+            read_msg(&mut stream).await.context("reading server info")?,
+        )),
+        Err(OpenError::Rejected {
+            code: ErrorCode::Unsupported,
+            ..
+        }) => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e).context("server info")),
     }
-    ctx.console.print(&out);
+}
+
+async fn cmd_info(ctx: &Ctx) -> Result<()> {
+    let conn = &ctx.shared.conn;
+    let server = server_info(conn).await?;
+    let stats = conn.stats();
+    let forwards = ctx.shared.forwards.list();
+    let out = InfoOut {
+        server,
+        connection: ConnectionOut {
+            host: conn.target().host.clone(),
+            port: conn.target().port,
+            peer: conn.peer_addr().to_string(),
+            peer_fingerprint: conn.remote_key().fingerprint().to_string(),
+            trusted_via: conn.trusted_via().to_owned(),
+            our_key: conn.identity().describe(),
+            protocol: conn.version(),
+            cipher: mysh_proto::NOISE_PATTERN.to_owned(),
+            connected_secs: conn.connected_at().elapsed().as_secs(),
+            rtt_ms: conn.last_rtt().map(millis),
+            bytes_in: stats.bytes_in,
+            bytes_out: stats.bytes_out,
+            rekeys: stats.rekeys_in + stats.rekeys_out,
+        },
+        sessions: ctx.session_rows().iter().map(session_row).collect(),
+        forwards: forwards.iter().map(forward_row).collect(),
+    };
+    ctx.console.report(&out, || {
+        let rtt = conn.last_rtt().map_or_else(|| "n/a".to_owned(), ms);
+        let mut text = format!(
+            "server:    {} ({})\n\
+             protocol:  v{}\n\
+             peer key:  {} (trusted via {})\n\
+             our key:   {}\n\
+             cipher:    {}\n\
+             uptime:    {}\n\
+             traffic:   {} in, {} out\n\
+             rtt:       {rtt}\n\
+             sessions:  {}\n",
+            conn.server_hello().name,
+            conn.peer_addr(),
+            conn.version(),
+            conn.remote_key().fingerprint(),
+            conn.trusted_via(),
+            conn.identity().describe(),
+            mysh_proto::NOISE_PATTERN,
+            format_duration(conn.connected_at().elapsed()),
+            human(stats.bytes_in),
+            human(stats.bytes_out),
+            out.sessions.len(),
+        );
+        let _ = writeln!(text, "forwards:  {}", forwards.len());
+        for f in &forwards {
+            let _ = writeln!(text, "  {}", format_forward(f));
+        }
+        if let Some(info) = &out.server {
+            let denied = if info.limits.denied.is_empty() {
+                "none".to_owned()
+            } else {
+                info.limits.denied.join(", ")
+            };
+            let _ = write!(
+                text,
+                "remote:    mysh {} on {} {} (kernel {})\n\
+                 \x20          shell {}, home {}, user {}\n\
+                 \x20          up {}, idle timeout {}, detach grace {}, denied: {denied}\n",
+                info.version,
+                info.platform.os,
+                info.platform.arch,
+                info.platform.kernel,
+                info.shell,
+                info.home,
+                info.user,
+                format_duration(Duration::from_secs(info.uptime_secs)),
+                format_duration(Duration::from_secs(info.limits.idle_timeout_secs)),
+                format_duration(Duration::from_secs(info.limits.detach_grace_secs)),
+            );
+        }
+        text
+    });
+    Ok(())
 }
 
 async fn cmd_ping(ctx: &Ctx, count: u32, term: Option<&mut Terminal>) -> Result<()> {
@@ -716,7 +959,9 @@ async fn cmd_ping(ctx: &Ctx, count: u32, term: Option<&mut Terminal>) -> Result<
         let mut rtts = Vec::new();
         for i in 0..count {
             let rtt = conn.ping().await?;
-            console.println(&format!("pong {}: {}", i + 1, ms(rtt)));
+            if !console.mode().is_json() {
+                console.println(&format!("pong {}: {}", i + 1, ms(rtt)));
+            }
             rtts.push(rtt);
             if i + 1 < count {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -731,19 +976,23 @@ async fn cmd_ping(ctx: &Ctx, count: u32, term: Option<&mut Terminal>) -> Result<
     let min = rtts.iter().min().copied().unwrap_or_default();
     let max = rtts.iter().max().copied().unwrap_or_default();
     let avg = rtts.iter().sum::<Duration>() / u32::try_from(rtts.len()).unwrap_or(1);
-    ctx.console.println(&format!(
-        "rtt min/avg/max = {}/{}/{}",
-        ms(min),
-        ms(avg),
-        ms(max)
-    ));
+    let out = PingOut {
+        rtts_ms: rtts.iter().copied().map(millis).collect(),
+        min: millis(min),
+        avg: millis(avg),
+        max: millis(max),
+    };
+    ctx.console.report(&out, || {
+        format!("rtt min/avg/max = {}/{}/{}\n", ms(min), ms(avg), ms(max))
+    });
     Ok(())
 }
 
 fn cmd_log(ctx: &Ctx, target: &str) -> Result<()> {
     if target == "off" {
         ctx.console.set_log(None);
-        ctx.console.println("logging off");
+        ctx.console
+            .report(&OkOut::OK, || "logging off\n".to_owned());
         return Ok(());
     }
     let path = resolve_local(ctx, target);
@@ -754,18 +1003,132 @@ fn cmd_log(ctx: &Ctx, target: &str) -> Result<()> {
         .with_context(|| format!("log: {}", path.display()))?;
     ctx.console.set_log(Some(file));
     ctx.console
-        .println(&format!("logging to {}", path.display()));
+        .report(&OkOut::OK, || format!("logging to {}\n", path.display()));
     Ok(())
 }
 
-/// `exec CMD...`: non-PTY session, output streamed to the console, `Ctrl-C`
-/// forwarded as `SIGINT`. Returns the shell-style exit code.
-async fn exec_command(
+/// The `--timeout` escalation for an exec session: TERM at the deadline,
+/// KILL two seconds later, and if the server still reports nothing (a
+/// grandchild holding the output pipes) the client stops waiting one second
+/// after that.
+#[derive(Debug)]
+pub struct ExecTimeout {
+    next: Option<tokio::time::Instant>,
+    step: u8,
+    /// The deadline has passed.
+    pub fired: bool,
+}
+
+/// What to do when [`ExecTimeout::due`] resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutStep {
+    Signal(Signal),
+    /// Stop waiting for `Exited`; the session is left to the server.
+    Abandon,
+}
+
+impl ExecTimeout {
+    /// Pause between `Term` and `Kill`.
+    pub const KILL_AFTER: Duration = Duration::from_secs(2);
+    /// Pause between `Kill` and giving up on the exit report.
+    pub const ABANDON_AFTER: Duration = Duration::from_secs(1);
+
+    #[must_use]
+    pub fn new(limit: Option<Duration>) -> Self {
+        Self {
+            next: limit.map(|d| tokio::time::Instant::now() + d),
+            step: 0,
+            fired: false,
+        }
+    }
+
+    /// Resolves when the next step is due; never without a limit.
+    pub async fn due(&self) {
+        match self.next {
+            Some(at) => tokio::time::sleep_until(at).await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// After [`ExecTimeout::due`]: the step to take now, arming the next.
+    pub fn fire(&mut self) -> TimeoutStep {
+        self.fired = true;
+        self.step += 1;
+        let now = tokio::time::Instant::now();
+        match self.step {
+            1 => {
+                self.next = Some(now + Self::KILL_AFTER);
+                TimeoutStep::Signal(Signal::Term)
+            }
+            2 => {
+                self.next = Some(now + Self::ABANDON_AFTER);
+                TimeoutStep::Signal(Signal::Kill)
+            }
+            _ => {
+                self.next = None;
+                TimeoutStep::Abandon
+            }
+        }
+    }
+}
+
+/// Build the exec result once the session ended and report it: the JSON
+/// document, the `exit` event, or nothing (text mode streams as it goes).
+/// Returns the process exit code.
+pub fn finish_exec(
+    console: &Console,
+    status: Option<ExitStatus>,
+    started: std::time::Instant,
+    timed_out: bool,
+) -> i32 {
+    let (stdout, stderr) = console.take_exec_capture();
+    let (exit, signal) = match status {
+        Some(ExitStatus::Code(code)) => (Some(code), None),
+        Some(ExitStatus::Signal { signal, .. }) => (None, Some(signal)),
+        None => (None, None),
+    };
+    let result = ExecResult {
+        stdout: output::Bytes::new(stdout),
+        stderr: output::Bytes::new(stderr),
+        exit,
+        signal,
+        duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        timed_out,
+    };
+    match console.mode() {
+        output::Mode::Json => console.emit(&result),
+        output::Mode::JsonStream => console.event(&output::Event::Exit {
+            exit,
+            signal,
+            duration_ms: result.duration_ms,
+            timed_out,
+        }),
+        output::Mode::Human | output::Mode::Plain => {
+            if timed_out {
+                console.notice("timed out");
+            }
+        }
+    }
+    result.code()
+}
+
+/// `exec [--timeout D] [--cwd DIR] CMD...`: non-PTY session, output
+/// streamed to the console, `Ctrl-C` forwarded as `SIGINT`. Returns the
+/// shell-style exit code (124 after a timeout). `stdin` is the input a
+/// control-socket request carried along (`None`: the session gets EOF at
+/// once, as the prompt's `exec` always did).
+pub(crate) async fn exec_command(
     ctx: &mut Ctx,
     command: Vec<String>,
+    cwd: Option<String>,
+    limit: Option<Duration>,
+    stdin: Option<&[u8]>,
     mut term: Option<&mut Terminal>,
 ) -> Result<i32> {
-    let cwd = mru_cwd(ctx).await;
+    let cwd = match cwd {
+        Some(dir) => Some(dir),
+        None => mru_cwd(ctx).await,
+    };
     let label = kind_label(&command);
     let req = session_request(
         ctx.shared.conn.target(),
@@ -773,12 +1136,25 @@ async fn exec_command(
         None,
         cwd,
     );
+    let started = std::time::Instant::now();
+    // Bytes of an earlier foreground session must not leak into this result.
+    let _ = ctx.console.take_exec_capture();
     let id = ctx
         .stack
         .open_session(&ctx.shared.conn, req, &label)
         .await?;
+    if let Some(s) = ctx.stack.get(id) {
+        ctx.console.event(&output::Event::Started {
+            session: id,
+            pid: s.pid,
+        });
+    }
     ctx.stack.foreground(id, None)?;
+    if let Some(bytes) = stdin.filter(|b| !b.is_empty()) {
+        ctx.stack.send_stdin(id, bytes)?;
+    }
     ctx.stack.stdin_eof(id)?;
+    let mut deadline = ExecTimeout::new(limit);
     loop {
         tokio::select! {
             ev = ctx.events.recv() => {
@@ -787,11 +1163,22 @@ async fn exec_command(
                 ctx.stack.apply(&ev, !mine);
                 if mine {
                     return match ev {
-                        Event::Exited { status, .. } => Ok(status.shell_code()),
+                        Event::Exited { status, .. } => {
+                            Ok(finish_exec(&ctx.console, Some(status), started, deadline.fired))
+                        }
                         Event::Lost { .. } => bail!("exec: connection lost"),
                     };
                 }
             }
+            () = deadline.due() => match deadline.fire() {
+                TimeoutStep::Signal(sig) => {
+                    let _ = ctx.stack.signal(id, sig);
+                }
+                TimeoutStep::Abandon => {
+                    let _ = ctx.stack.detach(id);
+                    return Ok(finish_exec(&ctx.console, None, started, true));
+                }
+            },
             inp = next_input(term.as_deref_mut()) => {
                 if let Some(Input::Bytes(b)) = inp
                     && b.contains(&0x03) {
@@ -944,6 +1331,19 @@ async fn prompt_loop(
     }
 }
 
+/// A clap diagnostic for a prompt line: printed as is (it is the help text
+/// for `-h`), or a `usage` error in JSON modes.
+fn usage_error(console: &Console, msg: &str) {
+    if console.mode().is_json() {
+        console.error(&output::coded(codes::USAGE, anyhow!("{}", msg.trim_end())));
+        return;
+    }
+    console.print(msg);
+    if !msg.ends_with('\n') {
+        console.print("\n");
+    }
+}
+
 /// Parse and run one prompt line, reporting errors on the console. A
 /// trailing `&` starts a background job instead (`client::jobs`).
 async fn handle_line(ctx: &mut Ctx, line: &str, term: &mut Terminal) -> Flow {
@@ -953,15 +1353,12 @@ async fn handle_line(ctx: &mut Ctx, line: &str, term: &mut Terminal) -> Flow {
         Ok(Some((cmd, true))) => {
             match start_job(ctx, line, cmd) {
                 Ok(id) => ctx.console.println(&format!("[{id}] started")),
-                Err(e) => ctx.console.println(&format!("error: {e:#}")),
+                Err(e) => ctx.console.error(&e),
             }
             Flow::Continue
         }
         Err(msg) => {
-            ctx.console.print(&msg);
-            if !msg.ends_with('\n') {
-                ctx.console.print("\n");
-            }
+            usage_error(&ctx.console, &msg);
             Flow::Continue
         }
     }
@@ -980,7 +1377,7 @@ async fn handle_cmd(ctx: &mut Ctx, cmd: MetaCommand, term: &mut Terminal) -> Flo
     match execute(ctx, cmd, Some(term)).await {
         Ok(flow) => flow,
         Err(e) => {
-            ctx.console.println(&format!("error: {e:#}"));
+            ctx.console.error(&e);
             Flow::Continue
         }
     }
@@ -1006,13 +1403,13 @@ pub async fn run_script(ctx: &mut Ctx) -> Result<i32> {
                     Ok(Some((cmd, false))) => cmd,
                     Ok(Some((cmd, true))) => {
                         if let Err(e) = start_job(ctx, &line, cmd) {
-                            ctx.console.println(&format!("error: {e:#}"));
+                            ctx.console.error(&e);
                             return Ok(1);
                         }
                         continue;
                     }
                     Err(msg) => {
-                        ctx.console.print(&msg);
+                        usage_error(&ctx.console, &msg);
                         return Ok(1);
                     }
                 };
@@ -1021,12 +1418,12 @@ pub async fn run_script(ctx: &mut Ctx) -> Result<i32> {
                     Ok(Flow::Continue) => {}
                     Ok(Flow::Exit | Flow::Disconnect) => return Ok(0),
                     Ok(Flow::Foreground(id)) => {
-                        ctx.console.println(&format!("error: cannot foreground session {id}: stdin is not a terminal"));
+                        ctx.console.error(&anyhow!("cannot foreground session {id}: stdin is not a terminal"));
                         return Ok(1);
                     }
                     Err(e) => {
-                        ctx.console.println(&format!("error: {e:#}"));
-                        return Ok(1);
+                        ctx.console.error(&e);
+                        return Ok(if code_for(&e) == codes::TIMEOUT { EXIT_TIMEOUT } else { 1 });
                     }
                 }
             }

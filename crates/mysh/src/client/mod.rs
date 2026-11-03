@@ -11,8 +11,10 @@ pub mod editor;
 pub mod files;
 pub mod forward;
 pub mod jobs;
+pub mod master;
 pub mod meta;
 pub mod session;
+pub mod session_api;
 pub mod shared;
 pub mod terminal;
 
@@ -24,9 +26,10 @@ use tokio::signal::unix::{SignalKind, signal};
 use tracing::{debug, warn};
 
 use crate::{
-    cli::{AuthorizeArgs, ForwardCliArgs, GetArgs, PutArgs},
+    cli::{AuthorizeArgs, ForwardCliArgs, GetArgs, MasterArgs, PutArgs, SessionArgs},
     config::{Paths, Target},
     identity::Baked,
+    output::{self, EXIT_TIMEOUT, Mode, code_for, codes},
 };
 
 use self::{
@@ -54,13 +57,24 @@ pub enum ClientCommand {
     Get(GetArgs),
     Forward(ForwardCliArgs),
     Authorize(AuthorizeArgs),
+    /// `mysh HOST session …`: the remote process API.
+    Session(SessionArgs),
+    /// `mysh master HOST` / `mysh -M HOST`: hold the connection open.
+    Master(MasterArgs),
 }
 
-/// Connect and run `cmd`; returns the process exit code. Errors are local
-/// usage, authentication or trust failures (the caller maps them to 2).
+/// Connect and run `cmd` with the output `mode`; returns the process exit
+/// code. Errors are local usage, authentication or trust failures (the
+/// caller maps them to 2).
 #[allow(clippy::needless_pass_by_value)] // by-value per the crate contract; `run` is the end of their life
-pub async fn run(target: Target, cmd: ClientCommand, paths: Paths, baked: Baked) -> Result<i32> {
-    let console = Console::new();
+pub async fn run(
+    target: Target,
+    cmd: ClientCommand,
+    paths: Paths,
+    baked: Baked,
+    mode: Mode,
+) -> Result<i32> {
+    let console = Console::with_mode(mode);
     let conn = connect(&target, &paths, &baked, &console).await?;
     let forwards = Forwards::new(conn.clone(), console.clone());
     let result = match add_cli_forwards(&forwards, &target).await {
@@ -82,14 +96,37 @@ async fn dispatch(
     let local_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let code = match cmd {
         ClientCommand::Put(args) => {
-            one_shot(console, files::put(conn, console, &args, None, &local_cwd)).await
+            one_shot(
+                console,
+                target.timeout,
+                files::put(conn, console, &args, None, &local_cwd),
+            )
+            .await
         }
         ClientCommand::Get(args) => {
-            one_shot(console, files::get(conn, console, &args, None, &local_cwd)).await
+            one_shot(
+                console,
+                target.timeout,
+                files::get(conn, console, &args, None, &local_cwd),
+            )
+            .await
         }
         ClientCommand::Authorize(args) => {
             let line = meta::pubkey_line(conn, args.pubkey.as_deref(), &home_dir(), &local_cwd)?;
-            one_shot(console, files::authorize(conn, console, &line)).await
+            one_shot(console, None, files::authorize(conn, console, &line)).await
+        }
+        ClientCommand::Session(args) => {
+            // `session send --stdin` reads this process's stdin itself.
+            match session_api::run(conn, console, &args, None).await {
+                Ok(code) => code,
+                Err(e) => {
+                    console.error(&e);
+                    1
+                }
+            }
+        }
+        ClientCommand::Master(args) => {
+            master::serve(conn, console, target, paths, forwards.clone(), &args).await?
         }
         ClientCommand::Forward(ForwardCliArgs {}) => wait_mode(conn, console).await,
         ClientCommand::Connect { command } if !command.is_empty() => {
@@ -114,7 +151,7 @@ async fn dispatch(
                     interactive(conn, console, target, paths, forwards.clone(), initial).await?
                 }
                 Err(e) => {
-                    console.println(&format!("error: {e:#}"));
+                    console.error(&e);
                     1
                 }
             }
@@ -161,13 +198,22 @@ async fn add_cli_forwards(forwards: &Forwards, target: &Target) -> Result<()> {
     Ok(())
 }
 
-/// Run one file/authorize operation; failures print and exit 1.
-async fn one_shot(console: &Console, fut: impl Future<Output = Result<()>>) -> i32 {
-    match fut.await {
+/// Run one file/authorize operation within the target's `--timeout`;
+/// failures print and exit 1 (124 after a timeout).
+async fn one_shot(
+    console: &Console,
+    limit: Option<Duration>,
+    fut: impl Future<Output = Result<()>>,
+) -> i32 {
+    match meta::bounded(limit, fut).await {
         Ok(()) => 0,
         Err(e) => {
-            console.println(&format!("error: {e:#}"));
-            1
+            console.error(&e);
+            if code_for(&e) == codes::TIMEOUT {
+                EXIT_TIMEOUT
+            } else {
+                1
+            }
         }
     }
 }
@@ -209,7 +255,8 @@ async fn wait_mode(conn: &Connection, console: &Console) -> i32 {
 }
 
 /// `mysh HOST CMD...`: one exec session, no prompt. A PTY only with `-t`
-/// (and only when the local terminal can provide one).
+/// (and only when the local terminal can provide one). `--timeout` sends
+/// TERM then KILL and exits 124; `--cwd` sets the working directory.
 async fn exec_mode(
     conn: &Connection,
     console: &Console,
@@ -218,7 +265,9 @@ async fn exec_mode(
     forwards: Forwards,
     command: Vec<String>,
 ) -> Result<i32> {
-    let tty = mysh_pty::terminal::is_terminal(std::io::stdin()) && console.is_tty();
+    let tty = mysh_pty::terminal::is_terminal(std::io::stdin())
+        && console.is_tty()
+        && console.mode() == Mode::Human;
     if target.force_pty && !target.no_pty {
         if tty {
             let initial = Initial::Session(SessionKind::Exec { argv: command });
@@ -228,13 +277,26 @@ async fn exec_mode(
     }
     let (mut stack, mut events) = Stack::new(console.clone());
     let label = meta::kind_label(&command);
-    let req = meta::session_request(target, SessionKind::Exec { argv: command }, None, None);
+    let req = meta::session_request(
+        target,
+        SessionKind::Exec { argv: command },
+        None,
+        target.cwd.clone(),
+    );
+    let started = std::time::Instant::now();
     let id = stack.open_session(conn, req, &label).await?;
+    if let Some(s) = stack.get(id) {
+        console.event(&output::Event::Started {
+            session: id,
+            pid: s.pid,
+        });
+    }
     stack.set_primary(id);
     stack.foreground(id, None)?;
     let mut term = Terminal::cooked(console)?;
     let mut sigint = signal(SignalKind::interrupt()).context("SIGINT handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("SIGTERM handler")?;
+    let mut deadline = meta::ExecTimeout::new(target.timeout);
     loop {
         tokio::select! {
             inp = term.next() => match inp {
@@ -250,13 +312,23 @@ async fn exec_mode(
                 let Some(ev) = ev else { return Ok(EXIT_LOST) };
                 stack.apply(&ev, false);
                 match ev {
-                    Event::Exited { status, .. } => return Ok(status.shell_code()),
+                    Event::Exited { status, .. } => {
+                        return Ok(meta::finish_exec(console, Some(status), started, deadline.fired));
+                    }
                     Event::Lost { .. } => {
                         console.notice("connection lost");
                         return Ok(EXIT_LOST);
                     }
                 }
             }
+            () = deadline.due() => match deadline.fire() {
+                meta::TimeoutStep::Signal(sig) => {
+                    let _ = stack.signal(id, sig);
+                }
+                meta::TimeoutStep::Abandon => {
+                    return Ok(meta::finish_exec(console, None, started, true));
+                }
+            },
             _ = sigint.recv() => {
                 let _ = stack.signal(id, mysh_proto::session::Signal::Int);
             }
@@ -308,7 +380,9 @@ async fn interactive(
     let shared = Shared::new(conn.clone(), console.clone(), forwards, home_dir());
     let local_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut ctx = Ctx::new(shared, console.clone(), local_cwd, initial.is_some());
-    if !(stdin_tty && console.is_tty()) {
+    // `--json`/`--json-stream` never run the line editor: the input is a
+    // script even on a terminal.
+    if !(stdin_tty && console.is_tty() && !console.mode().is_json()) {
         if initial.is_some() {
             console.notice("stdin is not a terminal; reading prompt commands from it");
             ctx.auto_exit = false;
@@ -317,7 +391,7 @@ async fn interactive(
     }
     ctx.history = History::load(&paths.history);
     let mut term = Terminal::new(console, target.meta_key).context("entering raw mode")?;
-    if !target.quiet {
+    if !target.quiet && console.mode() == Mode::Human {
         console.println(&banner(conn));
     }
     // The control socket lives as long as the prompt; `Drop` removes it.

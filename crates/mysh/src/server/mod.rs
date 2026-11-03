@@ -12,6 +12,7 @@
 
 pub mod files;
 pub mod forward;
+pub mod info;
 pub mod session;
 
 use std::{
@@ -294,6 +295,7 @@ impl Server {
     /// Bind every listen address (all must succeed). With no addresses the
     /// default `[::]:7722` is tried first and `0.0.0.0:7722` second.
     pub async fn bind(cfg: ServerConfig) -> Result<Self> {
+        info::mark_started();
         let mut listeners = Vec::with_capacity(cfg.listen.len().max(1));
         if cfg.listen.is_empty() {
             let v6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, DEFAULT_PORT));
@@ -760,7 +762,18 @@ async fn dispatch(mut stream: Stream, ctx: ConnCtx) {
         Open::Cwd { session } => session::handle_cwd(stream, session, ctx).await,
         Open::Attach { session } => session::handle_attach(stream, session, ctx).await,
         Open::ListSessions => session::handle_list_sessions(stream, ctx).await,
-        Open::Info | Open::Read { .. } | Open::Write { .. } | Open::Pair => {
+        Open::Info => info::handle_info(stream, ctx).await,
+        Open::Read {
+            session,
+            offset,
+            max,
+            wait_ms,
+        } => session::handle_read(stream, session, offset, max, wait_ms, ctx).await,
+        Open::Write { session, eof } => session::handle_write(stream, session, eof, ctx).await,
+        Open::Signal { session, signal } => {
+            session::handle_signal(stream, session, signal, ctx).await;
+        }
+        Open::Pair => {
             files::send_error(
                 &mut stream,
                 ErrorCode::Unsupported,
@@ -930,7 +943,7 @@ mod tests {
         }
     }
 
-    fn test_policy() -> Policy {
+    pub(crate) fn test_policy() -> Policy {
         Policy {
             deny: HashSet::new(),
             accept_env: Vec::new(),

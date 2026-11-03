@@ -8,6 +8,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -388,6 +389,56 @@ pub fn decode_send_text(s: &str) -> Vec<u8> {
     out
 }
 
+/// `master = …`: whether a socket-less CLI call starts a background master
+/// first (docs/05-meta-shell.md, "Master mode").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum MasterMode {
+    /// Never spawn one (the default): each call connects for itself.
+    #[default]
+    Never,
+    /// Spawn one when no socket is there, and fall back to a direct
+    /// connection when that fails.
+    Auto,
+    /// Spawn one and fail when it does not come up.
+    Always,
+}
+
+impl MasterMode {
+    /// `never`/`off`/`false`, `auto`/`true`/`on`, `always`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "never" | "off" | "false" | "no" => Ok(Self::Never),
+            "auto" | "true" | "on" | "yes" => Ok(Self::Auto),
+            "always" => Ok(Self::Always),
+            other => Err(format!(
+                "unknown master mode {other:?} (never, auto, always)"
+            )),
+        }
+    }
+
+    /// Whether a missing control socket should start a master.
+    #[must_use]
+    pub fn spawns(self) -> bool {
+        matches!(self, Self::Auto | Self::Always)
+    }
+}
+
+impl<'de> Deserialize<'de> for MasterMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Text(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Bool(true) => Ok(Self::Auto),
+            Raw::Bool(false) => Ok(Self::Never),
+            Raw::Text(s) => Self::parse(&s).map_err(serde::de::Error::custom),
+        }
+    }
+}
+
 /// `~/.config/mysh/config.toml`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -408,6 +459,8 @@ pub struct Defaults {
     pub shell: Option<bool>,
     /// `true` behaves like `--accept-new` everywhere.
     pub accept_new: Option<bool>,
+    /// `auto` (or `true`) starts a background master for socket-less calls.
+    pub master: Option<MasterMode>,
 }
 
 /// `[hosts.NAME]` table.
@@ -430,6 +483,8 @@ pub struct HostAlias {
     pub shell: Option<bool>,
     /// Meta key for this host.
     pub escape: Option<String>,
+    /// Master mode for this host.
+    pub master: Option<MasterMode>,
 }
 
 /// Config file errors.
@@ -528,6 +583,12 @@ pub struct Target {
     pub attach: Option<Option<u32>>,
     /// `--no-ctl`: do not serve or use the control socket.
     pub no_ctl: bool,
+    /// `--timeout`: bound on `CMD`, `put`, `get`.
+    pub timeout: Option<Duration>,
+    /// `--cwd`: working directory for `CMD`.
+    pub cwd: Option<String>,
+    /// `--master` / `master = …`: background master policy.
+    pub master: MasterMode,
 }
 
 fn parse_env_item(s: &str) -> (String, Option<String>) {
@@ -661,6 +722,13 @@ pub fn resolve_target(
         no_session: opts.no_session,
         attach: opts.attach,
         no_ctl: opts.no_ctl,
+        timeout: opts.timeout,
+        cwd: opts.cwd.clone(),
+        master: opts
+            .master
+            .or(alias.master)
+            .or(config.defaults.master)
+            .unwrap_or_default(),
     })
 }
 
@@ -763,6 +831,40 @@ pub fn expand_tilde(path: &str, home: &Path) -> PathBuf {
         Some(rest) => home.join(rest),
         None => PathBuf::from(path),
     }
+}
+
+/// Parse a duration: a bare number of seconds, or a number with a unit
+/// (`ms`, `s`, `m`, `h`), e.g. `500ms`, `10s`, `2m`, `1h`. Fractions are
+/// accepted (`1.5s`); the result is rounded to milliseconds.
+pub fn parse_duration(s: &str) -> Result<Duration, String> {
+    let text = s.trim();
+    if text.is_empty() {
+        return Err("empty duration".to_owned());
+    }
+    let digits = text
+        .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+        .trim_end();
+    let unit = text[digits.len()..].trim();
+    let value: f64 = digits
+        .parse()
+        .map_err(|_| format!("invalid duration {s:?}"))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("invalid duration {s:?}"));
+    }
+    let millis = match unit {
+        "" | "s" | "sec" | "secs" => value * 1000.0,
+        "ms" => value,
+        "m" | "min" | "mins" => value * 60_000.0,
+        "h" | "hr" | "hrs" => value * 3_600_000.0,
+        other => return Err(format!("unknown duration unit {other:?} in {s:?}")),
+    };
+    // `2^63` as an f64 is exact and far past any sane duration.
+    if millis >= 9_223_372_036_854_775_808.0 {
+        return Err(format!("duration {s:?} is out of range"));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    // bounded above, non-negative
+    Ok(Duration::from_millis(millis.round() as u64))
 }
 
 #[cfg(test)]
@@ -1069,6 +1171,7 @@ shell = true           # `mysh pi` goes straight to a shell
                 env: vec!["LANG".to_owned(), "FOO=bar".to_owned()],
                 shell: Some(true),
                 escape: Some("^\\".to_owned()),
+                master: None,
             },
         );
         hosts.insert(
@@ -1083,6 +1186,7 @@ shell = true           # `mysh pi` goes straight to a shell
                 escape: Some("^@".to_owned()),
                 shell: Some(false),
                 accept_new: Some(true),
+                master: Some(MasterMode::Auto),
             },
             hosts,
         }

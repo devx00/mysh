@@ -38,6 +38,7 @@ use super::{
 use crate::{
     cli::{GetArgs, LsArgs, PutArgs},
     config::expand_tilde,
+    output::{AuthorizeOut, LsEntry, StatOut, TransferOut, octal_mode, rfc3339},
 };
 
 /// Progress callback: `(bytes so far, total)`.
@@ -385,6 +386,17 @@ impl Totals {
         let files = if self.files == 1 { "file" } else { "files" };
         format!("{} {files}, {}, {secs:.1} s", self.files, human(self.bytes))
     }
+
+    /// The final line (`--json`: a [`TransferOut`]).
+    fn report(&self, console: &Console) {
+        let out = TransferOut {
+            files: self.files,
+            bytes: self.bytes,
+            duration_ms: u64::try_from(self.started.map_or(0, |t| t.elapsed().as_millis()))
+                .unwrap_or(u64::MAX),
+        };
+        console.report(&out, || format!("{}\n", self.summary()));
+    }
 }
 
 fn label_of(path: &Path) -> String {
@@ -597,7 +609,7 @@ pub async fn put(
             console.notice(&format!("skipping {}: not a regular file", local.display()));
         }
     }
-    console.println(&totals.summary());
+    totals.report(console);
     Ok(())
 }
 
@@ -903,7 +915,7 @@ pub async fn get(
             FileKind::Other => console.notice(&format!("skipping {remote}: not a regular file")),
         }
     }
-    console.println(&totals.summary());
+    totals.report(console);
     Ok(())
 }
 
@@ -1197,6 +1209,28 @@ fn format_long(entries: &[DirEntry]) -> Vec<String> {
         .collect()
 }
 
+/// `file`, `dir`, `symlink`, `other` and the symlink target.
+fn kind_name(kind: &FileKind) -> (&'static str, Option<String>) {
+    match kind {
+        FileKind::File => ("file", None),
+        FileKind::Dir => ("dir", None),
+        FileKind::Symlink { target } => ("symlink", Some(target.clone())),
+        FileKind::Other => ("other", None),
+    }
+}
+
+fn ls_entry(e: &DirEntry) -> LsEntry {
+    let (kind, target) = kind_name(&e.attrs.kind);
+    LsEntry {
+        name: e.name.clone(),
+        kind: kind.to_owned(),
+        size: e.attrs.size,
+        mode: octal_mode(e.attrs.mode),
+        mtime: rfc3339(e.attrs.mtime),
+        target,
+    }
+}
+
 /// `ls [-l] [-a] [REMOTE]`.
 pub async fn ls(
     conn: &Connection,
@@ -1209,6 +1243,11 @@ pub async fn ls(
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     if !args.all {
         entries.retain(|e| !e.name.starts_with('.'));
+    }
+    if console.mode().is_json() {
+        let rows: Vec<LsEntry> = entries.iter().map(ls_entry).collect();
+        console.report(&rows, String::new);
+        return Ok(());
     }
     let lines = if args.long {
         format_long(&entries)
@@ -1227,6 +1266,49 @@ pub async fn ls(
     for line in lines {
         console.println(&line);
     }
+    Ok(())
+}
+
+/// `stat REMOTE`: the attributes of one path (`--json`: a [`StatOut`]).
+pub async fn stat_cmd(
+    conn: &Connection,
+    console: &Console,
+    path: &str,
+    default_remote: Option<&str>,
+) -> Result<()> {
+    let attrs = stat(conn, path, default_remote).await?.ok_or_else(|| {
+        crate::output::coded(
+            crate::output::codes::NOT_FOUND,
+            anyhow!("stat {path}: not found"),
+        )
+    })?;
+    let (kind, target) = kind_name(&attrs.kind);
+    let out = StatOut {
+        path: path.to_owned(),
+        kind: kind.to_owned(),
+        size: attrs.size,
+        mode: octal_mode(attrs.mode),
+        mtime: rfc3339(attrs.mtime),
+        uid: attrs.uid,
+        gid: attrs.gid,
+        target,
+    };
+    console.report(&out, || {
+        let mut text = format!(
+            "{} {:>10} {} {} {}",
+            format_mode(mode_bits(&attrs.kind, attrs.mode)),
+            attrs.size,
+            format_mtime(attrs.mtime),
+            out.kind,
+            path
+        );
+        if let Some(t) = &out.target {
+            text.push_str(" -> ");
+            text.push_str(t);
+        }
+        text.push('\n');
+        text
+    });
     Ok(())
 }
 
@@ -1295,7 +1377,9 @@ pub async fn authorize(conn: &Connection, console: &Console, pubkey_line: &str) 
     }
 
     if contains_key(&String::from_utf8_lossy(&existing), key) {
-        console.println("already present");
+        console.report(&AuthorizeOut { added: false }, || {
+            "already present\n".to_owned()
+        });
         return Ok(());
     }
 
@@ -1318,7 +1402,7 @@ pub async fn authorize(conn: &Connection, console: &Console, pubkey_line: &str) 
         &mut no_progress,
     )
     .await?;
-    console.println("added");
+    console.report(&AuthorizeOut { added: true }, || "added\n".to_owned());
     Ok(())
 }
 

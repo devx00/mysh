@@ -87,7 +87,7 @@ is `Ctrl-Z` at the prompt, `~?` is `help`.
 
 | command      | synopsis                                                        | notes                                                                 |
 | ------------ | --------------------------------------------------------------- | --------------------------------------------------------------------- |
-| `help`       | `help [CMD]`                                                    |                                                                       |
+| `help`       | `help [--json] [CMD]`                                           | `--json`: the prompt grammar as a command tree (see "Agent interface") |
 | `shell`      | `shell [--home] [CMD...]`                                       | start a new interactive PTY session and bring it to the foreground: the server's login shell (`--shell` → `$SHELL` → passwd → `/bin/sh`), or `CMD` under a PTY (`shell htop`, `shell bash --norc`). Starts in the cwd of the most recently used session, if any, unless `--home`. See "Session stack" |
 | `fg`         | `fg [ID]`                                                       | bring session ID (default: most recently used) to the foreground, replaying its buffered output. Also bound to the meta key at the prompt |
 | `sessions`   | `sessions [-a]`                                                 | list sessions: id, pid, kind, buffered bytes; `*` marks the most recently used. `-a` also asks the server (`ListSessions`) and prints its view: sessions detached from this or an earlier connection with their age and buffered output, and attached ones |
@@ -98,21 +98,24 @@ is `Ctrl-Z` at the prompt, `~?` is `help`.
 | `put`        | `put [-r] [-c] [-P] [-F] [-j N] LOCAL... [REMOTE]`              | default REMOTE = cwd of the MRU session (probe) → `~`; progress bar. `-P` preserves mode/mtime, `-F` follows symlinks (`-p`/`-L` are taken by the shared CLI options); `-r` uploads `-j` files at a time (default 4) with one aggregate progress line |
 | `get`        | `get [-r] [-c] [-P] [-j N] REMOTE... [LOCAL]`                   | default LOCAL = client cwd; `-P` preserves mode/mtime; `-r`/`-j` as for `put` |
 | `ls`         | `ls [-l] [-a] [REMOTE]`                                         | remote listing; default = MRU session cwd → `~`                        |
+| `stat`       | `stat REMOTE`                                                   | one path's attributes: mode, size, mtime, kind, symlink target         |
 | `cwd`        | `cwd`                                                           | print remote cwd (probe source: fg process / shell / home fallback) and local cwd |
 | `lcd`        | `lcd [DIR]`                                                     | change the client's working directory used by the prompt               |
 | `forward`    | `forward -L SPEC` · `-R SPEC` · `-D SPEC` · `forward ls` · `forward rm ID` | same SPEC grammar as the CLI flags; ids are stable per connection |
-| `exec`       | `exec CMD...`                                                   | run a non-PTY exec session; stream output into the prompt; print the exit code. Quick checks without opening a shell |
-| `info`       | `info`                                                          | server name, address, protocol version, peer fingerprint + how it was trusted, cipher, uptime, bytes in/out, RTT, sessions, active forwards |
+| `exec`       | `exec [--timeout D] [--cwd DIR] CMD...`                         | run a non-PTY exec session; stream output into the prompt; print the exit code. Quick checks without opening a shell. `--cwd` sets the start directory (default: MRU session cwd); `--timeout` sends `TERM`, then `KILL` 2 s later, and reports exit 124 |
+| `info`       | `info`                                                          | server name, address, protocol version, peer fingerprint + how it was trusted, cipher, uptime, bytes in/out, RTT, sessions, active forwards; then the server's own facts from `Open::Info` (version, platform, kernel, shell, home, user, uptime, limits, denied features) when it answers |
 | `ping`       | `ping [-c N]`                                                   | control-stream pings, RTT min/avg/max                                  |
 | `resize`     | `resize`                                                        | re-send the current terminal size to the MRU session                   |
 | `log`        | `log FILE` · `log off`                                          | tee everything written to the terminal (whichever session is foreground, replays included) to FILE from now on (`script`-like) |
 | `authorize`  | `authorize [PUBKEY_FILE]`                                       | append the client's public key (default: the identity in use) to the server's `~/.config/mysh/authorized_keys` via `File` ops; creates the dir `0700`; skips if already present. Equivalent of `ssh-copy-id` |
 | `jobs`       | `jobs [-w] [ID]`                                                | list background jobs (`CMD &`); `jobs ID` shows one job's state and captured output; `-w` waits for it first. See "Background jobs" |
+| `session`    | `session new|send|read|list|kill|wait …`                        | the remote process API: sessions addressed by id instead of by a terminal. See "Session command family" |
 | `exit`       | `exit` / `Ctrl-D`                                               | close the connection if no session is running; otherwise refuse and list them (`fg`, `detach`, or `disconnect`) |
 | `disconnect` | `disconnect`                                                    | close the connection now. PTY sessions are **not** killed: the server keeps them for its detach grace window (default 10 min) and `mysh --attach HOST` gets them back; with `--detach-grace 0` they get `SIGHUP` from their pty as before. `kill ID` is how you end one |
 
-Output formats are plain text, one record per line, suitable for eyes; there
-is no machine-readable mode in v1.
+Output formats are plain text, one record per line, suitable for eyes.
+`--json` / `--json-stream` on the command line switch every command to the
+documents and events of the "Agent interface" section below.
 
 ## Session stack
 
@@ -203,7 +206,8 @@ full-screen program needs the `Resize`-triggered redraw (sent right after
 | `mysh --attach[=ID] HOST`   | the detached session foregrounded (replay first) | **auto-exit**: the session list becomes empty | status of that session (1 if nothing or several to attach, 2 if the server keeps none) |
 | `mysh HOST CMD...`          | exec session, no prompt (`-t` for a PTY) | the command exits                                   | its status                     |
 | `mysh -N HOST` / `mysh forward` | nothing; stdin untouched             | `Ctrl-C`/`SIGTERM`, or the connection drops         | 0 / 255                        |
-| `mysh HOST < script`        | prompt commands read from stdin, no prompt, stop at first failure | stdin EOF or a failing command | 0 / 1 (255 on drop)           |
+| `mysh HOST < script`        | prompt commands read from stdin, no prompt, stop at first failure | stdin EOF or a failing command | 0 / 1 (255 on drop; 124 after `--timeout`) |
+| `mysh --json HOST [< script]` | scripted mode even on a terminal; one JSON document per command | as above                        | as above                       |
 
 Auto-exit mode still has the prompt: the meta key works, `shell` can open
 more sessions, and the client exits once the last of them is gone. The
@@ -228,6 +232,12 @@ mysh put    [OPTIONS] HOST LOCAL... [REMOTE]
 mysh get    [OPTIONS] HOST REMOTE... [LOCAL]
 mysh forward [OPTIONS] HOST (-L|-R|-D SPEC)...     = connect -N with forwards
 mysh authorize [OPTIONS] HOST [PUBKEY_FILE]
+mysh help [--json] [CMD]                clap's help for CMD (or the whole CLI); `--json`: the command tree
+mysh session [OPTIONS] HOST new [--cwd DIR] [--pty] [--env K=V] -- CMD ...
+mysh session [OPTIONS] HOST send ID [TEXT...] [--stdin] [--eof]
+mysh session [OPTIONS] HOST read ID [--since N] [--wait D] [--max BYTES] [--follow]
+mysh session [OPTIONS] HOST list|kill ID [-s SIG]|wait ID [--timeout D]
+mysh master [OPTIONS] HOST [--idle D] [--daemon]   hold the connection open for other calls
 ```
 
 Subcommand names are reserved words that cannot be used as bare `HOST`; use
@@ -251,7 +261,14 @@ Connection options (shared by every HOST-taking command):
 | `--env NAME[=VALUE]`  | send an environment variable (server must accept it)      |
 | `--baked-only`        | ignore files on disk                                      |
 | `--no-ctl`            | never use or serve the control socket (below)             |
+| `--json`              | one JSON document per command on stdout, errors as JSON on stderr ("Agent interface") |
+| `--json-stream`       | NDJSON events on stdout as they happen                    |
+| `--plain`             | no ANSI, progress lines, banner or prompt redraws; implied by the JSON modes and when stdout is not a terminal |
+| `--timeout DURATION`  | `10s`, `2m`, `500ms`: bound on `CMD`, `put`, `get` and the prompt's `exec`/`put`/`get` (`TERM`, `KILL` after 2 s, exit 124) |
+| `--cwd DIR`           | working directory for `CMD` (`~`-relative is expanded by the server) |
 | `-v`                  | repeatable; `-vv` includes handshake and stream events    |
+| `-M`                  | run as a background master for HOST (same as `mysh master HOST`) |
+| `--master MODE`       | `never` (default), `auto`, `always`: start a master when no control socket is there |
 
 `HOST` forms: `host`, `host:port`, `[v6addr]:port`, `v6addr` (bare), or a
 config alias (below).
@@ -286,6 +303,7 @@ ignored (files are re-read per connection anyway).
 [defaults]
 escape = "^]"          # meta key
 shell = false          # true = behave like `-s` everywhere
+master = "never"       # "auto" (or true) starts a background master for socket-less calls; "always" requires one
 
 [hosts.pi]
 host = "pi.lan"
@@ -295,6 +313,7 @@ pin = "SHA256:…"
 forward = ["-L 8080:localhost:80"]
 env = ["LANG"]
 shell = true           # `mysh pi` goes straight to a shell
+master = "auto"        # per-host master policy
 ```
 
 Flags override the alias; the alias overrides `[defaults]`; `[defaults]`
@@ -319,16 +338,19 @@ second TOFU prompt, nothing counted by the server's handshake rate limit.
   replaced; one that does belongs to another client for the same target,
   and the new client prints a notice and runs without a socket.
 - Protocol, one request per connection: the requester writes one
-  `Msg<CtlRequest { argv: Vec<String>, cwd: String }>` (the prompt words,
-  and its working directory for local paths); the serving client replies
-  with a stream of `Msg<CtlEvent>` — `Out(bytes)`, `Err(bytes)`,
-  `Progress { label, done, total }` — ending with `Done { code }`. Both use
-  `mysh_proto::frame` framing (`client::ctl`).
-- Allowed over the socket: `put get ls cwd forward exec info ping sessions
-  kill jobs authorize help`. Refused with an error event: `shell fg send
-  resize log exit disconnect attach detach` (they need the serving client's
-  terminal) and `lcd` (the request carries its own cwd). A trailing `&` is
-  refused too.
+  `Msg<CtlRequest { argv: Vec<String>, cwd: String, mode, stdin: Vec<u8> }>`
+  (the prompt words, its working directory for local paths, its output
+  mode, and standard input for `exec`/`session send --stdin`); the serving
+  client replies with a stream of `Msg<CtlEvent>` — `Out(bytes)`,
+  `Err(bytes)`, `Progress { label, done, total }` — ending with
+  `Done { code }`. Both use `mysh_proto::frame` framing (`client::ctl`).
+  The command renders in the requester's mode, so `--json` over the socket
+  produces the same document as a direct call.
+- Allowed over the socket: `put get ls stat cwd forward exec session info
+  ping sessions kill jobs authorize help`. Refused with an error event:
+  `shell fg send resize log exit disconnect attach detach` (they need the
+  serving client's terminal) and `lcd` (the request carries its own cwd).
+  A trailing `&` is refused too.
 - The serving client runs each request on its own task with a capture
   console, concurrently with the prompt, and prints `[mysh] ctl: put …`
   above it. `sessions`/`kill`/`cwd`/`info` see the prompt's sessions; an
@@ -342,6 +364,74 @@ second TOFU prompt, nothing counted by the server's handshake rate limit.
   both sides: a CLI command always connects, an interactive client never
   listens. `mysh forward HOST -L …` over the socket adds the forwards to the
   live client and returns at once.
+- `mysh HOST CMD` and `mysh HOST session …` take the same route: the
+  command runs as `exec CMD` (or the `session` command) in the serving
+  client, output is streamed back, and the exit code is the requester's.
+  A command that needs the local terminal (`-t`, or stdin that is a tty)
+  keeps its own connection; stdin of a redirected `mysh HOST CMD` travels
+  with the request up to 64 KiB, and a larger input falls back to a
+  connection of the requester's own. Stdin is only read once a socket has
+  answered, so the fallback still sees every byte.
+
+## Master mode
+
+`mysh master HOST` (or `mysh -M HOST`) is a client with no prompt and no
+stdin: it connects, serves the control socket above, logs to stderr, and
+exits when `--idle` passes without a control request (default 10 min), on
+`SIGTERM`/`SIGINT`, or when the connection ends. Its socket is removed on
+the way out. This is ssh's `ControlMaster` without a second configuration
+language: one long-lived connection, any number of short `mysh` calls
+through it, one handshake in the server's log.
+
+- `mysh master HOST --daemon` re-spawns the same binary detached — its own
+  process group, `/dev/null` for all three standard streams — and returns
+  once the socket answers (at most 3 s).
+- `[defaults] master = "auto"` (or `master = true`, or per host under
+  `[hosts.NAME]`, or `--master auto`) makes any socket-less CLI call start
+  that daemon first and then run through it; `always` fails the call when
+  the master cannot be used, `never` (the default) never spawns one.
+- The daemon inherits the resolved connection: port, identity, pin, TOFU
+  policy, `--baked-only` and `--env` items are passed through, so it makes
+  the same trust decisions the call would have made. An unknown host key
+  without `--accept-new` therefore keeps a master from coming up (nothing
+  can answer a prompt), and the call falls back to its own connection.
+
+## Session command family
+
+`session` drives a remote process without a terminal (03-protocol.md
+§10ter). It works as a CLI subcommand, at the prompt, and over the control
+socket; the output is text by default and one JSON document per command
+with `--json`.
+
+| command        | synopsis                                                   | prints                                               |
+| -------------- | ---------------------------------------------------------- | ---------------------------------------------------- |
+| `session new`  | `new [--cwd DIR] [--pty] [--env K=V] -- CMD ...`            | `session 7 (pid 123)`, or `{"id":7,"pid":123}`        |
+| `session send` | `send ID [TEXT...] [--stdin] [--eof]`                       | nothing (`{"ok":true}`)                               |
+| `session read` | `read ID [--since N] [--wait D] [--max BYTES] [--follow]`   | the bytes (stdout to stdout, stderr to stderr), or one `{offset, next, oldest, chunks, exited}` per read |
+| `session list` | `list`                                                      | one row per session: id, pid, state, `next`, command  |
+| `session kill` | `kill [-s SIG] ID`                                          | nothing                                               |
+| `session wait` | `wait ID [--timeout D]`                                     | `session 7 exit 0`; exit code = the session's (124 on timeout) |
+
+- A `session new` session **persists**: it is registered on the server and
+  outlives the stream that started it, so later calls — from another
+  process, over another connection — address it by id. It stays listed
+  after its process exits, with the status, until the server's detach
+  grace window passes; a server started with `--detach-grace 0` refuses to
+  open one.
+- `--pty` is off by default so stdout and stderr stay apart (`read` tags
+  every chunk); with it the session behaves like `shell` and can be
+  reattached with `attach`.
+- `read` is addressed by **absolute byte offset**, never by "what is new":
+  `--since N` starts at `N` (default 0), the reply says where it actually
+  starts (`offset`, higher when older bytes aged out of the 1 MiB ring),
+  where to continue (`next`) and how far back the server can still go
+  (`oldest`). The same `--since` returns the same bytes, so a reader that
+  crashes resumes exactly where it was. `--wait D` blocks up to `D` (max
+  60 s) for new output; `--follow` keeps reading until the session exits.
+- `send TEXT` decodes caret notation and `\xNN` like the prompt's `send`
+  and appends a newline; `--stdin` sends this command's standard input
+  verbatim instead; `--eof` closes the session's stdin afterwards (how a
+  `cat` session ends). `--pty` sessions ignore the EOF, as a terminal does.
 
 ## Background jobs
 
@@ -365,3 +455,115 @@ token).
   big.iso ~/ (2.9 MiB, 1.2 s)` — followed by the captured output.
 - In scripted mode (`mysh HOST < script`) `&` works the same; at end of
   input the script waits for its jobs and exits 1 if any failed.
+
+## Agent interface
+
+A program driving `mysh` — an LLM agent, a script, an orchestrator — gets
+structured output from the same commands with three global flags
+(`crates/mysh/src/output.rs` holds every shape):
+
+| flag            | stdout                                              | stderr                         |
+| --------------- | --------------------------------------------------- | ------------------------------ |
+| `--json`        | one JSON document per command, nothing else         | `{"error": …}` lines           |
+| `--json-stream` | NDJSON: one event object per line, as things happen | nothing of mysh's              |
+| `--plain`       | text without ANSI, progress, banner or prompt redraws | notices (`[mysh] …`)         |
+
+`--plain` is implied by both JSON modes and whenever stdout is not a
+terminal. With a JSON mode `mysh HOST` never runs the line editor: stdin is
+read as a script even on a terminal, and every command of the script prints
+its document in turn (`mysh --json HOST < script`). Exit codes do not
+change (see "Modes and exit"); `--timeout` expiry exits 124 like
+`timeout(1)`.
+
+Durations (`--timeout`, prompt `exec --timeout`) are `500ms`, `10s`, `2m`,
+`1h`, fractions allowed; a bare number is seconds.
+
+### Documents (`--json`)
+
+Field names are `snake_case`; omitted optional fields are `null`. A
+`bytes` value is a JSON string when the bytes are valid UTF-8, otherwise
+`{"base64": "…"}` — consumers must accept both.
+
+| command                                   | document                                                                 |
+| ----------------------------------------- | ------------------------------------------------------------------------ |
+| `mysh HOST CMD`, prompt `exec`            | `ExecResult {stdout: bytes, stderr: bytes, exit: int\|null, signal: int\|null, duration_ms, timed_out: bool}` — `exit` for a normal exit, `signal` when killed by one, `timed_out` after `--timeout` |
+| `info`                                    | `InfoOut {server: Info\|null, connection: {host, port, peer, peer_fingerprint, trusted_via, our_key, protocol, cipher, connected_secs, rtt_ms: float\|null, bytes_in, bytes_out, rekeys}, sessions: [SessionRow], forwards: [ForwardRow]}`; `server` is the `Open::Info` reply (03-protocol.md §10quater) or `null` for a server without it |
+| `sessions [-a]`                           | `SessionsOut {sessions: [SessionRow {id, pid, kind, buffered, mru, foreground}], server?: [DetachedSession]}` — `server` only with `-a` (the `ListSessions` rows: `id, pid, kind, started, detached, buffered, pty, next, oldest, exited`) |
+| `jobs`                                    | `[JobRow {id, state: "running"\|"done"\|"failed"\|"cancelled", exit: int\|null, error: string\|null, elapsed_ms, command, progress: {label, done, total}\|null}]` |
+| `jobs [-w] ID`                            | `JobOut`: the `JobRow` fields plus `output: bytes` (the captured output) |
+| `ls [-l] [-a] [REMOTE]`                   | `[LsEntry {name, kind: "file"\|"dir"\|"symlink"\|"other", size, mode: "0644", mtime: RFC 3339 UTC, target: string\|null}]` (`-l` makes no difference) |
+| `stat REMOTE`                             | `StatOut {path, kind, size, mode, mtime, uid, gid, target}`              |
+| `forward ls`, `forward -L/-R/-D …`        | `[ForwardRow {id, kind: "local"\|"remote"\|"dynamic", bind: "host:port", target: "host:port"\|null, accepted}]` — an add reports the rows it created |
+| `ping [-c N]`                             | `PingOut {rtts_ms: [float], min, avg, max}` (milliseconds)              |
+| `put`, `get` (CLI and prompt)             | `TransferOut {files, bytes, duration_ms}`                                |
+| `cwd`                                     | `CwdOut {remote: string\|null, session: int\|null, local}`               |
+| `authorize`                               | `AuthorizeOut {added: bool}` (`false`: already present)                  |
+| `kill`, `forward rm`, `log`, `resize`, `detach` | `{"ok": true}`                                                     |
+| `help [CMD]`, `mysh help --json [CMD]`    | `HelpTree {command, about, args: [{name, long, short, takes_value, positional, required, repeatable, value_name, default, help}], subcommands: [HelpTree]}` — built from the clap definitions, so it is always current; the prompt tree's root is named `prompt` |
+
+`lcd`, `exit`, `disconnect` print nothing. Session output of a foregrounded
+PTY session has no JSON form (`shell`/`fg`/`attach` need a terminal and are
+refused in scripted mode).
+
+### Events (`--json-stream`)
+
+Every line is `{"event": NAME, …}`:
+
+| event      | fields                                              | when                                                        |
+| ---------- | --------------------------------------------------- | ----------------------------------------------------------- |
+| `started`  | `session`, `pid`                                    | an exec session is running                                  |
+| `stdout`   | `data: bytes`                                       | a chunk of the exec session's stdout, in order              |
+| `stderr`   | `data: bytes`                                       | a chunk of its stderr                                       |
+| `exit`     | `exit`, `signal`, `duration_ms`, `timed_out`        | the exec session ended — **always the last event of an exec** |
+| `progress` | `label`, `done`, `total: int\|null`                 | transfer progress (throttled to ~10/s; the final state is always sent) |
+| `notice`   | `text`                                              | what `[mysh] …` would have said                             |
+| `error`    | `code`, `message`                                   | a command failed (codes below); in this mode errors are on stdout so one stream tells the whole story |
+| `result`   | `value`                                             | the `--json` document of a command that has one (`ls`, `info`, a transfer's `TransferOut`, …) |
+
+### Errors and codes
+
+In `--json` mode a failure prints one line on stderr:
+
+```json
+{"error": {"code": "trust_unknown", "message": "host key verification failed: …"}}
+```
+
+Codes are stable; the message is for humans and may change.
+
+| code             | meaning                                                                  |
+| ---------------- | ------------------------------------------------------------------------ |
+| `unauthorized`   | the server refused every identity (handshake `Denied`)                   |
+| `denied`         | policy: the feature is switched off (`--deny`, key options)              |
+| `not_found`      | no such path/session/forward on the server                               |
+| `unsupported`    | the server does not implement the stream kind                            |
+| `io`             | server-side I/O failure, or the connection went away mid-command         |
+| `limit`          | a per-connection quota (sessions, listeners, streams)                    |
+| `protocol`       | malformed or out-of-order message                                        |
+| `trust_unknown`  | unknown server key and no way to ask (`--strict`, or no terminal)        |
+| `trust_mismatch` | the server key differs from `known_hosts`/`--pin`; never bypassable      |
+| `connect_failed` | DNS, TCP connect, or handshake timeout                                   |
+| `timeout`        | `--timeout` expired (`put`/`get`); an exec reports it in its result      |
+| `usage`          | bad command line or prompt line (clap), missing HOST, bad config         |
+| `internal`       | anything else                                                            |
+
+The first seven are the wire's `ErrorCode` values in snake_case
+(03-protocol.md §5). Exit codes: 2 for `usage`, trust, connect and
+authorization failures (as before), 1 for a failing command, 124 after a
+timeout, 255 when the connection drops.
+
+### Timeouts
+
+`--timeout D` on `mysh HOST CMD` (and `exec --timeout D` at the prompt):
+when `D` passes the client sends `Signal(Term)`; 2 s later `Signal(Kill)`;
+if the server still has not reported the exit 1 s after that (a grandchild
+keeping the output pipes open), the client stops waiting and leaves the
+session to the server. In every case the result says `timed_out: true`
+and the process exits 124. On `put`/`get` the whole transfer is bounded;
+expiry is a `timeout` error and exit 124.
+
+### Control socket
+
+A CLI command that reuses a live interactive client's socket (`put`, `get`,
+`forward`, `authorize`, `exec`) runs in that client with the requester's
+output mode, so `mysh put --json HOST …` prints the same document either
+way.

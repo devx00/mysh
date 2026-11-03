@@ -69,6 +69,16 @@ and ships as static release binaries.
   with one aggregate progress line.
 - **Prompt** (M5): Tab completion of local paths and `Ctrl-R` reverse
   history search.
+- **Structured output** (M6): `--json` (one document per command, errors
+  as `{"error": {"code", "message"}}` on stderr with stable codes),
+  `--json-stream` (NDJSON `started`/`stdout`/`stderr`/`exit`/`progress`/
+  `notice`/`error`/`result` events, base64 for non-UTF-8 chunks) and
+  `--plain` on every HOST command and the prompt; typed result shapes in
+  `mysh::output`; `--timeout DURATION` (TERM, KILL after 2 s, exit 124) and
+  `--cwd DIR` for `CMD`/`exec`; `stat REMOTE`; `Open::Info` (server
+  version, platform, kernel, shell, home, user, caps, limits, uptime) shown
+  by `info`; `mysh help --json [CMD]` and the prompt's `help --json` print
+  the clap command tree (docs/05 "Agent interface", docs/03 §10quater).
 - **Release** (M4): `scripts/release.sh` links all five targets and writes
   `SHA256SUMS`; `.github/workflows/release.yml` does the same on tags;
   `contrib/` has a systemd unit, a launchd plist and a Termux:Boot script.

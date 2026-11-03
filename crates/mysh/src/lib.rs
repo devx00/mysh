@@ -7,6 +7,7 @@ pub mod cli;
 pub mod client;
 pub mod config;
 pub mod identity;
+pub mod output;
 pub mod server;
 
 /// Key material compiled in with `--features baked` (docs/02-security.md).

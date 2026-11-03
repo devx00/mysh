@@ -5,6 +5,11 @@
 //! readers, the prompt, and meta commands never interleave mid-line. In raw
 //! mode (`OPOST` off) text writes translate `\n` to `\r\n`; session bytes
 //! are never translated because the remote tty already did that.
+//!
+//! The console carries the output [`Mode`] (docs/05-meta-shell.md "Agent
+//! interface"): in `Json` mode results go out as one document per command
+//! via [`Console::report`] and session bytes are collected for the
+//! `ExecResult`; in `JsonStream` mode everything becomes an [`Event`] line.
 
 use std::{
     fs::File,
@@ -16,10 +21,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde::Serialize;
 use tokio::{
     io::AsyncWriteExt as _,
     sync::{mpsc, oneshot},
 };
+
+use crate::output::{Bytes, ErrorOut, Event, Mode};
 
 /// Minimum interval between two redraws of the progress line.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -104,10 +112,13 @@ struct Progress {
 
 struct Inner {
     sink: Sink,
+    mode: Mode,
     raw: AtomicBool,
     tty: bool,
     hook: Mutex<Option<Hook>>,
     progress: Mutex<Progress>,
+    /// Session bytes collected in `Json` mode for the exec result.
+    exec_capture: Mutex<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Cloneable handle to the terminal writer. See the module docs.
@@ -119,6 +130,7 @@ pub struct Console {
 impl std::fmt::Debug for Console {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Console")
+            .field("mode", &self.inner.mode)
             .field("tty", &self.inner.tty)
             .field("raw", &self.inner.raw.load(Ordering::Relaxed))
             .finish_non_exhaustive()
@@ -131,12 +143,19 @@ impl Default for Console {
     }
 }
 impl Console {
-    /// Spawns the writer task on the current tokio runtime.
+    /// Spawns the writer task on the current tokio runtime; `Human` on a
+    /// terminal, `Plain` otherwise.
     pub fn new() -> Self {
+        let tty = mysh_pty::terminal::is_terminal(std::io::stdout());
+        Self::with_mode(Mode::select(false, false, false, tty))
+    }
+
+    /// Spawns the writer task with an explicit output mode.
+    pub fn with_mode(mode: Mode) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(writer(rx));
         let tty = mysh_pty::terminal::is_terminal(std::io::stdout());
-        Self::with_sink(Sink::Terminal(tx), tty)
+        Self::with_sink(Sink::Terminal(tx), tty, mode)
     }
 
     /// A console that records instead of printing: every write becomes a
@@ -144,17 +163,26 @@ impl Console {
     /// notices arrive as `Err` and `progress` sends structured updates.
     #[must_use]
     pub fn capture() -> (Self, CaptureRx) {
+        Self::capture_with_mode(Mode::Plain)
+    }
+
+    /// [`Console::capture`] in an explicit mode: with `Json`/`JsonStream`
+    /// the `Out` events carry the JSON lines a terminal console would have
+    /// printed (for control-socket requests made with `--json`).
+    #[must_use]
+    pub fn capture_with_mode(mode: Mode) -> (Self, CaptureRx) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
-            Self::with_sink(Sink::Capture(tx), false),
+            Self::with_sink(Sink::Capture(tx), false, mode),
             CaptureRx { rx, done: false },
         )
     }
 
-    fn with_sink(sink: Sink, tty: bool) -> Self {
+    fn with_sink(sink: Sink, tty: bool, mode: Mode) -> Self {
         Self {
             inner: Arc::new(Inner {
                 sink,
+                mode,
                 raw: AtomicBool::new(false),
                 tty,
                 hook: Mutex::new(None),
@@ -165,12 +193,111 @@ impl Console {
                     latest: None,
                     forwarded: false,
                 }),
+                exec_capture: Mutex::new((Vec::new(), Vec::new())),
             }),
         }
     }
 
     fn is_capture(&self) -> bool {
         matches!(self.inner.sink, Sink::Capture(_))
+    }
+
+    /// The output mode chosen in `main`.
+    pub fn mode(&self) -> Mode {
+        self.inner.mode
+    }
+
+    /// `Human` mode on a terminal: progress lines and prompt redraws.
+    fn draws(&self) -> bool {
+        self.inner.tty && self.inner.mode == Mode::Human
+    }
+
+    /// A command's result: the JSON document in `Json`/`JsonStream` mode,
+    /// else `human()` (which must end with its newline) as text.
+    pub fn report<T: Serialize>(&self, value: &T, human: impl FnOnce() -> String) {
+        match self.inner.mode {
+            Mode::Json => self.emit(value),
+            Mode::JsonStream => match serde_json::to_value(value) {
+                Ok(value) => self.event(&Event::Result { value }),
+                Err(e) => self.error_line(&ErrorOut::new(
+                    crate::output::codes::INTERNAL,
+                    format!("serializing result: {e}"),
+                )),
+            },
+            Mode::Human | Mode::Plain => self.print(&human()),
+        }
+    }
+
+    /// One JSON document on stdout (`Json` and `JsonStream` modes only).
+    pub fn emit<T: Serialize>(&self, value: &T) {
+        if !self.inner.mode.is_json() {
+            return;
+        }
+        match serde_json::to_string(value) {
+            Ok(mut line) => {
+                line.push('\n');
+                self.send(Op::Out(line.into_bytes()));
+            }
+            Err(e) => self.error_line(&ErrorOut::new(
+                crate::output::codes::INTERNAL,
+                format!("serializing output: {e}"),
+            )),
+        }
+    }
+
+    /// One NDJSON event on stdout in `JsonStream` mode. In `Json` mode a
+    /// notice or error still reaches stderr; everything else is dropped.
+    pub fn event(&self, ev: &Event) {
+        match self.inner.mode {
+            Mode::JsonStream => self.emit(ev),
+            Mode::Json => match ev {
+                Event::Notice { text } => {
+                    self.send(Op::Err(format!("[mysh] {text}\n").into_bytes()));
+                }
+                Event::Error { code, message } => {
+                    self.send(Op::Err(
+                        format!("{}\n", ErrorOut::new(code, message.clone()).to_line())
+                            .into_bytes(),
+                    ));
+                }
+                _ => {}
+            },
+            Mode::Human | Mode::Plain => match ev {
+                Event::Notice { text } => self.notice(text),
+                Event::Error { message, .. } => self.println(&format!("error: {message}")),
+                _ => {}
+            },
+        }
+    }
+
+    /// A failed command: `error: …` as text, an [`ErrorOut`] line on stderr
+    /// in `Json` mode, an `error` event in `JsonStream` mode.
+    pub fn error(&self, err: &anyhow::Error) {
+        match self.inner.mode {
+            Mode::Json => self.error_line(&ErrorOut::from_error(err)),
+            Mode::JsonStream => {
+                let out = ErrorOut::from_error(err);
+                self.event(&Event::Error {
+                    code: out.error.code,
+                    message: out.error.message,
+                });
+            }
+            Mode::Human | Mode::Plain => self.println(&format!("error: {err:#}")),
+        }
+    }
+
+    fn error_line(&self, out: &ErrorOut) {
+        self.send(Op::Err(format!("{}\n", out.to_line()).into_bytes()));
+    }
+
+    /// Session bytes collected by `write_bytes`/`write_stderr` in `Json`
+    /// mode since the last call: `(stdout, stderr)`.
+    pub fn take_exec_capture(&self) -> (Vec<u8>, Vec<u8>) {
+        self.inner
+            .exec_capture
+            .lock()
+            .map(|mut c| std::mem::take(&mut *c))
+            .unwrap_or_default()
     }
 
     /// Whether stdout is a terminal.
@@ -201,11 +328,18 @@ impl Console {
         self.send(Op::Out(bytes));
     }
 
-    /// `[mysh] text` on its own line (stderr when stdout is not a terminal),
+    /// `[mysh] text` on its own line (stderr unless drawing on a terminal),
     /// then the prompt-redraw hook if one is installed. With a hook active
     /// in raw mode the prompt line is cleared first so the notice does not
-    /// land mid-line; the hook then repaints the prompt underneath.
+    /// land mid-line; the hook then repaints the prompt underneath. In
+    /// `JsonStream` mode the notice is an event.
     pub fn notice(&self, text: &str) {
+        if self.inner.mode == Mode::JsonStream {
+            self.emit(&Event::Notice {
+                text: text.to_owned(),
+            });
+            return;
+        }
         self.end_progress_line();
         let hook = self.inner.hook.lock().ok().and_then(|h| h.clone());
         let mut bytes = Vec::new();
@@ -214,7 +348,7 @@ impl Console {
         }
         bytes.extend(self.translate(format!("[mysh] {text}").as_bytes()));
         bytes.extend_from_slice(self.newline());
-        if self.inner.tty {
+        if self.inner.tty && self.inner.mode == Mode::Human {
             self.send(Op::Out(bytes));
         } else {
             self.send(Op::Err(bytes));
@@ -224,13 +358,46 @@ impl Console {
         }
     }
 
-    /// Raw session output: no translation; tee'd to the log file.
+    /// Raw session output: no translation; tee'd to the log file. Collected
+    /// in `Json` mode, a `stdout` event in `JsonStream` mode.
     pub fn write_bytes(&self, bytes: &[u8]) {
+        match self.inner.mode {
+            Mode::Json => {
+                if let Ok(mut c) = self.inner.exec_capture.lock() {
+                    c.0.extend_from_slice(bytes);
+                }
+            }
+            Mode::JsonStream => self.emit(&Event::Stdout {
+                data: Bytes::from(bytes),
+            }),
+            Mode::Human | Mode::Plain => self.send(Op::Out(bytes.to_vec())),
+        }
+    }
+
+    /// Raw bytes to stderr (exec sessions without a pty); collected or an
+    /// event like [`Console::write_bytes`].
+    pub fn write_stderr(&self, bytes: &[u8]) {
+        match self.inner.mode {
+            Mode::Json => {
+                if let Ok(mut c) = self.inner.exec_capture.lock() {
+                    c.1.extend_from_slice(bytes);
+                }
+            }
+            Mode::JsonStream => self.emit(&Event::Stderr {
+                data: Bytes::from(bytes),
+            }),
+            Mode::Human | Mode::Plain => self.send(Op::Err(bytes.to_vec())),
+        }
+    }
+
+    /// Bytes already in final form (control-socket relay): straight to
+    /// stdout, no mode handling, no newline translation.
+    pub fn write_raw(&self, bytes: &[u8]) {
         self.send(Op::Out(bytes.to_vec()));
     }
 
-    /// Raw bytes to stderr (exec sessions without a pty).
-    pub fn write_stderr(&self, bytes: &[u8]) {
+    /// [`Console::write_raw`] for stderr.
+    pub fn write_raw_err(&self, bytes: &[u8]) {
         self.send(Op::Err(bytes.to_vec()));
     }
 
@@ -239,11 +406,13 @@ impl Console {
         self.send(Op::SetLog(file));
     }
 
-    /// One `\r`-redrawn status line; no-op when stdout is not a terminal.
-    /// A capture console forwards every call as a `Progress` event instead
-    /// (throttled like the drawn line). Finish with [`Console::progress_done`].
+    /// One `\r`-redrawn status line; no-op unless drawing on a terminal. A
+    /// capture console forwards every call as a `Progress` event instead,
+    /// and `JsonStream` mode emits `progress` events (both throttled like
+    /// the drawn line). Finish with [`Console::progress_done`].
     pub fn progress(&self, label: &str, done: u64, total: Option<u64>) {
-        if !self.inner.tty && !self.is_capture() {
+        let stream = self.inner.mode == Mode::JsonStream;
+        if !self.draws() && !self.is_capture() && !stream {
             return;
         }
         let Ok(mut p) = self.inner.progress.lock() else {
@@ -255,52 +424,63 @@ impl Console {
             .is_none_or(|t| now.duration_since(t) >= PROGRESS_INTERVAL);
         p.line = format_progress(label, done, total);
         p.active = true;
+        let ev = CaptureEvent::Progress {
+            label: label.to_owned(),
+            done,
+            total,
+        };
+        if due {
+            p.last_draw = Some(now);
+            self.forward_progress(&ev);
+        }
+        p.forwarded = due;
+        p.latest = Some(ev);
+    }
+
+    /// Deliver one progress update the way the mode and sink want it.
+    fn forward_progress(&self, ev: &CaptureEvent) {
+        let CaptureEvent::Progress { label, done, total } = ev else {
+            return;
+        };
+        if self.inner.mode == Mode::JsonStream {
+            self.emit(&Event::Progress {
+                label: label.clone(),
+                done: *done,
+                total: *total,
+            });
+            return;
+        }
         match &self.inner.sink {
             Sink::Terminal(_) => {
-                if due {
-                    p.last_draw = Some(now);
-                    self.send(Op::Out(format!("\r\x1b[K{}", p.line).into_bytes()));
-                }
+                let line = format_progress(label, *done, *total);
+                self.send(Op::Out(format!("\r\x1b[K{line}").into_bytes()));
             }
             Sink::Capture(tx) => {
-                let ev = CaptureEvent::Progress {
-                    label: label.to_owned(),
-                    done,
-                    total,
-                };
-                if due {
-                    p.last_draw = Some(now);
-                    let _ = tx.send(ev.clone());
-                }
-                p.forwarded = due;
-                p.latest = Some(ev);
+                let _ = tx.send(ev.clone());
             }
         }
     }
 
     /// Draw the final state of the progress line and move to a new line. A
-    /// capture console forwards the last throttled update instead.
+    /// capture console (or `JsonStream` mode) forwards the last throttled
+    /// update instead.
     pub fn progress_done(&self) {
-        if !self.inner.tty && !self.is_capture() {
+        let stream = self.inner.mode == Mode::JsonStream;
+        if !self.draws() && !self.is_capture() && !stream {
             return;
         }
         let Ok(mut p) = self.inner.progress.lock() else {
             return;
         };
         if p.active {
-            match &self.inner.sink {
-                Sink::Terminal(_) => {
-                    let mut bytes = format!("\r\x1b[K{}", p.line).into_bytes();
-                    bytes.extend_from_slice(self.newline());
-                    self.send(Op::Out(bytes));
-                }
-                Sink::Capture(tx) => {
-                    if !p.forwarded
-                        && let Some(ev) = p.latest.take()
-                    {
-                        let _ = tx.send(ev);
-                    }
-                }
+            if self.draws() && !stream {
+                let mut bytes = format!("\r\x1b[K{}", p.line).into_bytes();
+                bytes.extend_from_slice(self.newline());
+                self.send(Op::Out(bytes));
+            } else if !p.forwarded
+                && let Some(ev) = p.latest.take()
+            {
+                self.forward_progress(&ev);
             }
         }
         p.active = false;
@@ -311,10 +491,10 @@ impl Console {
     }
 
     /// Called by [`Console::notice`] after printing, so an active prompt can
-    /// redraw itself under the notice.
+    /// redraw itself under the notice. Ignored outside `Human` mode.
     pub fn set_prompt_hook(&self, hook: Option<Hook>) {
         if let Ok(mut h) = self.inner.hook.lock() {
-            *h = hook;
+            *h = hook.filter(|_| self.inner.mode == Mode::Human);
         }
     }
 
@@ -372,7 +552,7 @@ impl Console {
 
     /// An in-progress status line must not be overprinted by other text.
     fn end_progress_line(&self) {
-        if !self.inner.tty {
+        if !self.draws() {
             return;
         }
         let Ok(mut p) = self.inner.progress.lock() else {

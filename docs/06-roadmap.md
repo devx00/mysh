@@ -136,60 +136,78 @@ principles hold throughout:
    a stable machine-readable code, every long-running thing is a session
    with an id.
 
-### M6 — structured I/O
+### M6 — structured I/O ✔
 
-- `--json` on every command that prints data: `info`, `sessions`, `jobs`,
+- `--json` ✔ on every command that prints data: `info`, `sessions`, `jobs`,
   `ls`, `stat`, `forward ls`, `ping`, `exec` and `mysh HOST CMD` (one object
-  `{stdout, stderr, exit, signal, duration_ms}`; `--json-stream` emits NDJSON
-  events `{"stdout":…}` / `{"stderr":…}` / `{"exit":…}` as they happen,
-  base64 for non-UTF-8 chunks). Errors become
+  `{stdout, stderr, exit, signal, duration_ms, timed_out}`; `--json-stream`
+  ✔ emits NDJSON events `{"event":"stdout","data":…}` / `stderr` / `exit`
+  as they happen, base64 for non-UTF-8 chunks). Errors ✔ become
   `{"error": {"code": "unauthorized", "message": …}}` on stderr with the
   same codes as `ErrorCode` plus client-side ones (`trust_unknown`,
-  `trust_mismatch`, `connect_failed`, `timeout`, `usage`).
-- `--plain`: no ANSI, no progress lines, no banner, no prompt hooks
+  `trust_mismatch`, `connect_failed`, `timeout`, `usage`, `internal`).
+- `--plain` ✔: no ANSI, no progress lines, no banner, no prompt hooks
   (implied by `--json` and when stdout is not a tty).
-- `--timeout DURATION` on `exec`, `CMD`, `put`, `get` (sends `Signal(Term)`
-  then `Kill` after 2 s; exit code 124 like `timeout(1)`), `--cwd DIR` on
+- `--timeout DURATION` ✔ on `exec`, `CMD`, `put`, `get` (sends `Signal(Term)`
+  then `Kill` after 2 s; exit code 124 like `timeout(1)`), `--cwd DIR` ✔ on
   `exec`/`CMD` (uses `SessionRequest.cwd`).
-- `info --json` reports server facts without running a command: a new
+- `info --json` ✔ reports server facts without running a command: the
   `Open::Info` stream returning `{name, version, platform: {os, arch,
-  kernel}, shell, home, user, caps, limits, uptime, detach_grace}`.
-- `help --json`: the clap command tree with arguments, types and defaults,
-  for tool discovery.
-- Docs: 05 gains an "Agent interface" section with the JSON schemas.
-- Tests: every `--json` output round-trips through `serde_json` into typed
-  structs in the test; NDJSON ordering (`exit` last); error code mapping
-  for each failure class; `--timeout` kills a `sleep 30` in ≈1 s with 124;
-  `--cwd`; `Open::Info` fields match `uname`.
+  kernel}, shell, home, user, caps, limits, uptime_secs}` (03-protocol.md
+  §10quater); the human `info` prints them too.
+- `help --json` ✔ (`mysh help --json [CMD]` and the prompt's `help --json`):
+  the clap command tree with arguments, types and defaults, for tool
+  discovery.
+- Docs ✔: 05 "Agent interface" with every document, event and code.
+- Tests ✔ (`tests/json.rs`): every `--json` output round-trips through
+  `serde_json` into the typed structs of `mysh::output`; NDJSON ordering
+  (`exit` last) and base64; error code mapping for each failure class;
+  `--timeout` kills a `sleep 30` in ≈1 s with 124 (and a TERM-ignoring one
+  after the KILL); `--cwd`; `Open::Info` fields match `uname`; `help --json`
+  lists every subcommand.
 
-### M7 — remote process API
+### M7 — remote process API ✔
 
-- `exec` over the control socket: `mysh HOST exec CMD` and `mysh HOST CMD`
-  reuse a live client's connection when the socket exists (today only
-  `put/get/forward/authorize` do). `mysh -M HOST` (or `--persist`) starts a
-  background master that holds the connection open with no prompt and
-  exits after `--idle 10m` without clients, like ssh ControlMaster; the
-  first socket-less call may auto-spawn it (`master = auto` in config).
-- Session I/O without a terminal: `mysh HOST session new [--cwd] [--pty]
-  CMD` → `{id, pid}`; `session send ID BYTES` (`--stdin` for raw, `--eof`);
-  `session read ID --since OFFSET [--wait DURATION] [--max BYTES]` →
-  `{offset, next, bytes, exited: …}`; `session list`, `session kill ID
-  [-s SIG]`, `session wait ID`. Server side: every session (attached or not)
-  keeps its ring with an absolute byte offset counter; new stream kinds
-  `Open::Read { session, offset, max }` (one `Msg<ReadReply>`, blocking up
-  to `wait` for new bytes) and `Open::Write { session }` (raw stdin, then
-  close). Reads are idempotent: the same offset returns the same bytes
-  until they age out of the ring, and the reply says so (`oldest`).
-- Sessions created this way persist by default (they are the detached
-  kind); `--pty` is optional and off by default so stdout/stderr stay
-  separate (`ReadReply` carries both streams for non-PTY sessions).
-- Docs: 03 §7 (offsets), new §10ter (`Read`/`Write`), 05 (master mode,
-  `session` command family).
-- Tests: 200 `exec` calls through one master complete in a bounded time
-  and the server logs a single handshake; `session new 'sh -c "for i in
-  $(seq 1 5); do echo $i; sleep 0.2; done"'` + incremental `read --since`
-  reassembles `1..5` exactly once; `read` past the ring reports `oldest`;
-  `send` to a `cat` session echoes; `kill`; master idle exit; auto-spawn.
+- `exec` over the control socket ✔: `mysh HOST CMD` runs in a live
+  client or master when the socket answers (stdin up to 64 KiB travels
+  with the request; a terminal stdin or `-t` keeps its own connection),
+  and so do the `session` commands. `mysh -M HOST` / `mysh master HOST
+  [--idle D] [--daemon]` ✔ holds the connection open with no prompt and no
+  stdin, logs to stderr, removes its socket on the way out and exits after
+  `--idle` (default 10 min) without a request, on `SIGTERM`, or when the
+  connection ends. `master = "auto"` in `[defaults]`/`[hosts.NAME]` (or
+  `--master auto|always`) makes a socket-less call spawn that daemon
+  first — detached through `process_group(0)` and `Stdio::null()`, waited
+  for up to 3 s.
+- Session I/O without a terminal ✔: `mysh HOST session new [--cwd] [--pty]
+  [--env] -- CMD` → `{id, pid}`; `session send ID [TEXT] [--stdin]
+  [--eof]`; `session read ID [--since N] [--wait D] [--max B] [--follow]`
+  → `{offset, next, oldest, chunks, exited}`; `session list`, `session
+  kill ID [-s SIG]`, `session wait ID [--timeout D]` — as CLI
+  subcommands, prompt commands and over the control socket. Server side ✔:
+  every registered session keeps an `OutRing` with absolute offsets, fed
+  whether or not a stream is attached, and three new stream kinds
+  `Open::Read { session, offset, max, wait_ms }`,
+  `Open::Write { session, eof }` and `Open::Signal { session, signal }`
+  (03 §10ter). Reads are idempotent: the same offset returns the same
+  bytes until they age out of the 1 MiB ring, and the reply says so
+  (`offset`, `oldest`).
+- Sessions created this way persist ✔ (`SessionRequest.persist`): they are
+  registered at `Started`, survive the stream that opened them, and stay
+  listed with their status for the detach grace window; `--pty` is off by
+  default so stdout and stderr stay separate (`Chunk.stream`).
+- Docs ✔: 03 §7 (offsets, `persist`), §10ter (`Read`/`Write`/`Signal`),
+  §12; 05 (`session` command family, master mode, exec over the socket).
+- Tests ✔ (`tests/procapi.rs`, plus `OutRing` units): incremental
+  `read --since` reassembles `1..5` exactly once and ends in `Code(0)`;
+  2 MiB of output read from 0 reports `offset == oldest > 0`; `send` to a
+  `cat` session echoes and `--eof` ends it with `Code(0)`; stdout/stderr
+  stay tagged without a pty and merge with one; `kill` → `Signal(15)`;
+  `wait --timeout` gives up without ending the session; 200 `exec` calls
+  through one master all succeed against a server limited to one handshake
+  per minute; `--idle 500ms` exits within 2 s and removes its socket;
+  `master = "auto"` spawns one master and the second call reuses it;
+  `read --follow` streams until exit.
 
 ### M8 — files as primitives
 
@@ -291,6 +309,17 @@ later.
 | 28 | `&` is recognised only as a final whole token; jobs are limited to `put get ls exec authorize`; a cancelled job's `exec` session gets `SIGTERM`; completion prints the notice and the captured output (64 KiB cap) in one go | shell-style `&` anywhere, backgrounding any command, output streamed live above the prompt | a glued `&` is a legal file name; the other commands need the terminal; interleaving a job's output with the prompt and foreground sessions would defeat the capture console |
 | 29 | parallel recursive transfers walk first and then run files `-j` at a time behind a semaphore; the first error aborts the rest; progress is one aggregate line | pipelining the walk with the transfers; continuing past errors and summarising | directories exist before any file stream opens and `-P` post-order attributes stay correct; an aborted tree is reported as one error the user can act on, and `-c` resumes it |
 | 30 | signature authentication stays inside Noise `XX`: the client's static is a fresh random key, message 3's payload carries `AuthProof::Ed25519 { public_key, signature }` over `SIG_AUTH_LABEL ‖ h2` (the handshake hash after message 2), and the server authorizes the ed25519 key directly; `ClientHello` grew the `auth` field without a protocol version bump (pre-release, no deployed peers) | a separate `NN` handshake plus an `Auth` message after it; a new protocol version | one handshake code path and one `Verdict`; `h2` already binds both ephemerals and the server static so the signature cannot be replayed; the identity stays hidden from an unverified server exactly as for static keys; a cap bit is enough for a client to know whether to try an agent key before revealing anything |
+| 31 | one `output::Mode` (`Human`/`Plain`/`Json`/`JsonStream`) chosen in `main` and carried by the `Console`; printers call `console.report(&doc, || text)` and the console decides whether the document, a `result` event or the text goes out; session bytes are collected (`Json`) or turned into `stdout`/`stderr` events (`JsonStream`) by the same `write_bytes`/`write_stderr` the terminal path uses | a second dispatcher or per-command `--json` flags; a `Printer` trait per command | one grammar, one dispatcher, one console: every frontend (prompt, script, job, control socket) gets JSON by constructing its console in the right mode, and the typed result structs double as the test contract |
+| 32 | errors carry a stable code as a typed cause in the anyhow chain (`CodedError`), classified once by `code_for`; the wire's `ErrorCode` maps 1:1 to snake_case, trust/connect/usage/timeout are client-side codes; unclassified errors that exit 2 report `usage`, the rest `internal` | an error enum threaded through every client function | the chains already exist and stay readable; a code is attached exactly where the failure class is known (dial, trust verdict, handshake verdict, transfer deadline) and nothing else changes |
+| 33 | `--timeout` is a client-side escalation: `Signal(Term)` at the deadline, `Signal(Kill)` 2 s later, stop waiting 1 s after that (the exec server reports `Exited` only once the output pipes close, so a grandchild holding them would otherwise hang the caller); exit 124, `timed_out: true` | a server-side deadline in `SessionRequest` | works against today's servers, the policy is visible in one place, and the server keeps its single "exit = reaped + drained" rule |
+| 34 | `Open::Info` is assembled from the effective per-connection `Policy`, `std::env::consts` and `rustix::system::uname()` — never by running a command; `uptime` counts from `Server::bind` | `uname -a`/`sh -c` on the server | a client asking "what are you" must not need the `exec` permission, and a deterministic reply is testable (`kernel == uname -r`) |
+| 35 | one `OutRing` per *registered* session (every PTY session, plus `persist: true` exec sessions) carries absolute offsets (`next`, `oldest`, plus a `sent` watermark) and is fed by the pump whether or not a stream is attached; an unregistered session gets a ring with capacity 0 | a ring only while detached, as in M5; a separate buffer per reader | one buffer answers both jobs — `Attach` replays from `sent`, `Open::Read` addresses absolute offsets — so the reattach replay and the API can never disagree, the "carry" hack of M5 disappears, and a plain `mysh HOST CMD` still allocates nothing |
+| 36 | `persist: true` sessions are parked by the same machinery as a detached PTY session: the attached pump returns on stream EOF, a detached pump (one per kind) keeps draining output into the ring and serving `Open::Write`, and the entry stays listed with its status until the detach grace window passes | a reaper that unregisters a session as soon as its process exits | `session wait`/`read` must still work *after* the process ends, and one grace window (already configurable, already tested) is the only lifetime rule in the server; nothing new to tune |
+| 37 | `Open::Write` grew an `eof` flag instead of relying on the stream's half-close to mean "close stdin" | EOF on the write stream always closes the child's stdin | `session send ID TEXT` is a one-shot command whose stream always ends; without the flag every write would close stdin and `send` could never be repeated. The flag is a pre-release field addition, no version bump |
+| 38 | `kill` is its own stream kind (`Open::Signal`, kind 13) rather than an in-band byte on `Open::Write` or a full `Attach` | reuse `SessionIn::Signal` by attaching | `Write` is raw bytes by definition and `Attach` costs a session slot and a pty; one prologue plus one reply is the cheapest thing that can answer "did it work" |
+| 39 | a `Msg<ReadReply>` is capped at the control-message limit (256 KiB less framing) even though a client may ask for `READ_MAX` (1 MiB); the reader continues from `next` | raising `MAX_CONTROL_MESSAGE`; splitting a read over several messages | the frame cap is a transport invariant the fuzzers and both peers rely on, and `next` already exists to continue a read — a short reply is a normal answer, not an error |
+| 40 | the master is an ordinary client without prompt or stdin that owns the same control socket; `--daemon` and `master = auto` re-spawn the binary with `process_group(0)` and `Stdio::null()` and wait up to 3 s for the socket | `fork`+`setsid` in-process; a separate daemon binary or a socket-activated service | the safe std API is enough on Linux, macOS and Android, keeps `#![forbid(unsafe_code)]`, and reuses the socket, allow-list and capture console that M5 already tests; the master dies with its connection, so nothing outlives the server |
+| 41 | `mysh HOST CMD` routes through the socket only when stdin is not a terminal and `-t` was not given, and its stdin (≤ 64 KiB) travels inside the request, read only after a socket has answered | multiplexing the session's stdin over the control socket like ssh's ControlMaster | the control protocol is one request and an event stream, not a duplex channel; a bounded, eagerly-read stdin covers scripts and agents, while an interactive or huge-input call quietly keeps its own connection instead of behaving subtly differently |
 
 ## Testing strategy
 

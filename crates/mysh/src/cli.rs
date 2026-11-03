@@ -8,8 +8,14 @@
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+
+use crate::{
+    config::{MasterMode, parse_duration},
+    output::HelpTree,
+};
 
 /// Top-level command line: `mysh [OPTIONS] HOST [-- CMD...]` or a subcommand.
 #[derive(Parser, Debug)]
@@ -20,7 +26,8 @@ use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
     long_about = None,
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
-    arg_required_else_help = true
+    arg_required_else_help = true,
+    disable_help_subcommand = true
 )]
 pub struct Cli {
     /// Increase log verbosity; `-vv` includes handshake and stream events.
@@ -57,6 +64,24 @@ pub enum Command {
     Forward(HostAnd<ForwardCliArgs>),
     /// Append the client's public key to HOST's `authorized_keys`.
     Authorize(HostAnd<AuthorizeArgs>),
+    /// Start, feed, read and end sessions without a terminal.
+    Session(HostAnd<SessionArgs>),
+    /// Hold a connection open for other `mysh` calls (`ControlMaster`).
+    Master(HostAnd<MasterArgs>),
+    /// Print help for a command, or the whole command tree as JSON.
+    Help(HelpArgs),
+}
+
+/// `mysh help [--json] [CMD]`.
+#[derive(Args, Clone, Debug, Default)]
+pub struct HelpArgs {
+    /// The command tree with arguments, types and defaults, as JSON.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Subcommand to describe (default: the whole tree).
+    #[arg(value_name = "CMD")]
+    pub cmd: Option<String>,
 }
 
 /// Connection options shared by every HOST-taking command.
@@ -143,6 +168,40 @@ pub struct ConnectOpts {
     /// `put`/`get`/`forward`/`authorize`; always open a new connection.
     #[arg(long = "no-ctl")]
     pub no_ctl: bool,
+
+    /// One JSON document per command on stdout; errors as JSON on stderr
+    /// (docs/05-meta-shell.md "Agent interface").
+    #[arg(long, conflicts_with = "json_stream")]
+    pub json: bool,
+
+    /// Newline-delimited JSON events on stdout as they happen.
+    #[arg(long = "json-stream")]
+    pub json_stream: bool,
+
+    /// No ANSI sequences, progress lines, banner or prompt redraws (implied
+    /// by `--json`, `--json-stream`, and when stdout is not a terminal).
+    #[arg(long)]
+    pub plain: bool,
+
+    /// Give up after DURATION (`10s`, `2m`, `500ms`): a command gets TERM,
+    /// then KILL after 2 s; exit code 124.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub timeout: Option<Duration>,
+
+    /// Working directory for CMD (`~`-relative paths are expanded by the
+    /// server).
+    #[arg(long, value_name = "DIR")]
+    pub cwd: Option<String>,
+
+    /// Run as a background master for HOST: serve the control socket, no
+    /// prompt, no stdin (same as `mysh master HOST`).
+    #[arg(short = 'M')]
+    pub as_master: bool,
+
+    /// Start a background master when no control socket is there
+    /// (`never` by default; `[defaults] master` in the config file).
+    #[arg(long, value_name = "never|auto|always")]
+    pub master: Option<MasterMode>,
 }
 
 /// `HOST [-- CMD...]` with the shared connection options.
@@ -324,6 +383,9 @@ pub(crate) struct MetaCli {
 pub enum MetaCommand {
     /// List commands, or show help for one command.
     Help {
+        /// The command tree with arguments, types and defaults, as JSON.
+        #[arg(long)]
+        json: bool,
         /// Command name.
         #[arg(value_name = "CMD")]
         cmd: Option<String>,
@@ -395,6 +457,13 @@ pub enum MetaCommand {
     Forward(ForwardArgs),
     /// Run a non-PTY command and stream its output here.
     Exec {
+        /// Give up after DURATION (`10s`, `2m`, `500ms`): TERM, then KILL
+        /// after 2 s; exit code 124.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        timeout: Option<Duration>,
+        /// Working directory (default: the MRU session's, else home).
+        #[arg(long, value_name = "DIR")]
+        cwd: Option<String>,
         /// Command and arguments.
         #[arg(
             value_name = "CMD",
@@ -404,6 +473,14 @@ pub enum MetaCommand {
             num_args = 1..
         )]
         command: Vec<String>,
+    },
+    /// Start, feed, read and end sessions without a terminal.
+    Session(SessionArgs),
+    /// Show a remote file's attributes.
+    Stat {
+        /// Remote path.
+        #[arg(value_name = "REMOTE")]
+        path: String,
     },
     /// Show connection information.
     Info,
@@ -675,6 +752,206 @@ impl AuthorizeArgs {
     }
 }
 
+/// `session new|send|read|list|kill|wait …` (docs/05-meta-shell.md,
+/// "Session command family"). The same struct serves the CLI subcommand,
+/// the prompt command and the control socket.
+#[derive(Args, Clone, Debug, PartialEq, Eq)]
+pub struct SessionArgs {
+    #[command(subcommand)]
+    pub cmd: SessionCmd,
+}
+
+/// What a `session` command line asks for.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum SessionCmd {
+    /// Start a session that outlives this command; prints `{id, pid}`.
+    New(SessionNewArgs),
+    /// Write to a session's stdin.
+    Send(SessionSendArgs),
+    /// Read a session's output from an absolute byte offset.
+    Read(SessionReadArgs),
+    /// List the sessions this key owns on the server.
+    List,
+    /// Signal a session (default: TERM).
+    Kill {
+        /// Signal name or number.
+        #[arg(short = 's', long = "signal", value_name = "SIG")]
+        signal: Option<String>,
+        /// Session id.
+        #[arg(value_name = "ID")]
+        id: u32,
+    },
+    /// Wait for a session to exit and print its status.
+    Wait {
+        /// Give up after DURATION (`10s`, `2m`, `500ms`); exit code 124.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        timeout: Option<Duration>,
+        /// Session id.
+        #[arg(value_name = "ID")]
+        id: u32,
+    },
+}
+
+/// `session new [--cwd DIR] [--pty] [--env K=V] -- CMD…`.
+#[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionNewArgs {
+    /// Working directory (default: the remote home).
+    #[arg(long, value_name = "DIR")]
+    pub cwd: Option<String>,
+
+    /// Run under a pty (stdout and stderr are then merged).
+    #[arg(long)]
+    pub pty: bool,
+
+    /// Environment variable `NAME[=VALUE]` (repeatable; the server must
+    /// accept it).
+    #[arg(long, value_name = "NAME[=VALUE]")]
+    pub env: Vec<String>,
+
+    /// Command and arguments (a single word runs through the shell).
+    #[arg(
+        value_name = "CMD",
+        required = true,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        num_args = 1..
+    )]
+    pub command: Vec<String>,
+}
+
+/// `session send ID [TEXT…] [--stdin] [--eof]`.
+#[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionSendArgs {
+    /// Session id.
+    #[arg(value_name = "ID")]
+    pub id: u32,
+
+    /// Read the bytes from this command's stdin instead of TEXT.
+    #[arg(long)]
+    pub stdin: bool,
+
+    /// Close the session's stdin afterwards (non-PTY sessions).
+    #[arg(long)]
+    pub eof: bool,
+
+    /// Text to send; words are joined with single spaces and a newline is
+    /// appended. Caret notation (`^C`) and `\xNN` escapes are decoded.
+    #[arg(
+        value_name = "TEXT",
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        num_args = 0..
+    )]
+    pub text: Vec<String>,
+}
+
+/// `session read ID [--since N] [--wait D] [--max BYTES] [--follow]`.
+#[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionReadArgs {
+    /// Session id.
+    #[arg(value_name = "ID")]
+    pub id: u32,
+
+    /// Absolute byte offset to read from (default: 0).
+    #[arg(long, value_name = "OFFSET")]
+    pub since: Option<u64>,
+
+    /// Block up to DURATION for new output (default: no wait).
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub wait: Option<Duration>,
+
+    /// Largest reply, in bytes (default and cap: 1 MiB).
+    #[arg(long, value_name = "BYTES")]
+    pub max: Option<u32>,
+
+    /// Keep reading until the session exits.
+    #[arg(short = 'f', long)]
+    pub follow: bool,
+}
+
+/// `mysh master HOST [--idle D] [--daemon]`.
+#[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
+pub struct MasterArgs {
+    /// Exit after DURATION without a control-socket client (default 10m).
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub idle: Option<Duration>,
+
+    /// Start the master in the background and return once its socket is up.
+    #[arg(long)]
+    pub daemon: bool,
+}
+
+impl SessionArgs {
+    /// The prompt words that reproduce this command (for the control
+    /// socket); `--stdin` input travels with the request, not in the words.
+    #[must_use]
+    pub fn to_argv(&self) -> Vec<String> {
+        let mut argv = vec!["session".to_owned()];
+        let push_opt = |argv: &mut Vec<String>, flag: &str, value: Option<String>| {
+            if let Some(v) = value {
+                argv.push(flag.to_owned());
+                argv.push(v);
+            }
+        };
+        match &self.cmd {
+            SessionCmd::New(new) => {
+                argv.push("new".to_owned());
+                push_opt(&mut argv, "--cwd", new.cwd.clone());
+                if new.pty {
+                    argv.push("--pty".to_owned());
+                }
+                for e in &new.env {
+                    argv.push("--env".to_owned());
+                    argv.push(e.clone());
+                }
+                argv.push("--".to_owned());
+                argv.extend(new.command.iter().cloned());
+            }
+            SessionCmd::Send(send) => {
+                argv.push("send".to_owned());
+                if send.stdin {
+                    argv.push("--stdin".to_owned());
+                }
+                if send.eof {
+                    argv.push("--eof".to_owned());
+                }
+                argv.push(send.id.to_string());
+                if !send.text.is_empty() {
+                    argv.push("--".to_owned());
+                    argv.extend(send.text.iter().cloned());
+                }
+            }
+            SessionCmd::Read(read) => {
+                argv.push("read".to_owned());
+                push_opt(&mut argv, "--since", read.since.map(|v| v.to_string()));
+                push_opt(&mut argv, "--wait", read.wait.map(format_duration));
+                push_opt(&mut argv, "--max", read.max.map(|v| v.to_string()));
+                if read.follow {
+                    argv.push("--follow".to_owned());
+                }
+                argv.push(read.id.to_string());
+            }
+            SessionCmd::List => argv.push("list".to_owned()),
+            SessionCmd::Kill { signal, id } => {
+                argv.push("kill".to_owned());
+                push_opt(&mut argv, "-s", signal.clone());
+                argv.push(id.to_string());
+            }
+            SessionCmd::Wait { timeout, id } => {
+                argv.push("wait".to_owned());
+                push_opt(&mut argv, "--timeout", timeout.map(format_duration));
+                argv.push(id.to_string());
+            }
+        }
+        argv
+    }
+}
+
+/// A duration as `parse_duration` reads it back.
+fn format_duration(d: Duration) -> String {
+    format!("{}ms", d.as_millis())
+}
+
 /// Default `-j` for recursive transfers.
 pub const DEFAULT_TRANSFER_JOBS: usize = 4;
 
@@ -728,6 +1005,51 @@ pub fn meta_help(cmd: Option<&str>) -> String {
         let _ = writeln!(out, "  {:<width$}  {about}", sub.get_name());
     }
     out
+}
+
+/// The prompt grammar as a [`HelpTree`] (`help --json`). The root is the
+/// nameless `MetaCli`, reported as `prompt`.
+#[must_use]
+pub fn meta_help_tree() -> HelpTree {
+    let mut root = MetaCli::command();
+    root.build();
+    let mut tree = HelpTree::from_clap(&root);
+    "prompt".clone_into(&mut tree.command);
+    tree
+}
+
+/// The CLI as a [`HelpTree`] (`mysh help --json`).
+#[must_use]
+pub fn cli_help_tree() -> HelpTree {
+    let mut root = Cli::command();
+    root.build();
+    HelpTree::from_clap(&root)
+}
+
+/// `mysh help [--json] [CMD]`: text help (clap's long help) or the tree.
+pub fn help_text(args: &HelpArgs) -> Result<String, String> {
+    if args.json {
+        let tree = cli_help_tree();
+        let tree = match args.cmd.as_deref() {
+            Some(name) => tree
+                .subcommand(name)
+                .cloned()
+                .ok_or_else(|| format!("unknown command {name:?}"))?,
+            None => tree,
+        };
+        return serde_json::to_string(&tree)
+            .map(|s| format!("{s}\n"))
+            .map_err(|e| e.to_string());
+    }
+    let mut root = Cli::command();
+    root.build();
+    match args.cmd.as_deref() {
+        Some(name) => root
+            .find_subcommand_mut(name)
+            .map(|sub| sub.render_long_help().to_string())
+            .ok_or_else(|| format!("unknown command {name:?}")),
+        None => Ok(root.render_long_help().to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -973,6 +1295,8 @@ mod tests {
         assert_eq!(
             meta("exec ls -la"),
             MetaCommand::Exec {
+                timeout: None,
+                cwd: None,
                 command: vec!["ls".to_owned(), "-la".to_owned()]
             }
         );
@@ -998,6 +1322,7 @@ mod tests {
         assert_eq!(
             meta("help put"),
             MetaCommand::Help {
+                json: false,
                 cmd: Some("put".to_owned())
             }
         );

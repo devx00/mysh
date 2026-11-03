@@ -807,6 +807,9 @@ mod tests {
             no_session: false,
             attach: None,
             no_ctl: false,
+            timeout: None,
+            cwd: None,
+            master: crate::config::MasterMode::Never,
         }
     }
 
