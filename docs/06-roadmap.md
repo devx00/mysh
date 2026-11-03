@@ -239,7 +239,7 @@ principles hold throughout:
   exactly 3 (97 unchanged, trees byte-identical after); `--delete`
   removes extras; `--pull`; `--dry-run` changes nothing.
 
-### M9 — fleet
+### M9 — fleet ✔
 
 - Fan-out ✔ (05-meta-shell.md "Fleet", decision 48): `mysh run [-j N]
   (--hosts a,b,c | --group NAME)… [--json] [--timeout D] [--cwd D] -- CMD`
@@ -266,7 +266,7 @@ principles hold throughout:
   server installs the client's public key in `authorized_keys` and the
   client pins the server key in `known_hosts`. Single use, expires, a
   wrong code closes the window.
-- Docs: 05 (`run`, groups, `pair`), 02 (pairing section, audit log), 06.
+- Docs ✔: 05 (`run`, groups, `pair`), 02 (pairing section, audit log), 06.
 - Tests ✔ (`tests/fleet.rs`, `tests/audit.rs`, `tests/pairing.rs`): `run`
   across three loopback servers attributes every line and exits 0; `-j 2`
   with `sleep 0.5` takes two rounds not three; a down alias yields
@@ -280,7 +280,7 @@ principles hold throughout:
   timestamps and a 0600 file; pairing round trip, wrong code, expired
   code, replayed code.
 
-### M10 — embedding
+### M10 — embedding ✔
 
 - `mysh-client` library crate ✔ (07-embedding.md "Library", decisions
   52–54): the client half (`config`, `identity`, `conn`, `session` +
@@ -302,7 +302,7 @@ principles hold throughout:
   per host and `mysh://{host}/{path}` for files (text, base64 blob, or a
   JSON listing). Trust: `--accept-new` only; never a prompt. `put`/`get`
   need `--allow-local-paths`. `contrib/mcp/` holds an example client config.
-- Docs: a `docs/07-embedding.md` with the library API and the MCP tool
+- Docs ✔: `docs/07-embedding.md` with the library API and the MCP tool
   schemas.
 - Tests: the library's public API drives a loopback server through every
   `Client` method without the binary ✔ (`tests/client_api.rs`); an MCP conformance test ✔ (`tests/mcp.rs`)

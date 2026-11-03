@@ -5,10 +5,12 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-Milestones M1–M5 of `docs/06-roadmap.md` are implemented: mysh connects,
+Milestones M1–M10 of `docs/06-roadmap.md` are implemented: mysh connects,
 authenticates, runs interactive and non-interactive sessions that survive a
 disconnect, transfers files and forwards ports on Linux, macOS and Android,
-and ships as static release binaries.
+ships as static release binaries, and exposes everything to programs through
+structured output, a session read/write API, a library crate and an MCP
+server.
 
 ### Added
 
@@ -138,11 +140,12 @@ and ships as static release binaries.
 - **Release** (M4): `scripts/release.sh` links all five targets and writes
   `SHA256SUMS`; `.github/workflows/release.yml` does the same on tags;
   `contrib/` has a systemd unit, a launchd plist and a Termux:Boot script.
-- **Verification**: 317 tests (unit plus integration against an in-process
-  loopback server, including real-pty interactive, persistence and
-  control-socket tests); `scripts/android-build.sh` links an Android binary
-  with the NDK clang; `scripts/lima-test.sh` runs the suite on Linux in a
-  lima VM.
+- **Verification**: 441 tests (unit plus integration against an in-process
+  loopback server, including real-pty interactive, persistence,
+  control-socket, JSON, session-API, fleet, audit, pairing, library-API and
+  MCP conformance tests); 23 fuzz targets; `scripts/android-build.sh` links
+  an Android binary with the NDK clang; `scripts/lima-test.sh` runs the
+  suite on Linux in a lima VM.
 
 ### Changed
 
