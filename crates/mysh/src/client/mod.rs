@@ -33,7 +33,7 @@ use crate::{
     cli::{AuthorizeArgs, FileCmd, ForwardCliArgs, GetArgs, MasterArgs, PutArgs, SessionArgs},
     config::{Paths, Target},
     identity::Baked,
-    output::{self, EXIT_TIMEOUT, Mode, code_for, codes},
+    output::{EXIT_TIMEOUT, Mode, code_for, codes},
 };
 
 use self::{
@@ -361,12 +361,6 @@ async fn exec_mode(
     );
     let started = std::time::Instant::now();
     let id = stack.open_session(conn, req, &label).await?;
-    if let Some(s) = stack.get(id) {
-        console.event(&output::Event::Started {
-            session: id,
-            pid: s.pid,
-        });
-    }
     stack.set_primary(id);
     stack.foreground(id, None)?;
     let mut term = Terminal::cooked(console)?;

@@ -1123,12 +1123,6 @@ pub(crate) async fn exec_command(
         .stack
         .open_session(&ctx.shared.conn, req, &label)
         .await?;
-    if let Some(s) = ctx.stack.get(id) {
-        ctx.console.event(&output::Event::Started {
-            session: id,
-            pid: s.pid,
-        });
-    }
     ctx.stack.foreground(id, None)?;
     if let Some(bytes) = stdin.filter(|b| !b.is_empty()) {
         ctx.stack.send_stdin(id, bytes)?;

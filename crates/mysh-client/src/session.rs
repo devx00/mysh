@@ -233,6 +233,10 @@ impl Stack {
                 "session {id}: requested cwd unusable, started in home"
             ));
         }
+        // Report `Started` before the reader task exists: output (stderr in
+        // particular bypasses the ring) must never be observed ahead of it.
+        self.reporter
+            .event(&crate::types::Event::Started { session: id, pid });
         self.install(id, pid, kind_label, stream);
         Ok(id)
     }
