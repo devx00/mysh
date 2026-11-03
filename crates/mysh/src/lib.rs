@@ -9,6 +9,7 @@ pub mod config;
 pub mod identity;
 pub mod output;
 pub mod server;
+pub mod wordlist;
 
 /// Key material compiled in with `--features baked` (docs/02-security.md).
 pub mod baked {

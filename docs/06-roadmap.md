@@ -67,7 +67,7 @@ Workspace, lints, CI, this spec.
   enforcement ✔ (per-connection `Policy`, `from=` at authorization, forced
   command with `MYSH_ORIGINAL_COMMAND`).
 - Fuzz targets ✔ for every postcard decoder and the key/trust/config
-  parsers (`fuzz/`, 16 targets, `scripts/fuzz-all.sh`).
+  parsers (`fuzz/`, 23 targets, `scripts/fuzz-all.sh`).
 - Release ✔: `scripts/release.sh` links the five targets and writes
   `SHA256SUMS`; `.github/workflows/release.yml` builds the same set on
   tags; `contrib/` has the systemd unit (verified with
@@ -209,48 +209,76 @@ principles hold throughout:
   `master = "auto"` spawns one master and the second call reuses it;
   `read --follow` streams until exit.
 
-### M8 — files as primitives
+### M8 — files as primitives ✔
 
-- Streaming: `get REMOTE -` and `put - REMOTE` (stdout/stdin), `cat`,
-  `write REMOTE` (from stdin, atomic, `--mode`, `--append`), `tail [-f -n]`,
-  `stat --json`, `mkdir -p`, `rm [-r]`, `mv`, `realpath` as CLI and prompt
-  commands (all exist on the wire already; `tail -f` adds
-  `FileOp::Get { follow: true }`).
-- `put --checksum` / `get --checksum`: skip files whose size and BLAKE2s
-  hash match (`FileOp::Hash { path, algo }` → `Msg<[u8;32]>`), `sync
-  [--delete] LOCAL REMOTE` = recursive checksum transfer in both
-  directions, parallel like `-r`, with a `--dry-run` JSON plan.
-- Docs: 03 §9 (`Hash`, `follow`), 04 "File transfer", 05 rows.
-- Tests: `put -`/`get -` byte-identical through pipes; `tail -f` streams
-  appended lines; `sync` of a 100-file tree transfers only the 3 changed
-  files (asserted via `--json` plan and server traffic counters);
-  `--delete` removes extras; `--dry-run` changes nothing.
+- Streaming ✔: `get REMOTE -` and `put - REMOTE` (stdout/stdin; `--mode`,
+  `--mtime`), `cat`, `write REMOTE` (from stdin, atomic, `--mode`,
+  `--append`), `tail [-n N] [-f] [--for D]`, `stat [REMOTE…] --json`,
+  `mkdir [-P] [-m]`, `rm [-r]`, `mv`, `realpath`, `hash` as CLI subcommands,
+  prompt commands and over the control socket (`put -`/`write` carry the
+  request's stdin). `tail -f` adds `FileOp::Get { follow: true }`: the
+  server polls the open file every 100 ms until the client closes the
+  stream; Ctrl-C, `--for` and the connection's `--timeout` end it with
+  exit 0.
+- `put --checksum` / `get --checksum` ✔: skip files whose size and BLAKE2s
+  digest match (`FileOp::Hash { path, algo }` → `Msg<FileHash>`; local
+  hashes on the blocking pool); the summary gains `skipped`. `sync
+  [--pull] [--delete] [--dry-run] [--checksum] [-j N] SRC DST` ✔: plan by
+  size + mtime (±1 s) or digest, `--dry-run` prints a `SyncPlan`, the run
+  reuses the parallel transfer machinery and reports a `SyncSummary`;
+  `--delete` removes extras, files first, directories deepest first.
+- Docs ✔: 03 §9 (`Hash`, `follow`), 04 "File transfer" + "File
+  primitives", 05 rows and "Agent interface" documents.
+- Tests ✔ (`tests/fileprims.rs`): `put -`/`get -` byte-identical through
+  pipes (3 MB); `cat` concatenates; `write` replaces atomically (no temp
+  left) and `--append` appends; `tail -n`; `tail -f` streams appended
+  lines within 1 s and `--for` exits 0; `stat --json`; `mkdir -P`,
+  `rm -r`, `mv`, `realpath`; `--checksum` skips an identical file
+  (`skipped == 1`, `info` traffic counters far below the file size);
+  `sync` of a 100-file tree after changing 3 files plans and transfers
+  exactly 3 (97 unchanged, trees byte-identical after); `--delete`
+  removes extras; `--pull`; `--dry-run` changes nothing.
 
 ### M9 — fleet
 
-- Fan-out: `mysh run [-j N] [--hosts a,b,c | --group NAME] [--json] -- CMD`
-  runs the same command on many hosts through per-host masters, prints
-  `host: line` interleaved or a JSON array of per-host results; `mysh put
-  --hosts …` likewise. `[groups.NAME] hosts = [...]` in `config.toml`.
-- Audit log: `mysh serve --audit PATH` appends JSON lines `{ts, peer,
-  key_fingerprint, kind, event: connect|session|exec|file|forward|
-  disconnect, detail, exit, bytes_in, bytes_out, duration_ms}`; rotated by
-  the host's logrotate (no built-in rotation).
-- Pairing (**trust-model change — escalate before implementing**):
-  `mysh serve --pair [DURATION]` prints a one-time 8-word code; `mysh pair
-  HOST CODE` runs a PAKE (SPAKE2 or CPace) over the normal Noise channel
-  established with an *unverified* server key, both sides derive the
-  shared secret from the code, the server installs the client's public key
-  in `authorized_keys` and the client pins the server key in
-  `known_hosts`. The code is single-use and expires; a wrong code
-  terminates the pairing window. Decision to be logged with the chosen
-  PAKE and its crate.
+- Fan-out ✔ (05-meta-shell.md "Fleet", decision 48): `mysh run [-j N]
+  (--hosts a,b,c | --group NAME)… [--json] [--timeout D] [--cwd D] -- CMD`
+  runs the same command on many hosts — through a host's control socket
+  when a master or client serves it (`master = auto` starts one), else on
+  a fresh connection — and prints `host: line` / `host! line` interleaved
+  plus a summary table, or a JSON array of `RunResult` in selection order;
+  `mysh put/get --hosts …` likewise (`get` lands in `LOCALDIR/<host>/`).
+  `[groups.NAME] hosts = [...]` in `config.toml`; `--group` repeats and
+  mixes with `--hosts`, duplicates dropped, order kept. Exit 0 iff every
+  host exited 0.
+- Audit log ✔ (02-security.md "Audit log", decision 49): `mysh serve
+  --audit PATH` (`-` = stderr) appends JSON lines `{ts, peer, key, kind,
+  event: connect|disconnect|session|exec|file|forward|pair|denied, detail,
+  exit, bytes_in, bytes_out, duration_ms}` through one writer task
+  (`server/audit.rs`, `O_APPEND`, 0600, flushed per line); rotated by the
+  host's logrotate (no built-in rotation).
+- Pairing ✔ (02-security.md "Pairing", 03-protocol.md §10quinquies,
+  decisions 42–43): `mysh serve --pair [DURATION]` prints a one-time
+  6-word BIP-39 code (`SIGUSR1` opens another); `mysh pair HOST CODE`
+  connects with `caps::PAIR_REQUEST` to an *unverified* server key, gets
+  `Verdict::Pairing`, runs SPAKE2 (`spake2` crate, Ed25519 group) with the
+  code over `Open::Pair`, confirms the key both ways, and only then the
+  server installs the client's public key in `authorized_keys` and the
+  client pins the server key in `known_hosts`. Single use, expires, a
+  wrong code closes the window.
 - Docs: 05 (`run`, groups, `pair`), 02 (pairing section, audit log), 06.
-- Tests: `run` across three loopback servers with `-j 2` returns per-host
-  exit codes and keeps output attributed; a down host yields
-  `connect_failed` without blocking the others; audit lines for each event
-  type validate against a schema; pairing round trip, wrong code,
-  expired code, replayed code.
+- Tests ✔ (`tests/fleet.rs`, `tests/audit.rs`, `tests/pairing.rs`): `run`
+  across three loopback servers attributes every line and exits 0; `-j 2`
+  with `sleep 0.5` takes two rounds not three; a down alias yields
+  `connect_failed` while the others succeed (exit 1); `--json` parses into
+  `Vec<RunResult>` in selection order with duplicates removed; `put
+  --hosts` lands the file on all three and `get --hosts` fills
+  `LOCALDIR/<host>/`; a `run` through a master reuses its connection
+  (server admits one handshake per minute); audit lines for connect,
+  disconnect, session (pty and exec), exec, file, forward and denied
+  validate against a `deny_unknown_fields` schema with monotonic
+  timestamps and a 0600 file; pairing round trip, wrong code, expired
+  code, replayed code.
 
 ### M10 — embedding
 
@@ -320,6 +348,14 @@ later.
 | 39 | a `Msg<ReadReply>` is capped at the control-message limit (256 KiB less framing) even though a client may ask for `READ_MAX` (1 MiB); the reader continues from `next` | raising `MAX_CONTROL_MESSAGE`; splitting a read over several messages | the frame cap is a transport invariant the fuzzers and both peers rely on, and `next` already exists to continue a read — a short reply is a normal answer, not an error |
 | 40 | the master is an ordinary client without prompt or stdin that owns the same control socket; `--daemon` and `master = auto` re-spawn the binary with `process_group(0)` and `Stdio::null()` and wait up to 3 s for the socket | `fork`+`setsid` in-process; a separate daemon binary or a socket-activated service | the safe std API is enough on Linux, macOS and Android, keeps `#![forbid(unsafe_code)]`, and reuses the socket, allow-list and capture console that M5 already tests; the master dies with its connection, so nothing outlives the server |
 | 41 | `mysh HOST CMD` routes through the socket only when stdin is not a terminal and `-t` was not given, and its stdin (≤ 64 KiB) travels inside the request, read only after a socket has answered | multiplexing the session's stdin over the control socket like ssh's ControlMaster | the control protocol is one request and an event stream, not a duplex channel; a bounded, eagerly-read stdin covers scripts and agents, while an interactive or huge-input call quietly keeps its own connection instead of behaving subtly differently |
+| 42 | pairing is SPAKE2 (`spake2` 0.4, Ed25519 group) run **inside** the normal Noise connection with identities = the two Noise statics and password = the normalized 6-word BIP-39 code, followed by explicit HMAC-SHA256 key confirmation client-first over `client_static ‖ server_static ‖ A ‖ B`; the server writes `authorized_keys` only after the client's tag verifies and the client writes `known_hosts` only after the server's | CPace (no maintained Rust crate with the group we already link); a bare SPAKE2 without confirmation (the shared key is never used, so nothing would prove the codes matched); a PAKE-authenticated handshake replacing Noise (a second transport path) | one connection, one trust decision per side taken after a proof, and a man-in-the-middle relaying between two Noise sessions gets two different identities and fails both confirmations; the crate pins `curve25519-dalek` which mysh-net already uses |
+| 43 | a pairing window is a server-wide `Mutex<Option<PairWindow>>` that is single-use for *any* outcome: the first `Open::Pair` attempt spends it, a wrong code therefore buys one guess; `--pair [DURATION]` opens one at start, `SIGUSR1` replaces it; the handshake grants `Verdict::Pairing` only while a window is open and the client set `caps::PAIR_REQUEST`, and such a connection serves `Control` + `Pair` and nothing else | a window that survives failed attempts behind a retry counter; a pairing *mode* of the whole server; an out-of-band HTTP pairing endpoint | 2048⁶ codes make one guess per window more than enough while keeping the failure story trivial to reason about (and to test); the cap bit lets an unknown key reach the PAKE without a second handshake path, and the pairing-only dispatch keeps an unauthorized peer away from every other service |
+| 44 | `sync` takes its direction from the command form (`sync LOCAL REMOTE` pushes, `sync --pull REMOTE LOCAL` pulls); a `HOST:` prefix is never parsed, and the plan compares size + mtime (±1 s) by default, digests only with `--checksum` | rsync/scp-style `host:path` arguments; always hashing | one connection is already bound to one host, so a prefix would be redundant syntax with its own ambiguities (colons in paths), while mtime comparison keeps a 100-file no-op sync at two directory walks instead of 200 hashes |
+| 45 | `tail -f` is bounded by its own `--for` flag (and the connection's `--timeout` folded into it), and both end it with exit 0; `Get { follow }` is a server-side 100 ms poll on the open descriptor that restarts from 0 on truncation and ends when the client closes the stream | inotify/kqueue watching; treating the deadline as the usual `timeout` error (exit 124) | polling is portable to all three platforms and cheap at 10 Hz, and stopping a follow at a deadline is what the caller asked for, not a failure — the exit-124 convention is kept for operations that were meant to finish |
+| 46 | `cat`, `get REMOTE -` and `tail` write the body with `Console::write_bytes` (plain stdout, `stdout` events in `--json-stream`, one `DataOut {data, bytes}` document in `--json`) and draw no progress line; `--checksum` skips count in a new `TransferOut.skipped` field, and `files` only counts files actually moved | a separate raw stdout path bypassing the console; keeping skipped files inside `files` | the body *is* the output, so the existing byte path gives every mode a well-defined result for free, and an agent reading `{files: 0, skipped: 1}` sees at a glance that nothing was transferred |
+| 47 | the file primitives share one `FileCmd` enum between the CLI subcommands, the prompt and the control socket (`mysh HOST cat …` → `ClientCommand::File`), and the prompt-flattened structs avoid the shared CLI shorts/longs (`mkdir -P`, `tail --for`) just as `put -P` does | per-frontend arg structs; a `files` subcommand namespace (`mysh HOST files cat …`) | one clap definition per command keeps help, `to_argv` relaying and tests in one place; the capital/renamed flags are the price already paid for `put`, documented in the same table |
+| 48 | a fan-out member runs the *prompt words* of its command (`exec … -- CMD`, `put …`) either over the host's control socket or on a fresh connection via the same detached `Ctx` the socket server uses, always under a capture console in a JSON mode (`--json-stream` for `run`, `--json` for transfers); the fleet code only parses those events into `RunResult`/`TransferResult` and prefixes lines. `--hosts`/`--group` live in the shared connection options, so for `put`/`get` the `HOST` positional holds the first `PATH` | a dedicated per-host exec path reading `SessionOut` directly; a `HostsAnd<T>` arg struct with an optional `HOST` positional | reusing the single-host printers means every mode, the timeout escalation, `--cwd` and error codes behave identically per host with no second implementation to drift, and the master/ctl reuse comes for free; clap cannot express "HOST is absent when `--hosts` is given" for positionals, so shifting the first value is the honest alternative to a duplicated `put`/`get` definition |
+| 49 | the audit log is a server-wide `Arc<Audit>` holding an `mpsc` to one writer task that stamps `ts` at write time, serializes and flushes each line; handlers emit through a per-connection `audit::Handle` (peer + key) with the detail built by a closure that only runs when the log is on; `ServerConfig.audit: Option<PathBuf>` opens the file (`O_APPEND`, 0600) in `Server::bind` | a `tracing` layer with a JSON formatter; stamping `ts` at emit time; a synchronous `Mutex<File>` | a separate channel keeps the schema stable and independent of `-v` filters, one writer gives monotonic timestamps and no interleaving for free, the closure keeps the disabled path allocation-free, and failing `bind` on an unopenable audit file is the right default for a log that exists to be trusted |
 
 ## Testing strategy
 
@@ -333,10 +369,14 @@ later.
   Android builds in the release workflow.
 - Manual Android smoke script in `scripts/` (M2): build, push, serve, connect,
   resize, transfer.
-- Fuzz (M4): `fuzz/` is a separate cargo-fuzz workspace (excluded from the
-  root workspace; needs nightly). Targets cover every postcard decoder
-  (`proto_*`), `frame::body_len`/`decode`, key parsers (`keys_*`),
-  `authorized_keys`/`known_hosts` (`trust_*`), and the TOML/spec parsers
-  (`config_*`). `scripts/fuzz-all.sh [SECONDS]` builds and runs each target
-  for SECONDS (default 5) and summarises pass/fail; corpus and artifacts are
-  git-ignored.
+- Fuzz (M4, extended M9): `fuzz/` is a separate cargo-fuzz workspace
+  (excluded from the root workspace; needs nightly). Targets cover every
+  postcard decoder (`proto_*`, incl. `Info`, `ReadReply`, `FileHash`,
+  `PairMsg`, and all `Open` kinds 0–13), `frame::body_len`/`decode`, key
+  parsers (`keys_*`), `authorized_keys`/`known_hosts` (`trust_*`), the
+  TOML/spec parsers (`config_*`), `--hosts`/group expansion (`cli_hosts`),
+  `normalize_code` idempotence (`pair_code`) and `serde_json` round-trips of
+  `ExecResult`/`RunResult` (`output_json`) — 23 targets. The audit log is
+  write-only (no parser), so it has no target. `scripts/fuzz-all.sh
+  [SECONDS]` builds and runs each target for SECONDS (default 5) and
+  summarises pass/fail; corpus and artifacts are git-ignored.

@@ -101,6 +101,10 @@ pub struct ServerOpts {
     pub signature_auth: Option<bool>,
     /// Also listen on `[::1]:0` (see [`TestServer::addr_v6`]).
     pub listen_v6: bool,
+    /// Open a pairing window at start: `(code, duration)`.
+    pub pair_window: Option<(String, Duration)>,
+    /// `--audit PATH`: the audit log file (`None`: off).
+    pub audit: Option<PathBuf>,
 }
 
 /// A running server plus the client-side material needed to reach it.
@@ -116,6 +120,10 @@ pub struct TestServer {
     pub home: PathBuf,
     pub client_identity: Identity,
     pub server_key: PublicKey,
+    /// `<dir>/server/authorized_keys`: where paired client keys land.
+    pub server_authorized_keys: PathBuf,
+    /// The server's pairing windows.
+    pub pairing: std::sync::Arc<mysh::server::pair::PairState>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<anyhow::Result<()>>>,
 }
@@ -127,6 +135,11 @@ impl TestServer {
 
     pub fn host_arg(&self) -> String {
         format!("127.0.0.1:{}", self.addr.port())
+    }
+
+    /// Whether a pairing window is open right now.
+    pub fn pairing_open(&self) -> bool {
+        self.pairing.is_open()
     }
 
     /// Client `Paths` rooted at the temp client dir. The agent socket is
@@ -232,10 +245,12 @@ pub async fn start_server(opts: ServerOpts) -> TestServer {
         }
     }
     let inline = AuthorizedKeys::parse(&text, "test-inline");
+    // Paired keys land here; the server re-reads it on every connection.
+    let server_authorized_keys = dir.join("server").join("authorized_keys");
     let trust = TrustSource {
         baked: AuthorizedKeys::new(),
         inline,
-        files: Vec::new(),
+        files: vec![server_authorized_keys.clone()],
         ssh_ed25519_file: None,
     };
 
@@ -268,12 +283,18 @@ pub async fn start_server(opts: ServerOpts) -> TestServer {
         identity: server_identity,
         trust,
         policy,
+        pairing: Some(mysh::server::pair::PairConfig {
+            authorized_keys: server_authorized_keys.clone(),
+            window: opts.pair_window,
+        }),
+        audit: opts.audit,
     })
     .await
     .expect("bind server");
     let addrs = server.local_addrs();
     let addr = addrs[0];
     let addr_v6 = addrs.get(1).copied();
+    let pairing = server.pairing().expect("harness configures pairing");
     let (tx, rx) = oneshot::channel();
     let task = tokio::spawn(server.run(async move {
         let _ = rx.await;
@@ -287,6 +308,8 @@ pub async fn start_server(opts: ServerOpts) -> TestServer {
         home,
         client_identity,
         server_key,
+        server_authorized_keys,
+        pairing,
         shutdown: Some(tx),
         task: Some(task),
     }

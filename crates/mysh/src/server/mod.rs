@@ -10,9 +10,11 @@
 //! The server is single-user: it serves the OS user that runs it, with no
 //! privilege separation and no path sandboxing beyond `~` expansion.
 
+pub mod audit;
 pub mod files;
 pub mod forward;
 pub mod info;
+pub mod pair;
 pub mod session;
 
 use std::{
@@ -30,7 +32,7 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use mysh_net::{
     framing::{read_msg, write_msg, write_reply},
-    handshake::{HandshakeError, Peer, server_handshake},
+    handshake::{Accept, HandshakeError, Handshaken, Peer, server_handshake},
     keys::Identity,
     mux::{Incoming, Mode, Mux, Stream, accept_open},
     trust::KeyOptions,
@@ -44,6 +46,7 @@ use mysh_proto::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
+    signal::unix::{Signal, SignalKind, signal},
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
     task::JoinSet,
     time::{Instant, timeout},
@@ -53,7 +56,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     cli::{Feature, ServeArgs},
-    config::Paths,
+    config::{Paths, parse_duration},
     identity::{TrustSource, baked, load_server_identity},
 };
 use session::{Registry, Sessions};
@@ -250,6 +253,10 @@ pub struct ServerConfig {
     /// Trusted client keys; re-read on every connection.
     pub trust: TrustSource,
     pub policy: Policy,
+    /// Pairing support (`None`: `PAIR_REQUEST` clients take the normal path).
+    pub pairing: Option<pair::PairConfig>,
+    /// `--audit PATH` (`-` for stderr); `None` switches the audit log off.
+    pub audit: Option<PathBuf>,
 }
 
 /// State shared by every connection of one server.
@@ -263,6 +270,10 @@ struct Shared {
     limiter: Option<Mutex<RateLimiter>>,
     /// Session ids and detached PTY sessions, which outlive connections.
     registry: Registry,
+    /// Pairing windows; `None` when the server cannot pair at all.
+    pairing: Option<Arc<pair::PairState>>,
+    /// Audit log sink (disabled without `--audit`).
+    audit: Arc<audit::Audit>,
 }
 
 impl Shared {
@@ -324,6 +335,12 @@ impl Server {
             0 => None,
             rate => Some(Mutex::new(RateLimiter::new(rate))),
         };
+        let audit = match &cfg.audit {
+            Some(path) => audit::Audit::open(path)
+                .await
+                .with_context(|| format!("opening audit log {}", path.display()))?,
+            None => audit::Audit::disabled(),
+        };
         Ok(Self {
             listeners,
             shared: Arc::new(Shared {
@@ -333,6 +350,11 @@ impl Server {
                 handshakes: Arc::new(Semaphore::new(MAX_HANDSHAKES)),
                 limiter,
                 registry: Registry::default(),
+                pairing: cfg
+                    .pairing
+                    .as_ref()
+                    .map(|c| Arc::new(pair::PairState::new(c))),
+                audit,
             }),
         })
     }
@@ -343,6 +365,11 @@ impl Server {
             .iter()
             .filter_map(|l| l.local_addr().ok())
             .collect()
+    }
+
+    /// The pairing state, when the server was configured with one.
+    pub fn pairing(&self) -> Option<Arc<pair::PairState>> {
+        self.shared.pairing.clone()
     }
 
     /// Accept connections until `shutdown` resolves; then send
@@ -396,7 +423,7 @@ pub async fn serve(args: ServeArgs, paths: Paths) -> Result<()> {
     let baked = baked()?;
     let identity = load_server_identity(&args, &paths, &baked)?;
     let trust = TrustSource::for_server(&args, &paths, &baked)?;
-    if trust.load().is_empty() {
+    if trust.load().is_empty() && args.pair.is_none() {
         bail!(
             "no authorized client keys: add one to {} or pass --authorized-key",
             paths.authorized_keys.display()
@@ -406,19 +433,45 @@ pub async fn serve(args: ServeArgs, paths: Paths) -> Result<()> {
     let policy = Policy::from_args(&args);
     let fingerprint = identity.public.fingerprint();
     let source = identity.source.clone();
+    let pair_duration = match &args.pair {
+        None => None,
+        Some(None) => Some(limits::PAIR_WINDOW),
+        Some(Some(text)) => {
+            Some(parse_duration(text).map_err(|e| anyhow::anyhow!("--pair {text}: {e}"))?)
+        }
+    };
 
     let server = Server::bind(ServerConfig {
         listen,
         identity,
         trust,
         policy,
+        pairing: Some(pair::PairConfig {
+            authorized_keys: paths.authorized_keys.clone(),
+            window: None,
+        }),
+        audit: args.audit.clone(),
     })
     .await?;
+    // Installed before "listening" is announced: an operator (or a test)
+    // may send SIGUSR1 as soon as the server is up, and the default
+    // disposition would kill the process.
+    let usr1 = match signal(SignalKind::user_defined1()) {
+        Ok(usr1) => Some(usr1),
+        Err(e) => {
+            warn!(error = %e, "cannot listen for SIGUSR1");
+            None
+        }
+    };
     for addr in server.local_addrs() {
         info!(%addr, "listening");
     }
     info!(%fingerprint, %source, "host identity");
-    server.run(shutdown_signal()).await
+    let pairing = server.pairing().expect("serve always configures pairing");
+    if let Some(duration) = pair_duration {
+        pairing.open_random(duration);
+    }
+    server.run(shutdown_signal(pairing, usr1)).await
 }
 
 /// Parse `--listen` values; each must be a full `HOST:PORT` socket address.
@@ -433,10 +486,9 @@ fn parse_listen(values: &[String]) -> Result<Vec<SocketAddr>> {
         .collect()
 }
 
-/// Resolves on SIGTERM or SIGINT.
-async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-
+/// Resolves on SIGTERM or SIGINT. Meanwhile each `SIGUSR1` on `usr1` opens
+/// a fresh pairing window on `pairing` (docs/02-security.md "Pairing").
+async fn shutdown_signal(pairing: Arc<pair::PairState>, mut usr1: Option<Signal>) {
     let mut term = match signal(SignalKind::terminate()) {
         Ok(term) => Some(term),
         Err(e) => {
@@ -451,9 +503,18 @@ async fn shutdown_signal() {
             std::future::pending::<()>().await;
         }
     };
+    let sigusr1 = async {
+        if let Some(usr1) = usr1.as_mut() {
+            while usr1.recv().await.is_some() {
+                pairing.open_random(limits::PAIR_WINDOW);
+            }
+        }
+        std::future::pending::<()>().await;
+    };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => info!("SIGINT received"),
         () = sigterm => info!("SIGTERM received"),
+        () = sigusr1 => {}
     }
 }
 
@@ -514,22 +575,14 @@ async fn accept_loop(
     }
 }
 
-/// Handshake, authorize, take the control stream, then dispatch streams
-/// until the connection ends.
-#[allow(clippy::needless_pass_by_value)] // owned by the spawned task
-async fn handle_connection(
+/// Run the handshake and authorize the client's key (`None` after a logged
+/// and audited refusal). A `PAIR_REQUEST` client is admitted without
+/// authorization while a pairing window is open (`Handshaken::pairing`).
+async fn authenticate(
     stream: TcpStream,
     peer: SocketAddr,
-    local: SocketAddr,
-    shared: Arc<Shared>,
-    permit: OwnedSemaphorePermit,
-    shutdown: watch::Receiver<Option<String>>,
-) {
-    // TCP keepalive is not configurable through `tokio::net::TcpStream`
-    // (that needs `socket2`); the control-stream idle timeout covers it.
-    if let Err(e) = stream.set_nodelay(true) {
-        debug!(%peer, error = %e, "set_nodelay failed");
-    }
+    shared: &Shared,
+) -> Option<(Handshaken<TcpStream>, KeyOptions)> {
     let mut hello_caps = 0;
     if !shared.policy.detach_grace.is_zero() {
         hello_caps |= caps::PERSIST;
@@ -544,8 +597,14 @@ async fn handle_connection(
     let trust = shared.trust.load();
     let mut offered: Option<Peer> = None;
     let mut options = KeyOptions::default();
-    let result = server_handshake(stream, &shared.identity.secret, hello, |client, _| {
+    let result = server_handshake(stream, &shared.identity.secret, hello, |client, hello| {
         offered = Some(*client);
+        if hello.caps & caps::PAIR_REQUEST != 0
+            && shared.pairing.as_ref().is_some_and(|p| p.is_open())
+        {
+            info!(%peer, %client, "pairing-only connection admitted");
+            return Ok(Accept::Pairing);
+        }
         let entry = match client {
             Peer::Static(key) => trust.find(key),
             Peer::Ed25519(pk) => trust.find_ed25519(pk),
@@ -567,22 +626,49 @@ async fn handle_connection(
             ));
         }
         options = entry.options.clone();
-        Ok(())
+        Ok(Accept::Normal)
     })
     .await;
-    drop(permit);
-    let hs = match result {
-        Ok(hs) => hs,
-        Err(HandshakeError::Denied { .. }) => {
+    match result {
+        Ok(hs) => Some((hs, options)),
+        Err(HandshakeError::Denied { message, .. }) => {
             let client = offered.map_or_else(|| "?".to_owned(), |c| c.to_string());
             warn!(%peer, %client, "unauthorized client key");
-            return;
+            shared
+                .audit
+                .handle(peer, offered.as_ref())
+                .denied("handshake", &message);
+            None
         }
         Err(e) => {
             debug!(%peer, error = %e, "handshake failed");
-            return;
+            None
         }
+    }
+}
+
+/// Handshake, authorize, take the control stream, then dispatch streams
+/// until the connection ends.
+#[allow(clippy::needless_pass_by_value)] // owned by the spawned task
+async fn handle_connection(
+    stream: TcpStream,
+    peer: SocketAddr,
+    local: SocketAddr,
+    shared: Arc<Shared>,
+    permit: OwnedSemaphorePermit,
+    shutdown: watch::Receiver<Option<String>>,
+) {
+    // TCP keepalive is not configurable through `tokio::net::TcpStream`
+    // (that needs `socket2`); the control-stream idle timeout covers it.
+    if let Err(e) = stream.set_nodelay(true) {
+        debug!(%peer, error = %e, "set_nodelay failed");
+    }
+    let result = authenticate(stream, peer, &shared).await;
+    drop(permit);
+    let Some((hs, options)) = result else {
+        return;
     };
+    let connected = std::time::Instant::now();
     let client = hs.peer;
     info!(
         %peer,
@@ -591,6 +677,13 @@ async fn handle_connection(
         version = hs.version,
         "client connected"
     );
+    let audit = shared.audit.handle(peer, Some(&client));
+    audit.emit(audit::Event::Connect, || {
+        serde_json::json!({
+            "version": hs.version,
+            "pairing": hs.pairing,
+        })
+    });
     let policy = if options == KeyOptions::default() {
         Arc::clone(&shared.policy)
     } else {
@@ -604,20 +697,43 @@ async fn handle_connection(
         return;
     };
     let idle = policy.idle_timeout;
-    let ctx = ConnCtx::new(
-        policy,
-        mux.clone(),
-        peer,
-        local,
-        client,
-        shared.registry.clone(),
-    );
     let control_task = tokio::spawn(control_loop(control, mux.clone(), shutdown, peer, idle));
 
-    while let Some(stream) = incoming.accept().await {
-        tokio::spawn(dispatch(stream, ctx.clone()));
+    if let (true, Some(state)) = (hs.pairing, shared.pairing.as_ref()) {
+        // Pairing-only: `Control` and one `Pair` stream, nothing else.
+        let ctx = pair::PairCtx {
+            state: Arc::clone(state),
+            peer,
+            client,
+            client_static: hs.remote,
+            server_static: shared.identity.public,
+            server_name: shared.policy.name.clone(),
+            audit: audit.clone(),
+        };
+        while let Some(stream) = incoming.accept().await {
+            tokio::spawn(pair::dispatch(stream, ctx.clone()));
+        }
+    } else {
+        let ctx = ConnCtx::new(
+            policy,
+            mux.clone(),
+            peer,
+            local,
+            client,
+            shared.registry.clone(),
+            audit.clone(),
+        );
+        while let Some(stream) = incoming.accept().await {
+            tokio::spawn(dispatch(stream, ctx.clone()));
+        }
     }
     let _ = control_task.await;
+    let stats = mux.stats();
+    audit.emit_with(
+        audit::Event::Disconnect,
+        audit::Extra::traffic(stats.bytes_in, stats.bytes_out, connected),
+        || serde_json::json!({}),
+    );
     info!(%peer, "client disconnected");
 }
 
@@ -776,8 +892,8 @@ async fn dispatch(mut stream: Stream, ctx: ConnCtx) {
         Open::Pair => {
             files::send_error(
                 &mut stream,
-                ErrorCode::Unsupported,
-                "not implemented on this server",
+                ErrorCode::Denied,
+                "pairing needs a pairing-only connection (mysh pair)",
             )
             .await;
         }
@@ -799,6 +915,8 @@ pub struct ConnCtx {
     pub registry: Registry,
     /// Live remote listeners, for `MAX_LISTENERS`.
     pub listeners: Arc<AtomicUsize>,
+    /// Audit emitter for this connection (docs/02-security.md "Audit log").
+    pub audit: audit::Handle,
     next_listener: Arc<AtomicU32>,
 }
 
@@ -810,6 +928,7 @@ impl ConnCtx {
         local: SocketAddr,
         client: Peer,
         registry: Registry,
+        audit: audit::Handle,
     ) -> Self {
         Self {
             policy,
@@ -820,6 +939,7 @@ impl ConnCtx {
             sessions: Sessions::new(registry.clone()),
             registry,
             listeners: Arc::new(AtomicUsize::new(0)),
+            audit,
             next_listener: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -833,7 +953,8 @@ impl ConnCtx {
         local: SocketAddr,
         client: Peer,
     ) -> Self {
-        Self::new(policy, mux, peer, local, client, Registry::default())
+        let audit = audit::Handle::disabled(peer, &client);
+        Self::new(policy, mux, peer, local, client, Registry::default(), audit)
     }
 
     /// Next listener id (starts at 1, never reused within a connection).
@@ -1080,6 +1201,8 @@ mod tests {
             identity: identity(SecretKey::generate()),
             trust,
             policy: test_policy(),
+            audit: None,
+            pairing: None,
         })
         .await
         .unwrap();

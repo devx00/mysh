@@ -95,10 +95,19 @@ is `Ctrl-Z` at the prompt, `~?` is `help`.
 | `detach`     | `detach [ID]`                                                   | leave session ID (default: most recently used) running on the server and drop it from the stack: the stream is half-closed without a signal; prints `[mysh] session N detached; reattach with: mysh --attach=N HOST`. Refused when the server keeps no sessions (`--detach-grace 0`), since it would hang the session up |
 | `kill`       | `kill [-s SIG] ID` · `kill %ID`                                 | `SessionIn::Signal` to session ID (default `TERM`); `%ID` cancels background job ID |
 | `send`       | `send TEXT...`                                                  | write TEXT to the most recently used session and foreground it; caret notation (`^]`, `^C`) and `\xNN` are decoded |
-| `put`        | `put [-r] [-c] [-P] [-F] [-j N] LOCAL... [REMOTE]`              | default REMOTE = cwd of the MRU session (probe) → `~`; progress bar. `-P` preserves mode/mtime, `-F` follows symlinks (`-p`/`-L` are taken by the shared CLI options); `-r` uploads `-j` files at a time (default 4) with one aggregate progress line |
-| `get`        | `get [-r] [-c] [-P] [-j N] REMOTE... [LOCAL]`                   | default LOCAL = client cwd; `-P` preserves mode/mtime; `-r`/`-j` as for `put` |
+| `put`        | `put [-r] [-c] [-P] [-F] [-j N] [--checksum] LOCAL... [REMOTE]` · `put [--mode M] [--mtime T] - REMOTE` | default REMOTE = cwd of the MRU session (probe) → `~`; progress bar. `-P` preserves mode/mtime, `-F` follows symlinks (`-p`/`-L` are taken by the shared CLI options); `-r` uploads `-j` files at a time (default 4) with one aggregate progress line; `--checksum` skips files whose size and BLAKE2s digest already match (counted as `skipped`); `-` streams stdin to EOF into REMOTE (CLI and control socket only — the prompt owns stdin) |
+| `get`        | `get [-r] [-c] [-P] [-j N] [--checksum] REMOTE... [LOCAL]`      | default LOCAL = client cwd; `-P` preserves mode/mtime; `-r`/`-j`/`--checksum` as for `put`; LOCAL `-` prints the files to stdout in order (= `cat`) |
+| `cat`        | `cat REMOTE...`                                                 | print remote files to stdout, in order; no progress line (stdout is the body) |
+| `write`      | `write [--mode M] [--append] REMOTE`                            | stdin to EOF into REMOTE: atomic replace (mode default 0644), or `--append` after a `Stat` (keeps the file's mode). CLI and control socket only |
+| `tail`       | `tail [-n N] [-f] [--for D] REMOTE`                             | last N lines (default 10); `-f` keeps printing as the file grows until Ctrl-C, `--for D`, or the connection's `--timeout` — all exit 0 (`--timeout` is the shared CLI option, hence `--for`) |
 | `ls`         | `ls [-l] [-a] [REMOTE]`                                         | remote listing; default = MRU session cwd → `~`                        |
-| `stat`       | `stat REMOTE`                                                   | one path's attributes: mode, size, mtime, kind, symlink target         |
+| `stat`       | `stat REMOTE...`                                                | each path's attributes: mode, size, mtime, kind, symlink target         |
+| `mkdir`      | `mkdir [-P] [-m MODE] REMOTE...`                                | create directories (mode default 0755); `-P` creates missing parents and accepts existing ones (`-p` is the shared port option) |
+| `rm`         | `rm [-r] REMOTE...`                                             | remove files; `-r` removes directories with their contents             |
+| `mv`         | `mv FROM TO`                                                    | rename a remote path (replaces TO)                                     |
+| `realpath`   | `realpath REMOTE`                                               | the canonical remote path (`~`, `..`, symlinks resolved)                |
+| `hash`       | `hash REMOTE...`                                                | `blake2s256  <hex>  <size>  <path>` per regular file                   |
+| `sync`       | `sync [--pull] [--delete] [--dry-run] [--checksum] [-j N] SRC DST` | mirror a tree: `sync LOCAL REMOTE` pushes, `sync --pull REMOTE LOCAL` pulls (the form gives the direction; no `HOST:` prefix). Plans by size + mtime (±1 s), or by digest with `--checksum`; `--dry-run` prints the plan and changes nothing; `--delete` removes the destination's extras (files, then directories deepest first). See 04-sessions.md "sync" |
 | `cwd`        | `cwd`                                                           | print remote cwd (probe source: fg process / shell / home fallback) and local cwd |
 | `lcd`        | `lcd [DIR]`                                                     | change the client's working directory used by the prompt               |
 | `forward`    | `forward -L SPEC` · `-R SPEC` · `-D SPEC` · `forward ls` · `forward rm ID` | same SPEC grammar as the CLI flags; ids are stable per connection |
@@ -229,15 +238,28 @@ mysh serve [OPTIONS]
 mysh keygen [-o PATH] [-C COMMENT]
 mysh fingerprint [FILE]                 key file (private or public, either format); `-` for stdin
 mysh put    [OPTIONS] HOST LOCAL... [REMOTE]
-mysh get    [OPTIONS] HOST REMOTE... [LOCAL]
+mysh get    [OPTIONS] HOST REMOTE... [LOCAL]     LOCAL `-` prints to stdout; `put - REMOTE` reads stdin
+mysh cat    [OPTIONS] HOST REMOTE...
+mysh write  [OPTIONS] HOST [--mode M] [--append] REMOTE     from stdin
+mysh tail   [OPTIONS] HOST [-n N] [-f] [--for D] REMOTE
+mysh stat   [OPTIONS] HOST REMOTE...
+mysh mkdir  [OPTIONS] HOST [-P] [-m MODE] REMOTE...
+mysh rm     [OPTIONS] HOST [-r] REMOTE...
+mysh mv     [OPTIONS] HOST FROM TO
+mysh realpath [OPTIONS] HOST REMOTE
+mysh hash   [OPTIONS] HOST REMOTE...
+mysh sync   [OPTIONS] HOST [--pull] [--delete] [--dry-run] [--checksum] [-j N] SRC DST
 mysh forward [OPTIONS] HOST (-L|-R|-D SPEC)...     = connect -N with forwards
 mysh authorize [OPTIONS] HOST [PUBKEY_FILE]
+mysh pair [OPTIONS] HOST CODE...        first contact: run the PAKE with the code printed by `serve --pair`; installs our key on HOST and pins HOST's key locally (02-security.md "Pairing"). Exit 2 when the server has no window open or the code is wrong (nothing is written)
 mysh help [--json] [CMD]                clap's help for CMD (or the whole CLI); `--json`: the command tree
 mysh session [OPTIONS] HOST new [--cwd DIR] [--pty] [--env K=V] -- CMD ...
 mysh session [OPTIONS] HOST send ID [TEXT...] [--stdin] [--eof]
 mysh session [OPTIONS] HOST read ID [--since N] [--wait D] [--max BYTES] [--follow]
 mysh session [OPTIONS] HOST list|kill ID [-s SIG]|wait ID [--timeout D]
 mysh master [OPTIONS] HOST [--idle D] [--daemon]   hold the connection open for other calls
+mysh run [OPTIONS] [-j N] (--hosts a,b | --group NAME)... -- CMD ...   the same command on several hosts ("Fleet")
+mysh put/get [OPTIONS] (--hosts a,b | --group NAME)... PATH...        the same transfer to/from several hosts ("Fleet")
 ```
 
 Subcommand names are reserved words that cannot be used as bare `HOST`; use
@@ -264,11 +286,13 @@ Connection options (shared by every HOST-taking command):
 | `--json`              | one JSON document per command on stdout, errors as JSON on stderr ("Agent interface") |
 | `--json-stream`       | NDJSON events on stdout as they happen                    |
 | `--plain`             | no ANSI, progress lines, banner or prompt redraws; implied by the JSON modes and when stdout is not a terminal |
-| `--timeout DURATION`  | `10s`, `2m`, `500ms`: bound on `CMD`, `put`, `get` and the prompt's `exec`/`put`/`get` (`TERM`, `KILL` after 2 s, exit 124) |
+| `--timeout DURATION`  | `10s`, `2m`, `500ms`: bound on `CMD`, `put`, `get`, the file primitives and the prompt's `exec`/`put`/`get` (`TERM`, `KILL` after 2 s, exit 124); for `tail -f` it is the follow's deadline and a clean exit 0 |
 | `--cwd DIR`           | working directory for `CMD` (`~`-relative is expanded by the server) |
 | `-v`                  | repeatable; `-vv` includes handshake and stream events    |
 | `-M`                  | run as a background master for HOST (same as `mysh master HOST`) |
 | `--master MODE`       | `never` (default), `auto`, `always`: start a master when no control socket is there |
+| `--hosts a,b,…`       | fan out to these hosts (comma-separated, repeatable); `run`, `put`, `get` only ("Fleet") |
+| `--group NAME`        | fan out to `[groups.NAME]` of the config file (repeatable, mixes with `--hosts`) |
 
 `HOST` forms: `host`, `host:port`, `[v6addr]:port`, `v6addr` (bare), or a
 config alias (below).
@@ -288,12 +312,15 @@ Server options:
 | `--idle-timeout SECS`               | close a connection with no control traffic (default 120)  |
 | `--detach-grace SECS`               | keep a detached PTY session this long (default 600)       |
 | `--no-signature-auth`               | do not accept ssh-ed25519 signature authentication (agent keys); clears `caps::SIG_AUTH` |
+| `--pair [DURATION]`                 | open a pairing window at start (default `5m`) and print its one-time code to stderr; lets the server start with an empty `authorized_keys`. See 02-security.md "Pairing" |
+| `--audit PATH`                      | append one JSON line per audited event to PATH (created 0600; `-` = stderr). See 02-security.md "Audit log" |
 | `--baked-only`                      | ignore files on disk                                      |
 | `-v`                                | log level                                                 |
 
 Signals: `SIGTERM`/`SIGINT` → send `Shutdown` on every connection, wait up
 to 5 s for sessions to end, hang up detached sessions, exit. `SIGHUP` is
-ignored (files are re-read per connection anyway).
+ignored (files are re-read per connection anyway). `SIGUSR1` → open a new
+pairing window (5 min, replacing any) and print its code to stderr.
 
 ## Config file (v1, minimal)
 
@@ -314,10 +341,52 @@ forward = ["-L 8080:localhost:80"]
 env = ["LANG"]
 shell = true           # `mysh pi` goes straight to a shell
 master = "auto"        # per-host master policy
+
+[groups.lab]           # `--group lab` ("Fleet")
+hosts = ["pi", "nuc", "10.0.0.5:7722"]
 ```
 
 Flags override the alias; the alias overrides `[defaults]`; `[defaults]`
 overrides built-ins. No `Match` blocks, no includes.
+
+## Fleet
+
+`mysh run` executes one command on several hosts and `put`/`get --hosts`
+move the same files to or from several hosts:
+
+```
+mysh run [-j N] [--hosts a,b,c] [--group NAME]... [--json] [--timeout D] [--cwd D] -- CMD...
+mysh put --hosts a,b LOCAL... REMOTE
+mysh get --group lab REMOTE... LOCALDIR          # lands in LOCALDIR/<host>/
+```
+
+- Host selection: `--hosts` entries (split on commas) first, then every
+  `--group` in order; `[groups.NAME] hosts = [...]` lists aliases or any
+  `HOST` form; duplicates are dropped, order is preserved. An unknown group
+  or an empty selection is a usage error (exit 2) before anything runs. With
+  `--hosts`/`--group` the `HOST` slot of `put`/`get` is the first `PATH`.
+- Each host is resolved like a normal target (aliases, `[defaults]`, flags).
+  When a control socket for the host answers (an interactive client or a
+  master; `master = auto` starts one) the command runs through it, otherwise
+  on a fresh connection of this process — so `mysh master` per host turns a
+  fleet into one handshake per host.
+- `-j N` (default 4) hosts run at a time for `run`; transfers use 4 hosts at
+  a time with `-j` still meaning file streams per host.
+- Output: every line is attributed — `host: line` for stdout (on stdout),
+  `host! line` for stderr, notices and errors (on stderr) — interleaved as
+  the hosts produce them; then a summary table (host, exit, duration) on
+  stdout when it is a terminal, on stderr otherwise. `--json` prints one
+  array of `RunResult` (or `TransferResult`) in selection order and nothing
+  else; `--json-stream` wraps each host's events as
+  `{"event":"host","host":"a","data":{…}}` and ends with a `result` event
+  carrying the array.
+- A host that cannot be reached (`connect_failed`), trusted
+  (`trust_unknown`/`trust_mismatch`) or that times out gets `error` set
+  without affecting the others. `--timeout` and `--cwd` apply per host.
+- Exit code 0 iff every host ran and exited 0, else 1.
+
+`get --hosts` creates `LOCALDIR/<host>/` per host (`LOCALDIR` defaults to
+the current directory; a `/` in a host name becomes `_`).
 
 ## Control socket
 
@@ -346,8 +415,11 @@ second TOFU prompt, nothing counted by the server's handshake rate limit.
   `Done { code }`. Both use `mysh_proto::frame` framing (`client::ctl`).
   The command renders in the requester's mode, so `--json` over the socket
   produces the same document as a direct call.
-- Allowed over the socket: `put get ls stat cwd forward exec session info
-  ping sessions kill jobs authorize help`. Refused with an error event:
+- Allowed over the socket: `put get cat write tail ls stat mkdir rm mv
+  realpath hash sync cwd forward exec session info ping sessions kill jobs
+  authorize help` (`put -` and `write` take the request's stdin, ≤ 64 KiB;
+  a bigger input uses the caller's own connection). Refused with an error
+  event:
   `shell fg send resize log exit disconnect attach detach` (they need the
   serving client's terminal) and `lcd` (the request carries its own cwd).
   A trailing `&` is refused too.
@@ -492,12 +564,21 @@ Field names are `snake_case`; omitted optional fields are `null`. A
 | `jobs`                                    | `[JobRow {id, state: "running"\|"done"\|"failed"\|"cancelled", exit: int\|null, error: string\|null, elapsed_ms, command, progress: {label, done, total}\|null}]` |
 | `jobs [-w] ID`                            | `JobOut`: the `JobRow` fields plus `output: bytes` (the captured output) |
 | `ls [-l] [-a] [REMOTE]`                   | `[LsEntry {name, kind: "file"\|"dir"\|"symlink"\|"other", size, mode: "0644", mtime: RFC 3339 UTC, target: string\|null}]` (`-l` makes no difference) |
-| `stat REMOTE`                             | `StatOut {path, kind, size, mode, mtime, uid, gid, target}`              |
+| `stat REMOTE…`                            | `StatOut {path, kind, size, mode, mtime, uid, gid, target}` for one path, `[StatOut]` for several |
+| `cat REMOTE…`, `get REMOTE… -`, `tail`    | `DataOut {data: bytes, bytes}` — what would have gone to stdout (`tail -f`: everything up to the deadline) |
+| `write`, `mkdir`, `rm`, `mv`              | `{"ok": true}`                                                           |
+| `realpath REMOTE`                         | `RealpathOut {path, realpath}`                                           |
+| `hash REMOTE…`                            | `HashOut {path, algo: "blake2s256", size, digest: hex}` for one path, `[HashOut]` for several |
+| `sync --dry-run`                          | `SyncPlan {copies: [{path, size, reason: "missing"\|"size"\|"mtime"\|"content"}], deletes: [path], unchanged, bytes}` — paths relative to the tree root, deletes files first then directories deepest first |
+| `sync`                                    | `SyncSummary {copied, deleted, unchanged, bytes, duration_ms}`           |
 | `forward ls`, `forward -L/-R/-D …`        | `[ForwardRow {id, kind: "local"\|"remote"\|"dynamic", bind: "host:port", target: "host:port"\|null, accepted}]` — an add reports the rows it created |
 | `ping [-c N]`                             | `PingOut {rtts_ms: [float], min, avg, max}` (milliseconds)              |
-| `put`, `get` (CLI and prompt)             | `TransferOut {files, bytes, duration_ms}`                                |
+| `put`, `get` (CLI and prompt)             | `TransferOut {files, skipped, bytes, duration_ms}` — `files` counts files moved, `skipped` those left alone (`-c` complete, `--checksum` identical) |
+| `run … --json`                            | `[RunResult {host, ok, exit, signal, stdout: bytes, stderr: bytes, duration_ms, error: {code, message}\|null}]` in selection order; `ok` = ran and exited 0 ("Fleet") |
+| `put/get --hosts … --json`                | `[TransferResult {host, ok, transfer: TransferOut\|null, error: {code, message}\|null}]` |
 | `cwd`                                     | `CwdOut {remote: string\|null, session: int\|null, local}`               |
 | `authorize`                               | `AuthorizeOut {added: bool}` (`false`: already present)                  |
+| `mysh pair HOST CODE`                     | `PairOut {host, server_fingerprint, client_fingerprint, authorized_line, host_line}` |
 | `kill`, `forward rm`, `log`, `resize`, `detach` | `{"ok": true}`                                                     |
 | `help [CMD]`, `mysh help --json [CMD]`    | `HelpTree {command, about, args: [{name, long, short, takes_value, positional, required, repeatable, value_name, default, help}], subcommands: [HelpTree]}` — built from the clap definitions, so it is always current; the prompt tree's root is named `prompt` |
 
@@ -519,6 +600,7 @@ Every line is `{"event": NAME, …}`:
 | `notice`   | `text`                                              | what `[mysh] …` would have said                             |
 | `error`    | `code`, `message`                                   | a command failed (codes below); in this mode errors are on stdout so one stream tells the whole story |
 | `result`   | `value`                                             | the `--json` document of a command that has one (`ls`, `info`, a transfer's `TransferOut`, …) |
+| `host`     | `host`, `data: event`                               | a fan-out (`run`, `put/get --hosts`): `data` is the event that host's own stream would carry; the run ends with a `result` whose `value` is the array |
 
 ### Errors and codes
 

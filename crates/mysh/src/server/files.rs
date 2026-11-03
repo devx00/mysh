@@ -12,13 +12,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use blake2::{Blake2s256, Digest as _};
 use mysh_net::framing::{write_msg, write_reply};
 use mysh_net::mux::Stream;
-use mysh_proto::file::{Attrs, DirEntry, FileKind, FileOp, ListPage, PutDone};
+use mysh_proto::file::{Attrs, DirEntry, FileHash, FileKind, FileOp, HashAlgo, ListPage, PutDone};
 use mysh_proto::limits;
 use mysh_proto::open::{ErrorCode, OpenReply};
 use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tracing::debug;
 
 use crate::cli::Feature;
@@ -28,6 +29,8 @@ use crate::server::{ConnCtx, resolve_remote_path};
 #[allow(clippy::needless_pass_by_value)] // signature fixed by the dispatch contract
 pub async fn handle_file(mut stream: Stream, op: FileOp, cwd: Option<String>, ctx: ConnCtx) {
     if ctx.policy.deny.contains(&Feature::Files) {
+        ctx.audit
+            .denied("file", "file transfer is disabled by server policy");
         send_error(
             &mut stream,
             ErrorCode::Denied,
@@ -36,11 +39,13 @@ pub async fn handle_file(mut stream: Stream, op: FileOp, cwd: Option<String>, ct
         .await;
         return;
     }
+    let started = std::time::Instant::now();
     let resolve = |path: &str| resolve_remote_path(path, cwd.as_deref(), &ctx.policy.home);
     let body = match prepare(&op, resolve).await {
         Ok(body) => body,
         Err(err) => {
             debug!(?op, %err, "file op failed");
+            audit_file(&ctx, &op, Err(&err), started);
             send_error(&mut stream, error_code(&err), &err.to_string()).await;
             return;
         }
@@ -49,14 +54,57 @@ pub async fn handle_file(mut stream: Stream, op: FileOp, cwd: Option<String>, ct
         debug!(%err, "file op: reply failed");
         return;
     }
-    if let Err(err) = send_body(&mut stream, body).await {
-        debug!(?op, %err, "file op body failed");
-        // Dropping without shutdown resets the stream.
-        return;
+    match send_body(&mut stream, body).await {
+        Ok(bytes) => audit_file(&ctx, &op, Ok(bytes), started),
+        Err(err) => {
+            debug!(?op, %err, "file op body failed");
+            audit_file(&ctx, &op, Err(&err), started);
+            // Dropping without shutdown resets the stream.
+            return;
+        }
     }
     if let Err(err) = stream.shutdown().await {
         debug!(%err, "file op: shutdown failed");
     }
+}
+
+/// `file` audit event: the op, its path(s) as the client gave them, the
+/// bytes moved (`Get`: in to the client, `Put`: out of it) or the error.
+fn audit_file(
+    ctx: &ConnCtx,
+    op: &FileOp,
+    result: Result<u64, &io::Error>,
+    started: std::time::Instant,
+) {
+    let (name, path, other) = match op {
+        FileOp::Stat { path } => ("stat", path, None),
+        FileOp::List { path } => ("list", path, None),
+        FileOp::Mkdir { path, .. } => ("mkdir", path, None),
+        FileOp::Remove { path, .. } => ("remove", path, None),
+        FileOp::Rename { from, to } => ("rename", from, Some(to)),
+        FileOp::SetAttr { path, .. } => ("setattr", path, None),
+        FileOp::Realpath { path } => ("realpath", path, None),
+        FileOp::Get { path, .. } => ("get", path, None),
+        FileOp::Hash { path, .. } => ("hash", path, None),
+        FileOp::Put { path, .. } => ("put", path, None),
+    };
+    let mut extra = crate::server::audit::Extra::elapsed(started);
+    match (op, result) {
+        (FileOp::Get { .. }, Ok(bytes)) => extra.bytes_out = Some(bytes),
+        (FileOp::Put { .. }, Ok(bytes)) => extra.bytes_in = Some(bytes),
+        _ => {}
+    }
+    ctx.audit
+        .emit_with(crate::server::audit::Event::File, extra, || {
+            let mut detail = serde_json::json!({ "op": name, "path": path });
+            if let Some(to) = other {
+                detail["to"] = serde_json::Value::String(to.clone());
+            }
+            if let Err(err) = result {
+                detail["error"] = serde_json::Value::String(err.to_string());
+            }
+            detail
+        });
 }
 
 /// What follows `OpenReply::Ok` on the stream.
@@ -70,6 +118,12 @@ enum Body {
         file: File,
         attrs: Attrs,
         offset: u64,
+        follow: bool,
+    },
+    Hash {
+        file: std::fs::File,
+        size: u64,
+        algo: HashAlgo,
     },
     Put(PutTarget),
 }
@@ -120,7 +174,11 @@ async fn prepare(op: &FileOp, resolve: impl Fn(&str) -> PathBuf + Sync) -> io::R
             let real = fs::canonicalize(resolve(path)).await?;
             Ok(Body::Path(real.to_string_lossy().into_owned()))
         }
-        FileOp::Get { path, offset, .. } => {
+        FileOp::Get {
+            path,
+            offset,
+            follow,
+        } => {
             let path = resolve(path);
             let file = File::open(&path).await?;
             let md = file.metadata().await?;
@@ -129,6 +187,7 @@ async fn prepare(op: &FileOp, resolve: impl Fn(&str) -> PathBuf + Sync) -> io::R
                 file,
                 attrs,
                 offset: *offset,
+                follow: *follow,
             })
         }
         FileOp::Put {
@@ -143,29 +202,42 @@ async fn prepare(op: &FileOp, resolve: impl Fn(&str) -> PathBuf + Sync) -> io::R
                 open_put(resolve(path), *mode, *mtime, *offset, *truncate, *atomic).await?;
             Ok(Body::Put(target))
         }
-        FileOp::Hash { .. } => Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "hash is not implemented on this server",
-        )),
+        FileOp::Hash { path, algo } => {
+            let file = File::open(resolve(path)).await?;
+            let md = file.metadata().await?;
+            if !md.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "hash: not a regular file",
+                ));
+            }
+            Ok(Body::Hash {
+                file: file.into_std().await,
+                size: md.len(),
+                algo: *algo,
+            })
+        }
     }
 }
 
-async fn send_body(stream: &mut Stream, body: Body) -> io::Result<()> {
+/// Returns the bytes moved by the op (`Get`: sent, `Put`: written, else 0).
+async fn send_body(stream: &mut Stream, body: Body) -> io::Result<u64> {
     match body {
-        Body::Close => Ok(()),
-        Body::Attrs(attrs) => write_msg(stream, &attrs).await,
-        Body::Path(path) => write_msg(stream, &path).await,
+        Body::Close => Ok(0),
+        Body::Attrs(attrs) => write_msg(stream, &attrs).await.map(|()| 0),
+        Body::Path(path) => write_msg(stream, &path).await.map(|()| 0),
         Body::Pages(entries) => {
             let mut chunks = entries.chunks(limits::LIST_PAGE).peekable();
             if chunks.peek().is_none() {
-                return write_msg(
+                write_msg(
                     stream,
                     &ListPage {
                         entries: Vec::new(),
                         more: false,
                     },
                 )
-                .await;
+                .await?;
+                return Ok(0);
             }
             while let Some(chunk) = chunks.next() {
                 let page = ListPage {
@@ -174,19 +246,32 @@ async fn send_body(stream: &mut Stream, body: Body) -> io::Result<()> {
                 };
                 write_msg(stream, &page).await?;
             }
-            Ok(())
+            Ok(0)
         }
         Body::Get {
             mut file,
             attrs,
             offset,
+            follow,
         } => {
             write_msg(stream, &attrs).await?;
             if offset > 0 {
                 file.seek(SeekFrom::Start(offset)).await?;
             }
-            tokio::io::copy(&mut file, stream).await?;
-            stream.flush().await
+            let mut sent = tokio::io::copy(&mut file, stream).await?;
+            stream.flush().await?;
+            if follow {
+                sent += follow_file(stream, &mut file, offset + sent).await?;
+            }
+            Ok(sent)
+        }
+        Body::Hash { file, size, algo } => {
+            let digest = tokio::task::spawn_blocking(move || hash_file(file, algo))
+                .await
+                .map_err(|err| io::Error::other(err.to_string()))??;
+            write_msg(stream, &FileHash { algo, size, digest })
+                .await
+                .map(|()| 0)
         }
         Body::Put(mut target) => {
             let written = match receive_put(stream, &mut target).await {
@@ -198,9 +283,57 @@ async fn send_body(stream: &mut Stream, body: Body) -> io::Result<()> {
                     return Err(err);
                 }
             };
-            write_msg(stream, &PutDone { written }).await
+            write_msg(stream, &PutDone { written })
+                .await
+                .map(|()| written)
         }
     }
+}
+
+/// How often `Get { follow: true }` looks for new bytes.
+const FOLLOW_POLL: Duration = Duration::from_millis(100);
+
+/// `tail -f` on the server: after the initial body, poll the open file
+/// every [`FOLLOW_POLL`] and send whatever was appended; a file that shrank
+/// (truncated) is re-sent from the start, silently. Ends when the client
+/// closes its side of the stream; returns the bytes sent meanwhile.
+async fn follow_file(stream: &mut Stream, file: &mut File, mut pos: u64) -> io::Result<u64> {
+    let mut probe = [0u8; 1];
+    let mut sent = 0u64;
+    loop {
+        tokio::select! {
+            // The client never sends body bytes: a read ending (EOF or reset)
+            // means it closed the stream.
+            _ = stream.read(&mut probe) => return Ok(sent),
+            () = tokio::time::sleep(FOLLOW_POLL) => {}
+        }
+        let len = file.metadata().await?.len();
+        if len < pos {
+            file.seek(SeekFrom::Start(0)).await?;
+            pos = 0;
+        }
+        if len > pos {
+            let n = tokio::io::copy(file, stream).await?;
+            pos += n;
+            sent += n;
+            stream.flush().await?;
+        }
+    }
+}
+
+/// BLAKE2s-256 of a whole file (blocking; run under `spawn_blocking`).
+fn hash_file(mut file: std::fs::File, algo: HashAlgo) -> io::Result<[u8; 32]> {
+    let HashAlgo::Blake2s256 = algo;
+    let mut hasher = Blake2s256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = io::Read::read(&mut file, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 /// Stream the body into the opened target and finalise it; returns bytes
@@ -396,12 +529,11 @@ pub(crate) mod tests {
     use std::os::unix::fs::DirBuilderExt as _;
     use std::sync::Arc;
 
-    use mysh_net::handshake::{ClientAuth, Peer, client_handshake, server_handshake};
+    use mysh_net::handshake::{Accept, ClientAuth, Peer, client_handshake, server_handshake};
     use mysh_net::keys::SecretKey;
     use mysh_net::mux::{Incoming, Mode, Mux, OpenError, accept_open};
     use mysh_proto::handshake::ServerHello;
     use mysh_proto::open::Open;
-    use tokio::io::AsyncReadExt as _;
 
     use super::*;
     use crate::server::Policy;
@@ -457,7 +589,7 @@ pub(crate) mod tests {
                 name: "test".into(),
                 caps: 0,
             },
-            |_, _| Ok(()),
+            |_, _| Ok(Accept::Normal),
         );
         let (client, server) = tokio::join!(client, server);
         let (client, _hello) = client.expect("client handshake");

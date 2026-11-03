@@ -29,7 +29,9 @@ use tracing::{debug, warn};
 
 use super::{
     console::{CaptureEvent, Console},
-    meta::{Ctx, Flow, exec_command, execute},
+    fileops::{self, Input},
+    files,
+    meta::{Ctx, Flow, exec_command, execute, mru_cwd},
     session_api,
     shared::Shared,
 };
@@ -120,7 +122,16 @@ pub fn refusal(cmd: &MetaCommand) -> Option<&'static str> {
         | MetaCommand::Authorize(_)
         | MetaCommand::Jobs { .. }
         | MetaCommand::Session(_)
-        | MetaCommand::Stat { .. } => None,
+        | MetaCommand::Stat(_)
+        | MetaCommand::Cat(_)
+        | MetaCommand::Write(_)
+        | MetaCommand::Tail(_)
+        | MetaCommand::Mkdir(_)
+        | MetaCommand::Rm(_)
+        | MetaCommand::Mv(_)
+        | MetaCommand::Realpath(_)
+        | MetaCommand::Hash(_)
+        | MetaCommand::Sync(_) => None,
     }
 }
 
@@ -284,7 +295,9 @@ impl Drop for ActivityGuard {
 
 /// Run one request's command on a detached context. `exec` and `session`
 /// carry an exit code of their own; everything else succeeds or fails.
-async fn run_command(ctx: &mut Ctx, cmd: MetaCommand, stdin: Vec<u8>) -> Result<i32> {
+/// `put -` and `write` take the request's stdin instead of this
+/// process's.
+pub(crate) async fn run_command(ctx: &mut Ctx, cmd: MetaCommand, stdin: Vec<u8>) -> Result<i32> {
     match cmd {
         MetaCommand::Exec {
             timeout,
@@ -298,6 +311,34 @@ async fn run_command(ctx: &mut Ctx, cmd: MetaCommand, stdin: Vec<u8>) -> Result<
             let conn = ctx.shared.conn.clone();
             let console = ctx.console.clone();
             session_api::run(&conn, &console, &args, Some(&stdin)).await
+        }
+        MetaCommand::Put(args) if args.paths.first().is_some_and(|p| p == "-") => {
+            let conn = ctx.shared.conn.clone();
+            let remote = mru_cwd(ctx).await;
+            files::put_with_input(
+                &conn,
+                &ctx.console,
+                &args,
+                remote.as_deref(),
+                &ctx.local_cwd,
+                Some(Input::Bytes(&stdin)),
+            )
+            .await?;
+            Ok(0)
+        }
+        MetaCommand::Write(args) => {
+            let conn = ctx.shared.conn.clone();
+            let remote = mru_cwd(ctx).await;
+            fileops::run(
+                &conn,
+                &ctx.console,
+                &crate::cli::FileCmd::Write(args),
+                remote.as_deref(),
+                &ctx.local_cwd,
+                Some(Input::Bytes(&stdin)),
+            )
+            .await?;
+            Ok(0)
         }
         other => match execute(ctx, other, None).await? {
             Flow::Continue => Ok(0),

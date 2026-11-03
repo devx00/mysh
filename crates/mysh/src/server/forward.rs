@@ -22,6 +22,7 @@ use tracing::debug;
 
 use crate::cli::Feature;
 use crate::server::ConnCtx;
+use crate::server::audit::{Event, Extra, Handle};
 use crate::server::files::send_error;
 
 /// Upper bound on resolving + connecting for `DirectTcp`.
@@ -34,6 +35,8 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 #[allow(clippy::needless_pass_by_value)] // signature fixed by the dispatch contract
 pub async fn handle_direct_tcp(mut stream: Stream, host: String, port: u16, ctx: ConnCtx) {
     if ctx.policy.deny.contains(&Feature::ForwardLocal) {
+        ctx.audit
+            .denied("forward", "local forwarding is disabled by server policy");
         send_error(
             &mut stream,
             ErrorCode::Denied,
@@ -42,15 +45,22 @@ pub async fn handle_direct_tcp(mut stream: Stream, host: String, port: u16, ctx:
         .await;
         return;
     }
+    let started = std::time::Instant::now();
     let socket = match tokio::time::timeout(DIAL_TIMEOUT, dial(&host, port)).await {
         Ok(Ok(socket)) => socket,
         Ok(Err((code, err))) => {
             debug!(%host, port, %err, "direct-tcp dial failed");
+            ctx.audit.emit(Event::Forward, || {
+                serde_json::json!({ "kind": "direct", "host": host, "port": port, "error": err.to_string() })
+            });
             send_error(&mut stream, code, &err.to_string()).await;
             return;
         }
         Err(_) => {
             debug!(%host, port, "direct-tcp dial timed out");
+            ctx.audit.emit(Event::Forward, || {
+                serde_json::json!({ "kind": "direct", "host": host, "port": port, "error": "connect timed out" })
+            });
             send_error(&mut stream, ErrorCode::Io, "connect timed out").await;
             return;
         }
@@ -59,9 +69,16 @@ pub async fn handle_direct_tcp(mut stream: Stream, host: String, port: u16, ctx:
         debug!(%err, "direct-tcp: reply failed");
         return;
     }
-    if let Err(err) = relay(stream, socket).await {
+    let relayed = relay(stream, socket).await;
+    if let Err(err) = &relayed {
         debug!(%host, port, %err, "direct-tcp relay ended with error");
     }
+    let (bytes_out, bytes_in) = relayed.unwrap_or_default();
+    ctx.audit.emit_with(
+        Event::Forward,
+        Extra::traffic(bytes_in, bytes_out, started),
+        || serde_json::json!({ "kind": "direct", "host": host, "port": port }),
+    );
 }
 
 /// Resolve then connect, trying each address in order. Resolution failures
@@ -96,7 +113,8 @@ async fn dial(host: &str, port: u16) -> Result<TcpStream, (ErrorCode, io::Error)
 /// Copy bytes both ways with half-close propagation: when one direction hits
 /// EOF the peer's write side is shut down; the other direction keeps going.
 /// An error on either side ends both (dropping the yamux stream resets it).
-pub(crate) async fn relay(stream: Stream, socket: TcpStream) -> io::Result<()> {
+/// Returns `(bytes to the socket, bytes to the stream)`.
+pub(crate) async fn relay(stream: Stream, socket: TcpStream) -> io::Result<(u64, u64)> {
     let (mut stream_rd, mut stream_wr) = tokio::io::split(stream);
     let (mut sock_rd, mut sock_wr) = socket.into_split();
     let to_socket = async {
@@ -111,7 +129,7 @@ pub(crate) async fn relay(stream: Stream, socket: TcpStream) -> io::Result<()> {
     };
     let (out, inn) = tokio::try_join!(to_socket, to_stream)?;
     debug!(bytes_out = out, bytes_in = inn, "relay finished");
-    Ok(())
+    Ok((out, inn))
 }
 
 /// Decrements the connection's listener count when the listener ends.
@@ -128,6 +146,8 @@ impl Drop for ListenerSlot {
 #[allow(clippy::needless_pass_by_value)] // signature fixed by the dispatch contract
 pub async fn handle_forward_listen(mut stream: Stream, host: String, port: u16, ctx: ConnCtx) {
     if ctx.policy.deny.contains(&Feature::ForwardRemote) {
+        ctx.audit
+            .denied("forward", "remote forwarding is disabled by server policy");
         send_error(
             &mut stream,
             ErrorCode::Denied,
@@ -184,6 +204,10 @@ pub async fn handle_forward_listen(mut stream: Stream, host: String, port: u16, 
         return;
     }
     debug!(listener = id, %host, port = bound_port, "remote listener bound");
+    let started = std::time::Instant::now();
+    ctx.audit.emit(Event::Forward, || {
+        serde_json::json!({ "kind": "listen", "listener": id, "host": host, "port": bound_port })
+    });
 
     // The control-ish stream carries nothing after `Bound`; its EOF (or
     // reset) is the cancel signal. Anything the client does send is ignored.
@@ -193,7 +217,7 @@ pub async fn handle_forward_listen(mut stream: Stream, host: String, port: u16, 
             accepted = listener.accept() => match accepted {
                 Ok((socket, peer)) => {
                     let mux = ctx.mux.clone();
-                    tokio::spawn(forwarded(mux, id, socket, peer));
+                    tokio::spawn(forwarded(mux, id, socket, peer, ctx.audit.clone()));
                 }
                 Err(err) => {
                     debug!(listener = id, %err, "accept failed");
@@ -207,23 +231,37 @@ pub async fn handle_forward_listen(mut stream: Stream, host: String, port: u16, 
         }
     }
     debug!(listener = id, "remote listener closed");
+    ctx.audit.emit_with(Event::Forward, Extra::elapsed(started), || {
+        serde_json::json!({ "kind": "listen", "listener": id, "host": host, "port": bound_port, "closed": true })
+    });
     let _ = stream.shutdown().await;
 }
 
 /// Hand one accepted socket to the client over a `ForwardedTcp` stream.
-async fn forwarded(mux: Mux, listener: u32, socket: TcpStream, peer: SocketAddr) {
+async fn forwarded(mux: Mux, listener: u32, socket: TcpStream, peer: SocketAddr, audit: Handle) {
     let open = Open::ForwardedTcp {
         listener,
         peer: peer.to_string(),
     };
+    let started = std::time::Instant::now();
     match mux.open(&open).await {
         Ok(stream) => {
-            if let Err(err) = relay(stream, socket).await {
+            let relayed = relay(stream, socket).await;
+            if let Err(err) = &relayed {
                 debug!(listener, %peer, %err, "forwarded relay ended with error");
             }
+            let (bytes_out, bytes_in) = relayed.unwrap_or_default();
+            audit.emit_with(
+                Event::Forward,
+                Extra::traffic(bytes_in, bytes_out, started),
+                || serde_json::json!({ "kind": "forwarded", "listener": listener, "peer": peer.to_string() }),
+            );
         }
         Err(err) => {
             debug!(listener, %peer, %err, "client refused forwarded connection");
+            audit.emit(Event::Forward, || {
+                serde_json::json!({ "kind": "forwarded", "listener": listener, "peer": peer.to_string(), "error": err.to_string() })
+            });
             drop(socket);
         }
     }

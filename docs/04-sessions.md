@@ -215,3 +215,55 @@ Throughput note: a single stream is bounded by the yamux window ÷ RTT
 (4 MiB / 50 ms ≈ 80 MB/s) and by ChaCha20-Poly1305 (≫ 1 GB/s on these
 CPUs). Good enough; no parallel chunking of one file — parallelism is per
 file (`-j`), which is where directory trees spend their time.
+
+`--checksum` (`put`, `get`, also per file under `-r`): before a regular
+file is transferred, `Stat` the other side; when it is a regular file of
+the same size, `Hash { Blake2s256 }` it remotely and hash the local copy
+on the blocking pool (`spawn_blocking`); equal digests skip the file. The
+summary separates `files` (moved) from `skipped` (`-c` on a complete file,
+`--checksum` on an identical one).
+
+### File primitives
+
+`mysh::client::fileops` (plus `files::cat`/`put -`) gives every file
+operation a one-shot CLI form (`mysh HOST cat …`), a prompt form and a
+control-socket form, with one clap struct per command (`cli::FileCmd`).
+Relative remote paths resolve against the MRU session's cwd at the prompt
+and against the home directory elsewhere.
+
+| command                                   | wire                                                                                   |
+| ----------------------------------------- | -------------------------------------------------------------------------------------- |
+| `get REMOTE… -`, `cat REMOTE…`            | `Get { offset: 0 }` per file, bodies to stdout in order; no progress line (stdout is the body); `--json` → one `DataOut {data, bytes}` |
+| `put [--mode M] [--mtime T] - REMOTE`     | stdin to EOF into `Put { mode (default 0644), mtime, offset: 0, truncate: true, atomic }`; REMOTE must name a file; over the control socket the request's stdin (≤ 64 KiB) is the body, a larger one uses the caller's own connection |
+| `write [--mode M] [--append] REMOTE`      | stdin to EOF; atomic replace, or after a `Stat` `Put { offset: size, truncate: false, atomic: false }` (an appended file keeps its mode unless `--mode`) |
+| `tail [-n N] [-f] [--for D] REMOTE`       | `Stat`, then `Get { offset: size − window }` (64 KiB, ×4 until the window holds `N` lines or reaches 0), bytes past the stat'ed size dropped, last `N` lines printed; `-f` then opens `Get { offset: size, follow: true }` and prints as bytes arrive until Ctrl-C, `--for`, or the connection's `--timeout` (all exit 0); dropping the stream ends the server's poll |
+| `stat REMOTE…`                            | `Stat` each; `--json` → `StatOut` (one path) or `[StatOut]`                              |
+| `mkdir [-P] [-m MODE] REMOTE…`            | `Mkdir` (mode default 0755); `-P` walks the components with `Stat`/`Mkdir`, existing directories are fine (`-p` is the shared port option) |
+| `rm [-r] REMOTE…`                         | `Remove { recursive }`                                                                  |
+| `mv FROM TO`                              | `Rename`                                                                                |
+| `realpath REMOTE`                         | `Realpath`; `--json` → `RealpathOut {path, realpath}`                                    |
+| `hash REMOTE…`                            | `Hash`; prints `blake2s256  <hex>  <size>  <path>`; `--json` → `HashOut` or `[HashOut]`  |
+
+### sync
+
+`sync [--pull] [--delete] [--dry-run] [--checksum] [-j N] SRC DST`
+mirrors one tree into another; exactly one side is remote and the
+**command form** says which — `sync LOCAL REMOTE` pushes, `sync --pull
+REMOTE LOCAL` pulls. There is no `HOST:` prefix: the connection already
+names the host.
+
+1. Plan: walk both trees (`List` pages remotely, `read_dir` locally;
+   symlinks and special files are skipped with a notice on the source and
+   count as extras on the destination). A source file is copied when the
+   destination lacks it (`missing`), differs in size (`size`), differs in
+   mtime by more than 1 s (`mtime`), or — with `--checksum`, which replaces
+   the mtime test for same-size files — differs in BLAKE2s digest
+   (`content`). The result is a `SyncPlan { copies: [{path, size, reason}],
+   deletes: [path], unchanged, bytes }`; `--dry-run` prints it (JSON, or
+   one `copy`/`delete` line per entry plus a total) and changes nothing.
+2. Execute: create the missing directories pre-order (mode 0755), then
+   transfer the copies with the parallel machinery above (`-j`, default
+   4) **preserving mtime and mode** (so the next plan sees them as
+   unchanged), then with `--delete` remove the destination's extras —
+   files first, then directories deepest first. The summary is a
+   `SyncSummary { copied, deleted, unchanged, bytes, duration_ms }`.

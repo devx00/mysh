@@ -447,6 +447,17 @@ pub struct Config {
     pub defaults: Defaults,
     /// `[hosts.NAME]` aliases.
     pub hosts: BTreeMap<String, HostAlias>,
+    /// `[groups.NAME]` host lists for `--group` (docs/05-meta-shell.md
+    /// "Fleet").
+    pub groups: BTreeMap<String, Group>,
+}
+
+/// `[groups.NAME]` table.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Group {
+    /// Aliases or `HOST` forms, in fan-out order.
+    pub hosts: Vec<String>,
 }
 
 /// `[defaults]` table.
@@ -1189,6 +1200,7 @@ shell = true           # `mysh pi` goes straight to a shell
                 master: Some(MasterMode::Auto),
             },
             hosts,
+            groups: BTreeMap::new(),
         }
     }
 

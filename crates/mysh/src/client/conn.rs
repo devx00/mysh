@@ -321,7 +321,7 @@ impl Inner {
 
 /// Resolve and dial `host:port`, trying each address in order. Failures
 /// carry the `connect_failed` code.
-async fn dial(host: &str, port: u16) -> Result<TcpStream> {
+pub(crate) async fn dial(host: &str, port: u16) -> Result<TcpStream> {
     let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host, port)).await {
         Ok(addrs) => addrs.collect(),
         Err(e) => {
@@ -377,13 +377,13 @@ struct AttemptDone {
 /// [`Signer`] backed by one `ssh-agent` key: the agent signs
 /// `SIG_AUTH_LABEL ‖ h2`; the private key never leaves it.
 #[derive(Debug)]
-struct AgentSigner {
+pub(crate) struct AgentSigner {
     agent: Agent,
     key: AgentKey,
 }
 
 impl AgentSigner {
-    async fn connect(socket: &Path, key: AgentKey) -> Result<Self> {
+    pub(crate) async fn connect(socket: &Path, key: AgentKey) -> Result<Self> {
         let agent = Agent::connect(socket)
             .await
             .with_context(|| format!("connecting to ssh-agent at {}", socket.display()))?;

@@ -79,6 +79,39 @@ and ships as static release binaries.
   version, platform, kernel, shell, home, user, caps, limits, uptime) shown
   by `info`; `mysh help --json [CMD]` and the prompt's `help --json` print
   the clap command tree (docs/05 "Agent interface", docs/03 §10quater).
+- **File primitives** (M8): `get REMOTE -` / `put - REMOTE` stream through
+  stdout/stdin (`--mode`, `--mtime`); `cat`, `write [--mode] [--append]`,
+  `tail [-n N] [-f] [--for D]` (server-side `FileOp::Get { follow: true }`,
+  ends cleanly on Ctrl-C or a deadline), `stat REMOTE…`, `mkdir [-P] [-m]`,
+  `rm [-r]`, `mv`, `realpath` and `hash` as CLI subcommands, prompt
+  commands and over the control socket; `put/get --checksum` skip files
+  whose size and BLAKE2s-256 digest match (`FileOp::Hash`, the summary
+  gains `skipped`); `sync [--pull] [--delete] [--dry-run] [--checksum]
+  [-j N] SRC DST` mirrors a tree in either direction with a `SyncPlan` /
+  `SyncSummary` (docs/03 §9, docs/04 "File primitives", "sync").
+- **Pairing** (M9): `mysh serve --pair [DURATION]` prints a one-time
+  6-word code (BIP-39 words; `SIGUSR1` opens a new window on a running
+  server) and `mysh pair HOST CODE` runs SPAKE2 (`spake2`, Ed25519 group)
+  with it inside the normal Noise connection — `caps::PAIR_REQUEST`,
+  `Verdict::Pairing`, `Open::Pair` + `PairMsg` — then installs the client
+  key in the server's `authorized_keys` and pins the server key in
+  `known_hosts`, each side only after the other's confirmation MAC
+  verified. Windows are single-use and expire; a wrong code closes one.
+  `--json` prints `PairOut` (docs/02 "Pairing", docs/03 §10quinquies).
+- **Fleet** (M9): `mysh run [-j N] (--hosts a,b | --group NAME)… -- CMD`
+  runs one command on many hosts (through a host's master or control
+  socket when one serves it, else a fresh connection), prints
+  `host: line` / `host! line` interleaved plus a summary table, or a
+  `--json` array of `RunResult` in selection order (`--json-stream`: `host`
+  events); a dead host is `connect_failed` without affecting the others;
+  exit 0 iff all exited 0. `put/get --hosts …` fan the same transfer out
+  (`get` lands in `LOCALDIR/<host>/`, JSON `TransferResult`).
+  `[groups.NAME] hosts = [...]` in `config.toml` (docs/05 "Fleet").
+- **Audit log** (M9): `mysh serve --audit PATH` (`-` = stderr) appends one
+  JSON line per event — `connect`, `disconnect`, `session`, `exec`, `file`,
+  `forward`, `pair`, `denied` — with peer, key fingerprint, detail, exit,
+  bytes and duration, through one writer task (0600, `O_APPEND`, flushed
+  per line, no rotation) (docs/02 "Audit log").
 - **Release** (M4): `scripts/release.sh` links all five targets and writes
   `SHA256SUMS`; `.github/workflows/release.yml` does the same on tags;
   `contrib/` has a systemd unit, a launchd plist and a Termux:Boot script.

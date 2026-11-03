@@ -8,14 +8,18 @@ pub mod conn;
 pub mod console;
 pub mod ctl;
 pub mod editor;
+pub mod fileops;
 pub mod files;
+pub mod fleet;
 pub mod forward;
 pub mod jobs;
 pub mod master;
 pub mod meta;
+pub mod pair;
 pub mod session;
 pub mod session_api;
 pub mod shared;
+pub mod sync;
 pub mod terminal;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -26,7 +30,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tracing::{debug, warn};
 
 use crate::{
-    cli::{AuthorizeArgs, ForwardCliArgs, GetArgs, MasterArgs, PutArgs, SessionArgs},
+    cli::{AuthorizeArgs, FileCmd, ForwardCliArgs, GetArgs, MasterArgs, PutArgs, SessionArgs},
     config::{Paths, Target},
     identity::Baked,
     output::{self, EXIT_TIMEOUT, Mode, code_for, codes},
@@ -55,6 +59,8 @@ pub enum ClientCommand {
     },
     Put(PutArgs),
     Get(GetArgs),
+    /// `mysh HOST cat|write|tail|stat|mkdir|rm|mv|realpath|hash|sync …`.
+    File(FileCmd),
     Forward(ForwardCliArgs),
     Authorize(AuthorizeArgs),
     /// `mysh HOST session …`: the remote process API.
@@ -99,9 +105,35 @@ async fn dispatch(
             one_shot(
                 console,
                 target.timeout,
-                files::put(conn, console, &args, None, &local_cwd),
+                files::put_with_input(
+                    conn,
+                    console,
+                    &args,
+                    None,
+                    &local_cwd,
+                    Some(fileops::Input::Process),
+                ),
             )
             .await
+        }
+        ClientCommand::File(mut cmd) => {
+            if let FileCmd::Tail(tail) = &mut cmd {
+                // `tail -f` ends on its own deadline (clean exit, not 124).
+                tail.timeout = tail.timeout.or(target.timeout);
+            }
+            let fut = fileops::run(
+                conn,
+                console,
+                &cmd,
+                None,
+                &local_cwd,
+                Some(fileops::Input::Process),
+            );
+            if cmd.follows() {
+                until_interrupted(console, fut).await
+            } else {
+                one_shot(console, target.timeout, fut).await
+            }
         }
         ClientCommand::Get(args) => {
             one_shot(
@@ -164,7 +196,8 @@ async fn dispatch(
     Ok(code)
 }
 
-async fn shutdown(conn: &Connection, forwards: &Forwards, console: &Console) {
+/// Stop the forwards, flush, and close the connection (bounded to 3 s).
+pub(crate) async fn shutdown(conn: &Connection, forwards: &Forwards, console: &Console) {
     forwards.shutdown().await;
     console.flush().await;
     if tokio::time::timeout(Duration::from_secs(3), conn.close())
@@ -218,7 +251,31 @@ async fn one_shot(
     }
 }
 
-fn home_dir() -> PathBuf {
+/// Run an open-ended operation (`tail -f`, which bounds itself with its
+/// own `--timeout`) until it ends or SIGINT/SIGTERM arrives; a signal is a
+/// clean exit (0), not a failure. Dropping the future closes its stream.
+async fn until_interrupted(console: &Console, fut: impl Future<Output = Result<()>>) -> i32 {
+    let (Ok(mut sigint), Ok(mut sigterm)) = (
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::terminate()),
+    ) else {
+        warn!("cannot install signal handlers; Ctrl-C will not end cleanly");
+        return one_shot(console, None, fut).await;
+    };
+    tokio::select! {
+        r = fut => match r {
+            Ok(()) => 0,
+            Err(e) => {
+                console.error(&e);
+                1
+            }
+        },
+        _ = sigint.recv() => 0,
+        _ = sigterm.recv() => 0,
+    }
+}
+
+pub(crate) fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(dirs::home_dir)

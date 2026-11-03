@@ -60,6 +60,26 @@ pub enum Command {
     Put(HostAnd<PutArgs>),
     /// Copy files from HOST to the local machine.
     Get(HostAnd<GetArgs>),
+    /// Print remote files to stdout (`get REMOTE… -`).
+    Cat(HostAnd<CatArgs>),
+    /// Write stdin to a remote file (atomic replace, or `--append`).
+    Write(HostAnd<WriteArgs>),
+    /// Print the last lines of a remote file; `-f` keeps following it.
+    Tail(HostAnd<TailArgs>),
+    /// Show remote files' attributes.
+    Stat(HostAnd<StatArgs>),
+    /// Create remote directories.
+    Mkdir(HostAnd<MkdirArgs>),
+    /// Remove remote files (`-r`: directories too).
+    Rm(HostAnd<RmArgs>),
+    /// Rename a remote path.
+    Mv(HostAnd<MvArgs>),
+    /// Resolve a remote path (symlinks, `~`, `..`).
+    Realpath(HostAnd<RealpathArgs>),
+    /// BLAKE2s-256 of remote files.
+    Hash(HostAnd<HashArgs>),
+    /// Mirror a directory tree to (or, with `--pull`, from) HOST.
+    Sync(HostAnd<SyncArgs>),
     /// Connect with forwards only (`connect -N` with `-L/-R/-D`).
     Forward(HostAnd<ForwardCliArgs>),
     /// Append the client's public key to HOST's `authorized_keys`.
@@ -68,6 +88,10 @@ pub enum Command {
     Session(HostAnd<SessionArgs>),
     /// Hold a connection open for other `mysh` calls (`ControlMaster`).
     Master(HostAnd<MasterArgs>),
+    /// Pair with HOST using the one-time code printed by `serve --pair`.
+    Pair(HostAnd<PairArgs>),
+    /// Run one command on several hosts (`--hosts`, `--group`).
+    Run(RunArgs),
     /// Print help for a command, or the whole command tree as JSON.
     Help(HelpArgs),
 }
@@ -202,7 +226,63 @@ pub struct ConnectOpts {
     /// (`never` by default; `[defaults] master` in the config file).
     #[arg(long, value_name = "never|auto|always")]
     pub master: Option<MasterMode>,
+
+    /// Fan out to these hosts (comma-separated, repeatable; `run`, `put`
+    /// and `get` only).
+    #[arg(long, value_name = "HOST,...")]
+    pub hosts: Vec<String>,
+
+    /// Fan out to a `[groups.NAME]` of the config file (repeatable; `run`,
+    /// `put` and `get` only).
+    #[arg(long, value_name = "NAME")]
+    pub group: Vec<String>,
 }
+
+impl ConnectOpts {
+    /// `--hosts`/`--group` were given: the command fans out
+    /// (docs/05-meta-shell.md "Fleet").
+    #[must_use]
+    pub fn fan_out(&self) -> bool {
+        !self.hosts.is_empty() || !self.group.is_empty()
+    }
+}
+
+/// `mysh run [-j N] (--hosts a,b | --group NAME)… [--json] -- CMD…`.
+#[derive(Args, Clone, Debug, Default)]
+pub struct RunArgs {
+    #[command(flatten)]
+    pub opts: ConnectOpts,
+
+    /// Hosts run at the same time (default 4).
+    #[arg(short = 'j', long = "jobs", value_name = "N", default_value_t = DEFAULT_FLEET_JOBS)]
+    pub jobs: usize,
+
+    /// Command to run on every host.
+    #[arg(
+        value_name = "CMD",
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        num_args = 1..,
+        required = true
+    )]
+    pub command: Vec<String>,
+}
+
+impl RunArgs {
+    /// Hosts at a time; a zero (`Default`) means the clap default.
+    #[must_use]
+    pub fn concurrency(&self) -> usize {
+        if self.jobs == 0 {
+            DEFAULT_FLEET_JOBS
+        } else {
+            self.jobs
+        }
+    }
+}
+
+/// Default `-j` for `run` and the number of hosts `put`/`get --hosts`
+/// transfer to at once.
+pub const DEFAULT_FLEET_JOBS: usize = 4;
 
 /// `HOST [-- CMD...]` with the shared connection options.
 #[derive(Args, Clone, Debug, Default)]
@@ -318,6 +398,16 @@ pub struct ServeArgs {
     /// Do not accept ssh-ed25519 signature authentication.
     #[arg(long)]
     pub no_signature_auth: bool,
+
+    /// Open a pairing window at start (default 5m) and print its one-time
+    /// code; `SIGUSR1` opens another at any time.
+    #[arg(long, value_name = "DURATION", num_args = 0..=1)]
+    pub pair: Option<Option<String>>,
+
+    /// Append one JSON line per audited event to PATH (`-`: stderr); see
+    /// docs/02-security.md "Audit log".
+    #[arg(long, value_name = "PATH")]
+    pub audit: Option<PathBuf>,
 }
 
 /// `mysh keygen` options.
@@ -345,6 +435,24 @@ pub struct FingerprintArgs {
 /// `HostAnd<_>` shape as the other host commands.
 #[derive(Args, Clone, Debug, Default)]
 pub struct ForwardCliArgs {}
+
+/// `mysh pair HOST CODE`: first contact with a one-time code
+/// (docs/02-security.md "Pairing").
+#[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PairArgs {
+    /// The code printed by `mysh serve --pair` (words separated by hyphens
+    /// or spaces; case does not matter).
+    #[arg(value_name = "CODE", required = true, num_args = 1..)]
+    pub code: Vec<String>,
+}
+
+impl PairArgs {
+    /// The code as typed, words joined by hyphens.
+    #[must_use]
+    pub fn code(&self) -> String {
+        self.code.join("-")
+    }
+}
 
 /// Parse the process command line, exiting with clap's diagnostics on error.
 #[must_use]
@@ -476,12 +584,26 @@ pub enum MetaCommand {
     },
     /// Start, feed, read and end sessions without a terminal.
     Session(SessionArgs),
-    /// Show a remote file's attributes.
-    Stat {
-        /// Remote path.
-        #[arg(value_name = "REMOTE")]
-        path: String,
-    },
+    /// Show remote files' attributes.
+    Stat(StatArgs),
+    /// Print remote files here (`get REMOTE… -`).
+    Cat(CatArgs),
+    /// Write standard input to a remote file (CLI and control socket only).
+    Write(WriteArgs),
+    /// Print the last lines of a remote file; `-f` keeps following it.
+    Tail(TailArgs),
+    /// Create remote directories.
+    Mkdir(MkdirArgs),
+    /// Remove remote files (`-r`: directories too).
+    Rm(RmArgs),
+    /// Rename a remote path.
+    Mv(MvArgs),
+    /// Resolve a remote path (symlinks, `~`, `..`).
+    Realpath(RealpathArgs),
+    /// BLAKE2s-256 of remote files.
+    Hash(HashArgs),
+    /// Mirror a directory tree to (or, with `--pull`, from) the remote.
+    Sync(SyncArgs),
     /// Show connection information.
     Info,
     /// Measure round-trip time on the control stream.
@@ -516,6 +638,25 @@ pub enum MetaCommand {
     Disconnect,
 }
 
+impl MetaCommand {
+    /// The file primitive this command is, or the command back.
+    pub fn into_file_cmd(self) -> Result<FileCmd, Self> {
+        Ok(match self {
+            Self::Stat(a) => FileCmd::Stat(a),
+            Self::Cat(a) => FileCmd::Cat(a),
+            Self::Write(a) => FileCmd::Write(a),
+            Self::Tail(a) => FileCmd::Tail(a),
+            Self::Mkdir(a) => FileCmd::Mkdir(a),
+            Self::Rm(a) => FileCmd::Rm(a),
+            Self::Mv(a) => FileCmd::Mv(a),
+            Self::Realpath(a) => FileCmd::Realpath(a),
+            Self::Hash(a) => FileCmd::Hash(a),
+            Self::Sync(a) => FileCmd::Sync(a),
+            other => return Err(other),
+        })
+    }
+}
+
 /// `shell [--home] [CMD...]`.
 #[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShellArgs {
@@ -533,7 +674,8 @@ pub struct ShellArgs {
     pub command: Vec<String>,
 }
 
-/// `put [-r] [-c] [-P] [-F] LOCAL... [REMOTE]`.
+/// `put [-r] [-c] [-P] [-F] [--checksum] LOCAL... [REMOTE]`, or
+/// `put [--mode M] [--mtime T] - REMOTE` from stdin.
 ///
 /// Shorts differ from plain `put -p`/`-L` because the same struct is
 /// flattened next to the connection options on the CLI (`-p` port, `-L`
@@ -561,8 +703,22 @@ pub struct PutArgs {
     #[arg(short = 'j', long = "jobs", value_name = "N", default_value_t = DEFAULT_TRANSFER_JOBS)]
     pub jobs: usize,
 
+    /// Skip files whose size and BLAKE2s digest already match the remote.
+    #[arg(long)]
+    pub checksum: bool,
+
+    /// Mode of the file written from stdin (`put - REMOTE`; octal,
+    /// default 0644).
+    #[arg(long, value_name = "MODE", value_parser = parse_mode)]
+    pub mode: Option<u32>,
+
+    /// Modification time of the file written from stdin, seconds since the
+    /// epoch.
+    #[arg(long, value_name = "SECS", allow_negative_numbers = true)]
+    pub mtime: Option<i64>,
+
     /// LOCAL... [REMOTE]; with one path REMOTE defaults to the MRU session's
-    /// cwd, then `~`.
+    /// cwd, then `~`. `-` reads standard input (REMOTE required).
     #[arg(value_name = "PATH", required = true, num_args = 1..)]
     pub paths: Vec<String>,
 }
@@ -595,6 +751,17 @@ impl PutArgs {
         if self.follow_symlinks {
             argv.push("-F".to_owned());
         }
+        if self.checksum {
+            argv.push("--checksum".to_owned());
+        }
+        if let Some(mode) = self.mode {
+            argv.push("--mode".to_owned());
+            argv.push(format!("{mode:o}"));
+        }
+        if let Some(mtime) = self.mtime {
+            argv.push("--mtime".to_owned());
+            argv.push(mtime.to_string());
+        }
         argv.push("-j".to_owned());
         argv.push(self.concurrency().to_string());
         argv.push("--".to_owned());
@@ -603,7 +770,8 @@ impl PutArgs {
     }
 }
 
-/// `get [-r] [-c] [-P] REMOTE... [LOCAL]`.
+/// `get [-r] [-c] [-P] [--checksum] REMOTE... [LOCAL]`; LOCAL `-` prints.
+#[allow(clippy::struct_excessive_bools)] // independent switches, like `PutArgs`
 #[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
 pub struct GetArgs {
     /// Copy directories recursively.
@@ -622,7 +790,13 @@ pub struct GetArgs {
     #[arg(short = 'j', long = "jobs", value_name = "N", default_value_t = DEFAULT_TRANSFER_JOBS)]
     pub jobs: usize,
 
+    /// Skip files whose size and BLAKE2s digest already match the local
+    /// copy.
+    #[arg(long)]
+    pub checksum: bool,
+
     /// REMOTE... [LOCAL]; with one path LOCAL defaults to the client cwd.
+    /// `-` writes the files to standard output.
     #[arg(value_name = "PATH", required = true, num_args = 1..)]
     pub paths: Vec<String>,
 }
@@ -652,6 +826,9 @@ impl GetArgs {
         if self.preserve {
             argv.push("-P".to_owned());
         }
+        if self.checksum {
+            argv.push("--checksum".to_owned());
+        }
         argv.push("-j".to_owned());
         argv.push(self.concurrency().to_string());
         argv.push("--".to_owned());
@@ -674,6 +851,315 @@ pub struct LsArgs {
     /// Remote path (default: MRU session's cwd, then `~`).
     #[arg(value_name = "REMOTE")]
     pub path: Option<String>,
+}
+
+/// `cat REMOTE…`.
+#[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CatArgs {
+    /// Remote files, printed in order.
+    #[arg(value_name = "REMOTE", required = true, num_args = 1..)]
+    pub paths: Vec<String>,
+}
+
+/// `write [--mode M] [--append] REMOTE`.
+#[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WriteArgs {
+    /// Mode of a new file (octal, default 0644; an appended file keeps
+    /// its own).
+    #[arg(long, value_name = "MODE", value_parser = parse_mode)]
+    pub mode: Option<u32>,
+
+    /// Append to the file instead of replacing it atomically.
+    #[arg(long)]
+    pub append: bool,
+
+    /// Remote file.
+    #[arg(value_name = "REMOTE")]
+    pub path: String,
+}
+
+/// `tail [-n N] [-f] [--for D] REMOTE`.
+///
+/// The deadline is `--for`, not `--timeout`, because the struct is also
+/// flattened next to the connection options on the CLI, where `--timeout`
+/// is the global bound (which `tail -f` honours as well).
+#[derive(Args, Clone, Debug, PartialEq, Eq)]
+pub struct TailArgs {
+    /// Lines to print (default 10).
+    #[arg(short = 'n', long = "lines", value_name = "N", default_value_t = DEFAULT_TAIL_LINES)]
+    pub lines: usize,
+
+    /// Keep printing as the file grows, until Ctrl-C, `--for` or the
+    /// connection's `--timeout`.
+    #[arg(short = 'f', long)]
+    pub follow: bool,
+
+    /// With `-f`: stop after DURATION (`10s`, `2m`) and exit 0.
+    #[arg(id = "for", long = "for", value_name = "DURATION", value_parser = parse_duration)]
+    pub timeout: Option<Duration>,
+
+    /// Remote file.
+    #[arg(value_name = "REMOTE")]
+    pub path: String,
+}
+
+impl Default for TailArgs {
+    fn default() -> Self {
+        Self {
+            lines: DEFAULT_TAIL_LINES,
+            follow: false,
+            timeout: None,
+            path: String::new(),
+        }
+    }
+}
+
+/// `stat REMOTE…`.
+#[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
+pub struct StatArgs {
+    /// Remote paths.
+    #[arg(value_name = "REMOTE", required = true, num_args = 1..)]
+    pub paths: Vec<String>,
+}
+
+/// `mkdir [-P] [-m MODE] REMOTE…` (`-p` is the shared CLI port option).
+#[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
+pub struct MkdirArgs {
+    /// Create missing parents too; no error when the directory exists.
+    #[arg(short = 'P', long)]
+    pub parents: bool,
+
+    /// Mode of the created directories (octal, default 0755).
+    #[arg(short = 'm', long, value_name = "MODE", value_parser = parse_mode)]
+    pub mode: Option<u32>,
+
+    /// Remote directories.
+    #[arg(value_name = "REMOTE", required = true, num_args = 1..)]
+    pub paths: Vec<String>,
+}
+
+/// `rm [-r] REMOTE…`.
+#[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RmArgs {
+    /// Remove directories and their contents.
+    #[arg(short = 'r', long)]
+    pub recursive: bool,
+
+    /// Remote paths.
+    #[arg(value_name = "REMOTE", required = true, num_args = 1..)]
+    pub paths: Vec<String>,
+}
+
+/// `mv FROM TO`.
+#[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
+pub struct MvArgs {
+    /// Remote path to rename.
+    #[arg(value_name = "FROM")]
+    pub from: String,
+
+    /// New remote path (replaced if it exists).
+    #[arg(value_name = "TO")]
+    pub to: String,
+}
+
+/// `realpath REMOTE`.
+#[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RealpathArgs {
+    /// Remote path.
+    #[arg(value_name = "REMOTE")]
+    pub path: String,
+}
+
+/// `hash REMOTE…`.
+#[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HashArgs {
+    /// Remote regular files.
+    #[arg(value_name = "REMOTE", required = true, num_args = 1..)]
+    pub paths: Vec<String>,
+}
+
+/// `sync [--pull] [--delete] [--dry-run] [--checksum] [-j N] SRC DST`.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncArgs {
+    /// SRC is remote and DST local (default: local SRC → remote DST).
+    #[arg(long)]
+    pub pull: bool,
+
+    /// Remove files and directories on DST that SRC does not have.
+    #[arg(long)]
+    pub delete: bool,
+
+    /// Print the plan and change nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Compare same-size files by BLAKE2s digest instead of mtime.
+    #[arg(long)]
+    pub checksum: bool,
+
+    /// Concurrent file streams (default 4).
+    #[arg(short = 'j', long = "jobs", value_name = "N", default_value_t = DEFAULT_TRANSFER_JOBS)]
+    pub jobs: usize,
+
+    /// Source tree.
+    #[arg(value_name = "SRC")]
+    pub src: String,
+
+    /// Destination tree (created if missing).
+    #[arg(value_name = "DST")]
+    pub dst: String,
+}
+
+impl SyncArgs {
+    /// Concurrency; a zero (`Default`) means the clap default.
+    #[must_use]
+    pub fn concurrency(&self) -> usize {
+        if self.jobs == 0 {
+            DEFAULT_TRANSFER_JOBS
+        } else {
+            self.jobs
+        }
+    }
+}
+
+/// A file primitive run once (`mysh HOST cat …`), at the prompt, or over
+/// the control socket; the args structs are shared with [`MetaCommand`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileCmd {
+    Cat(CatArgs),
+    Write(WriteArgs),
+    Tail(TailArgs),
+    Stat(StatArgs),
+    Mkdir(MkdirArgs),
+    Rm(RmArgs),
+    Mv(MvArgs),
+    Realpath(RealpathArgs),
+    Hash(HashArgs),
+    Sync(SyncArgs),
+}
+
+impl FileCmd {
+    /// The command's name as typed.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Cat(_) => "cat",
+            Self::Write(_) => "write",
+            Self::Tail(_) => "tail",
+            Self::Stat(_) => "stat",
+            Self::Mkdir(_) => "mkdir",
+            Self::Rm(_) => "rm",
+            Self::Mv(_) => "mv",
+            Self::Realpath(_) => "realpath",
+            Self::Hash(_) => "hash",
+            Self::Sync(_) => "sync",
+        }
+    }
+
+    /// Whether the command consumes standard input (`write`).
+    #[must_use]
+    pub fn reads_stdin(&self) -> bool {
+        matches!(self, Self::Write(_))
+    }
+
+    /// `tail -f`: runs until interrupted.
+    #[must_use]
+    pub fn follows(&self) -> bool {
+        matches!(self, Self::Tail(TailArgs { follow: true, .. }))
+    }
+
+    /// The prompt words that reproduce this command (for the control socket).
+    #[must_use]
+    pub fn to_argv(&self) -> Vec<String> {
+        let mut argv = vec![self.name().to_owned()];
+        let flag = |argv: &mut Vec<String>, on: bool, word: &str| {
+            if on {
+                argv.push(word.to_owned());
+            }
+        };
+        match self {
+            Self::Cat(a) => {
+                argv.push("--".to_owned());
+                argv.extend(a.paths.iter().cloned());
+            }
+            Self::Write(a) => {
+                if let Some(mode) = a.mode {
+                    argv.push("--mode".to_owned());
+                    argv.push(format!("{mode:o}"));
+                }
+                flag(&mut argv, a.append, "--append");
+                argv.push("--".to_owned());
+                argv.push(a.path.clone());
+            }
+            Self::Tail(a) => {
+                argv.push("-n".to_owned());
+                argv.push(a.lines.to_string());
+                flag(&mut argv, a.follow, "-f");
+                if let Some(d) = a.timeout {
+                    argv.push("--for".to_owned());
+                    argv.push(format_duration(d));
+                }
+                argv.push("--".to_owned());
+                argv.push(a.path.clone());
+            }
+            Self::Stat(a) => {
+                argv.push("--".to_owned());
+                argv.extend(a.paths.iter().cloned());
+            }
+            Self::Mkdir(a) => {
+                flag(&mut argv, a.parents, "-P");
+                if let Some(mode) = a.mode {
+                    argv.push("-m".to_owned());
+                    argv.push(format!("{mode:o}"));
+                }
+                argv.push("--".to_owned());
+                argv.extend(a.paths.iter().cloned());
+            }
+            Self::Rm(a) => {
+                flag(&mut argv, a.recursive, "-r");
+                argv.push("--".to_owned());
+                argv.extend(a.paths.iter().cloned());
+            }
+            Self::Mv(a) => {
+                argv.push("--".to_owned());
+                argv.push(a.from.clone());
+                argv.push(a.to.clone());
+            }
+            Self::Realpath(a) => {
+                argv.push("--".to_owned());
+                argv.push(a.path.clone());
+            }
+            Self::Hash(a) => {
+                argv.push("--".to_owned());
+                argv.extend(a.paths.iter().cloned());
+            }
+            Self::Sync(a) => {
+                flag(&mut argv, a.pull, "--pull");
+                flag(&mut argv, a.delete, "--delete");
+                flag(&mut argv, a.dry_run, "--dry-run");
+                flag(&mut argv, a.checksum, "--checksum");
+                argv.push("-j".to_owned());
+                argv.push(a.concurrency().to_string());
+                argv.push("--".to_owned());
+                argv.push(a.src.clone());
+                argv.push(a.dst.clone());
+            }
+        }
+        argv
+    }
+}
+
+/// Default `-n` for `tail`.
+pub const DEFAULT_TAIL_LINES: usize = 10;
+
+/// An octal permission mode (`644`, `0755`, `u+x` is not accepted).
+fn parse_mode(s: &str) -> Result<u32, String> {
+    let digits = s.strip_prefix("0o").unwrap_or(s);
+    u32::from_str_radix(digits, 8)
+        .ok()
+        .filter(|m| *m <= 0o7777)
+        .ok_or_else(|| format!("`{s}` is not an octal mode (e.g. 644, 0755)"))
 }
 
 /// `forward -L SPEC | -R SPEC | -D SPEC | ls | rm ID`.

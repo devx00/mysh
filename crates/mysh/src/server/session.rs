@@ -827,6 +827,7 @@ fn spawn_error(err: &io::Error) -> (ErrorCode, String) {
 #[allow(clippy::needless_pass_by_value)] // handler signature per the dispatch contract
 pub async fn handle_session(mut stream: Stream, req: SessionRequest, ctx: ConnCtx) {
     if let Err((code, message)) = check_policy(&ctx.policy, &req) {
+        ctx.audit.denied("session", &message);
         files::send_error(&mut stream, code, &message).await;
         return;
     }
@@ -909,6 +910,43 @@ async fn run_session(mut stream: Stream, req: &SessionRequest, ctx: &ConnCtx, id
     }
 }
 
+/// `session` audit event: a child was spawned.
+fn audit_started(ctx: &ConnCtx, id: u32, pid: u32, pty: bool, cmd: &Command) {
+    ctx.audit.emit(super::audit::Event::Session, || {
+        let argv: Vec<String> = cmd
+            .argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        serde_json::json!({
+            "id": id,
+            "pid": pid,
+            "pty": pty,
+            "program": cmd.program.display().to_string(),
+            "argv": argv,
+            "cwd": cmd.cwd.display().to_string(),
+        })
+    });
+}
+
+/// `exec` audit event: a session's child exited (`exit` for a code, the
+/// signal in `detail`).
+fn audit_exited(ctx: &ConnCtx, id: u32, pid: u32, pty: bool, status: ExitStatus, started: Instant) {
+    let (exit, signal) = match status {
+        ExitStatus::Code(code) => (Some(code), None),
+        ExitStatus::Signal { signal, .. } => (None, Some(signal)),
+    };
+    let extra = super::audit::Extra {
+        exit,
+        ..super::audit::Extra::elapsed(started.into_std())
+    };
+    ctx.audit.emit_with(
+        super::audit::Event::Exec,
+        extra,
+        || serde_json::json!({ "id": id, "pid": pid, "pty": pty, "signal": signal }),
+    );
+}
+
 /// `ListSessions` label: `shell` or the exec command line.
 fn kind_label(kind: &SessionKind) -> String {
     match kind {
@@ -971,6 +1009,8 @@ struct PtySession {
     /// Set once the child is reaped.
     status: Option<ExitStatus>,
     master_eof: bool,
+    /// Spawn time, for the audit log.
+    started: Instant,
     /// Output ring and API stdin (docs/03-protocol.md §10ter).
     api: Api,
 }
@@ -1002,6 +1042,7 @@ async fn run_pty(
         child,
         status: None,
         master_eof: false,
+        started: Instant::now(),
         api,
     };
     meta.pid = pid;
@@ -1014,6 +1055,7 @@ async fn run_pty(
     );
     ctx.registry.register(id, meta.clone(), live.clone());
     info!(peer = %ctx.peer, session = id, pid, program = %cmd.program.display(), "pty session started");
+    audit_started(ctx, id, pid, true, cmd);
     match start_stream(stream, id, pid, cwd_fallback).await {
         Some(io) => serve_pty(io, session, meta, live, ctx).await,
         None => settle(Outcome::ClientGone, None, session, meta, live, ctx).await,
@@ -1052,6 +1094,7 @@ async fn settle(
     let keep = match outcome {
         Outcome::Exited(status) => {
             debug!(peer = %ctx.peer, session = id, pid, %status, "pty session exited");
+            audit_exited(ctx, id, pid, true, status, session.started);
             session.api.finished(status);
             if let Some(io) = io {
                 io.finish(status).await;
@@ -1438,6 +1481,8 @@ struct ExecSession {
     pipes: ExecPipes,
     /// Set once the child is reaped.
     status: Option<ExitStatus>,
+    /// Spawn time, for the audit log.
+    started: Instant,
     /// Output ring and API stdin (docs/03-protocol.md §10ter).
     api: Api,
 }
@@ -1472,6 +1517,7 @@ async fn run_exec(
         (meta, live)
     });
     info!(peer = %ctx.peer, session = id, pid, program = %cmd.program.display(), "exec session started");
+    audit_started(ctx, id, pid, false, cmd);
     let mut session = ExecSession {
         id,
         pid,
@@ -1482,6 +1528,7 @@ async fn run_exec(
             stderr,
         },
         status: None,
+        started: Instant::now(),
         api,
     };
     let Some(mut io) = start_stream(stream, id, pid, cwd_fallback).await else {
@@ -1517,6 +1564,7 @@ async fn settle_exec(
     match outcome {
         Outcome::Exited(status) => {
             debug!(peer = %ctx.peer, session = id, pid, %status, "exec session exited");
+            audit_exited(ctx, id, pid, false, status, session.started);
             session.api.finished(status);
             if let Some(io) = io {
                 io.finish(status).await;

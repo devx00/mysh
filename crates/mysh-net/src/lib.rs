@@ -10,6 +10,7 @@
 //! - [`framing`]: async `Msg<T>` and `Open`/`OpenReply` helpers
 //! - [`mux`]: yamux multiplexing and the per-stream prologue
 //! - [`agent`]: OpenSSH `ssh-agent` client (list ed25519 identities, sign)
+//! - [`pairing`]: SPAKE2 + key confirmation for `mysh pair`
 
 #![forbid(unsafe_code)]
 
@@ -19,4 +20,5 @@ pub mod handshake;
 pub mod keys;
 pub mod mux;
 pub mod noise;
+pub mod pairing;
 pub mod trust;

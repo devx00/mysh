@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 mysh-proto = { path = "../crates/mysh-proto" }
 mysh-net = { path = "../crates/mysh-net" }
 mysh = { path = "../crates/mysh" }
+serde_json = "1"
 
 # Standalone workspace: keeps nightly-only fuzzing out of the root workspace.
 [workspace]
@@ -127,6 +128,55 @@ bench = false
 [[bin]]
 name = "config_specs"
 path = "fuzz_targets/config_specs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_info"
+path = "fuzz_targets/proto_info.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_read_reply"
+path = "fuzz_targets/proto_read_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_file_hash"
+path = "fuzz_targets/proto_file_hash.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_pair"
+path = "fuzz_targets/proto_pair.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pair_code"
+path = "fuzz_targets/pair_code.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cli_hosts"
+path = "fuzz_targets/cli_hosts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "output_json"
+path = "fuzz_targets/output_json.rs"
 test = false
 doc = false
 bench = false

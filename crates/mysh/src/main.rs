@@ -7,7 +7,7 @@
 use std::process::ExitCode;
 
 use anyhow::{Context as _, Result, bail};
-use mysh::cli::{Cli, Command, ConnectArgs, ConnectOpts};
+use mysh::cli::{Cli, Command, ConnectArgs, ConnectOpts, FileCmd};
 use mysh::client::ClientCommand;
 use mysh::config::{Config, Paths, Target, resolve_target};
 use mysh::identity::{self, Baked};
@@ -47,6 +47,8 @@ fn main() -> ExitCode {
 }
 
 /// `RUST_LOG` wins; otherwise `-v` levels apply to the mysh crates only.
+/// Colours only when stderr is a terminal (logs are read by scripts and
+/// tests otherwise, e.g. the pairing code after `SIGUSR1`).
 fn init_logging(verbose: u8) {
     let level = match verbose {
         0 => None,
@@ -64,6 +66,7 @@ fn init_logging(verbose: u8) {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(mysh_pty::terminal::is_terminal(std::io::stderr()))
         .with_target(verbose >= 2)
         .init();
 }
@@ -120,11 +123,23 @@ async fn run(cli: Cli) -> ExitCode {
     let mode = match &cli.command {
         Some(Command::Put(h)) => mode_for(&h.opts),
         Some(Command::Get(h)) => mode_for(&h.opts),
+        Some(Command::Cat(h)) => mode_for(&h.opts),
+        Some(Command::Write(h)) => mode_for(&h.opts),
+        Some(Command::Tail(h)) => mode_for(&h.opts),
+        Some(Command::Stat(h)) => mode_for(&h.opts),
+        Some(Command::Mkdir(h)) => mode_for(&h.opts),
+        Some(Command::Rm(h)) => mode_for(&h.opts),
+        Some(Command::Mv(h)) => mode_for(&h.opts),
+        Some(Command::Realpath(h)) => mode_for(&h.opts),
+        Some(Command::Hash(h)) => mode_for(&h.opts),
+        Some(Command::Sync(h)) => mode_for(&h.opts),
         Some(Command::Forward(h)) => mode_for(&h.opts),
         Some(Command::Authorize(h)) => mode_for(&h.opts),
         Some(Command::Connect(args)) => mode_for(&args.opts),
         Some(Command::Session(h)) => mode_for(&h.opts),
         Some(Command::Master(h)) => mode_for(&h.opts),
+        Some(Command::Pair(h)) => mode_for(&h.opts),
+        Some(Command::Run(args)) => mode_for(&args.opts),
         None => mode_for(&cli.connect.opts),
         Some(Command::Help(args)) if args.json => Mode::Json,
         Some(_) => Mode::Human,
@@ -168,12 +183,62 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, EXIT_USAGE, mode),
         },
+        Some(Command::Pair(h)) => pair(&h, &config, &paths, &baked, mode).await,
+        Some(Command::Run(args)) => fleet_exit(
+            mysh::client::fleet::run(args, &config, paths, baked, mode).await,
+            mode,
+        ),
+        // `--hosts`/`--group`: HOST's slot holds the first PATH.
+        Some(Command::Put(h)) if h.opts.fan_out() => {
+            let mut args = h.args;
+            args.paths.insert(0, h.host);
+            fleet_exit(
+                mysh::client::fleet::put(&h.opts, &args, &config, paths, baked, mode).await,
+                mode,
+            )
+        }
+        Some(Command::Get(h)) if h.opts.fan_out() => {
+            let mut args = h.args;
+            args.paths.insert(0, h.host);
+            fleet_exit(
+                mysh::client::fleet::get(&h.opts, &args, &config, paths, baked, mode).await,
+                mode,
+            )
+        }
         other => match client_request(other, cli.connect) {
             Ok((host, opts, cmd)) => {
                 Box::pin(client(&host, &opts, &config, cmd, paths, baked, mode)).await
             }
             Err(e) => fail(&e, EXIT_USAGE, mode),
         },
+    }
+}
+
+/// Exit code of a fan-out: the command's, or usage (2) for a bad host
+/// selection.
+fn fleet_exit(result: Result<i32>, mode: Mode) -> ExitCode {
+    match result {
+        Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(255)),
+        Err(e) => fail(&e, EXIT_USAGE, mode),
+    }
+}
+
+/// `mysh pair HOST CODE`: its own connection path (unverified server key,
+/// pairing-only), never the control socket.
+async fn pair(
+    h: &mysh::cli::HostAnd<mysh::cli::PairArgs>,
+    config: &Config,
+    paths: &Paths,
+    baked: &Baked,
+    mode: Mode,
+) -> ExitCode {
+    let target = match resolve(&h.host, &h.opts, config) {
+        Ok(t) => t,
+        Err(e) => return fail(&e, EXIT_USAGE, mode),
+    };
+    match mysh::client::pair::run(&target, &h.args.code(), paths, baked, mode).await {
+        Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(255)),
+        Err(e) => fail(&e, EXIT_USAGE, mode),
     }
 }
 
@@ -195,6 +260,24 @@ fn client_request(command: Option<Command>, bare: ConnectArgs) -> Result<ClientR
         Some(Command::Connect(args)) => connect(args),
         Some(Command::Put(h)) => Ok((h.host, h.opts, ClientCommand::Put(h.args))),
         Some(Command::Get(h)) => Ok((h.host, h.opts, ClientCommand::Get(h.args))),
+        Some(Command::Cat(h)) => Ok((h.host, h.opts, ClientCommand::File(FileCmd::Cat(h.args)))),
+        Some(Command::Write(h)) => {
+            Ok((h.host, h.opts, ClientCommand::File(FileCmd::Write(h.args))))
+        }
+        Some(Command::Tail(h)) => Ok((h.host, h.opts, ClientCommand::File(FileCmd::Tail(h.args)))),
+        Some(Command::Stat(h)) => Ok((h.host, h.opts, ClientCommand::File(FileCmd::Stat(h.args)))),
+        Some(Command::Mkdir(h)) => {
+            Ok((h.host, h.opts, ClientCommand::File(FileCmd::Mkdir(h.args))))
+        }
+        Some(Command::Rm(h)) => Ok((h.host, h.opts, ClientCommand::File(FileCmd::Rm(h.args)))),
+        Some(Command::Mv(h)) => Ok((h.host, h.opts, ClientCommand::File(FileCmd::Mv(h.args)))),
+        Some(Command::Realpath(h)) => Ok((
+            h.host,
+            h.opts,
+            ClientCommand::File(FileCmd::Realpath(h.args)),
+        )),
+        Some(Command::Hash(h)) => Ok((h.host, h.opts, ClientCommand::File(FileCmd::Hash(h.args)))),
+        Some(Command::Sync(h)) => Ok((h.host, h.opts, ClientCommand::File(FileCmd::Sync(h.args)))),
         Some(Command::Authorize(h)) => Ok((h.host, h.opts, ClientCommand::Authorize(h.args))),
         Some(Command::Session(h)) => Ok((h.host, h.opts, ClientCommand::Session(h.args))),
         Some(Command::Master(h)) => Ok((h.host, h.opts, ClientCommand::Master(h.args))),
@@ -205,7 +288,12 @@ fn client_request(command: Option<Command>, bare: ConnectArgs) -> Result<ClientR
             Ok((h.host, h.opts, ClientCommand::Forward(h.args)))
         }
         Some(
-            Command::Serve(_) | Command::Keygen(_) | Command::Fingerprint(_) | Command::Help(_),
+            Command::Serve(_)
+            | Command::Keygen(_)
+            | Command::Fingerprint(_)
+            | Command::Help(_)
+            | Command::Pair(_)
+            | Command::Run(_),
         ) => {
             bail!("internal error: non-client command reached client dispatch")
         }
@@ -227,6 +315,13 @@ async fn client(
     baked: Baked,
     mode: Mode,
 ) -> ExitCode {
+    if opts.fan_out() {
+        return fail(
+            &anyhow::anyhow!("--hosts/--group apply to run, put and get only"),
+            EXIT_USAGE,
+            mode,
+        );
+    }
     let mut target = match resolve(host, opts, config) {
         Ok(t) => t,
         Err(e) => return fail(&e, EXIT_USAGE, mode),
@@ -277,7 +372,7 @@ async fn client(
             );
         }
     }
-    run_client(target, cmd, paths, baked, mode).await
+    Box::pin(run_client(target, cmd, paths, baked, mode)).await
 }
 
 async fn run_client(
@@ -287,7 +382,7 @@ async fn run_client(
     baked: Baked,
     mode: Mode,
 ) -> ExitCode {
-    match mysh::client::run(target, cmd, paths, baked, mode).await {
+    match Box::pin(mysh::client::run(target, cmd, paths, baked, mode)).await {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(255)),
         Err(e) => {
             let code = if code_for(&e) == codes::TIMEOUT {
@@ -310,6 +405,8 @@ async fn ctl_stdin(cmd: &ClientCommand) -> Result<Vec<u8>, TooMuchStdin> {
         ClientCommand::Session(args) => {
             matches!(&args.cmd, mysh::cli::SessionCmd::Send(send) if send.stdin)
         }
+        ClientCommand::Put(args) => args.paths.first().is_some_and(|p| p == "-"),
+        ClientCommand::File(cmd) => cmd.reads_stdin(),
         _ => false,
     };
     if !reads_stdin {
@@ -327,6 +424,20 @@ fn ctl_argv(cmd: &ClientCommand, opts: &ConnectOpts) -> Option<Vec<String>> {
         ClientCommand::Get(args) => Some(args.to_argv()),
         ClientCommand::Authorize(args) => Some(args.to_argv()),
         ClientCommand::Session(args) => Some(args.to_argv()),
+        ClientCommand::File(cmd) => {
+            let mut argv = cmd.to_argv();
+            // `tail -f` over the socket runs on the serving client: carry
+            // this call's `--timeout` along so it still ends by itself.
+            if let FileCmd::Tail(tail) = cmd
+                && tail.follow
+                && tail.timeout.is_none()
+                && let Some(limit) = opts.timeout
+            {
+                argv.insert(1, "--for".to_owned());
+                argv.insert(2, format!("{}ms", limit.as_millis()));
+            }
+            Some(argv)
+        }
         ClientCommand::Forward(_) => {
             let mut argv = vec!["forward".to_owned()];
             for (flag, specs) in [

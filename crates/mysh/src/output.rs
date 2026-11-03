@@ -317,7 +317,123 @@ pub struct PingOut {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct TransferOut {
+    /// Files transferred (skipped ones are not counted here).
     pub files: u64,
+    /// Files left alone: complete under `-c`, or identical under
+    /// `--checksum`.
+    #[serde(default)]
+    pub skipped: u64,
+    pub bytes: u64,
+    pub duration_ms: u64,
+}
+
+/// One element of `run --json` (docs/05-meta-shell.md "Fleet"), in the
+/// order the hosts were given.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RunResult {
+    /// The host as given (alias or address).
+    pub host: String,
+    /// The command ran and exited 0.
+    pub ok: bool,
+    pub exit: Option<i32>,
+    pub signal: Option<i32>,
+    pub stdout: Bytes,
+    pub stderr: Bytes,
+    pub duration_ms: u64,
+    /// Why the command did not run (or did not finish): `connect_failed`,
+    /// `trust_unknown`, `timeout`, … (the `ErrorOut` codes).
+    pub error: Option<ErrorBody>,
+}
+
+impl RunResult {
+    /// A host that produced no result at all because of `err`.
+    #[must_use]
+    pub fn failed(host: &str, err: &anyhow::Error, duration_ms: u64) -> Self {
+        Self {
+            host: host.to_owned(),
+            ok: false,
+            exit: None,
+            signal: None,
+            stdout: Bytes::new(Vec::new()),
+            stderr: Bytes::new(Vec::new()),
+            duration_ms,
+            error: Some(ErrorOut::from_error(err).error),
+        }
+    }
+}
+
+/// One element of `put`/`get --hosts … --json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TransferResult {
+    pub host: String,
+    pub ok: bool,
+    /// The transfer summary when it ran.
+    pub transfer: Option<TransferOut>,
+    pub error: Option<ErrorBody>,
+}
+
+/// `hash REMOTE… --json` (one per path).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct HashOut {
+    pub path: String,
+    /// `blake2s256`.
+    pub algo: String,
+    pub size: u64,
+    /// Lowercase hex.
+    pub digest: String,
+}
+
+/// `cat`, `get REMOTE -`, `tail` with `--json`: the bytes that would have
+/// gone to stdout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DataOut {
+    pub data: Bytes,
+    pub bytes: u64,
+}
+
+/// `realpath REMOTE --json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RealpathOut {
+    pub path: String,
+    pub realpath: String,
+}
+
+/// One file `sync` would copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SyncEntry {
+    /// Relative to the tree root.
+    pub path: String,
+    pub size: u64,
+    /// `missing`, `size`, `mtime`, `content`.
+    pub reason: String,
+}
+
+/// `sync --dry-run --json`: what a run would do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SyncPlan {
+    pub copies: Vec<SyncEntry>,
+    /// Extras on the destination (`--delete`), files before directories,
+    /// deepest first.
+    pub deletes: Vec<String>,
+    pub unchanged: u64,
+    /// Bytes the copies amount to.
+    pub bytes: u64,
+}
+
+/// `sync --json` after a real run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SyncSummary {
+    pub copied: u64,
+    pub deleted: u64,
+    pub unchanged: u64,
     pub bytes: u64,
     pub duration_ms: u64,
 }
@@ -338,6 +454,19 @@ pub struct CwdOut {
 pub struct AuthorizeOut {
     /// `false` when the key was already present.
     pub added: bool,
+}
+
+/// `pair --json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PairOut {
+    pub host: String,
+    pub server_fingerprint: String,
+    pub client_fingerprint: String,
+    /// The `authorized_keys` line the server installed.
+    pub authorized_line: String,
+    /// The `known_hosts` line the client installed.
+    pub host_line: String,
 }
 
 /// Acknowledgement of a command with nothing else to say (`kill`,
@@ -485,6 +614,12 @@ pub enum Event {
     /// A command's result document (what `--json` would have printed).
     Result {
         value: serde_json::Value,
+    },
+    /// One host's event in a fan-out (`run`, `put`/`get --hosts`): `data`
+    /// is the event that host's own stream would have carried.
+    Host {
+        host: String,
+        data: Box<Event>,
     },
 }
 

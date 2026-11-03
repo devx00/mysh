@@ -376,7 +376,16 @@ pub async fn execute(ctx: &mut Ctx, cmd: MetaCommand, term: Option<&mut Terminal
         MetaCommand::Put(_)
         | MetaCommand::Get(_)
         | MetaCommand::Ls(_)
-        | MetaCommand::Stat { .. }
+        | MetaCommand::Stat(_)
+        | MetaCommand::Cat(_)
+        | MetaCommand::Write(_)
+        | MetaCommand::Tail(_)
+        | MetaCommand::Mkdir(_)
+        | MetaCommand::Rm(_)
+        | MetaCommand::Mv(_)
+        | MetaCommand::Realpath(_)
+        | MetaCommand::Hash(_)
+        | MetaCommand::Sync(_)
         | MetaCommand::Authorize(_) => execute_transfer(ctx, cmd, term).await?,
         MetaCommand::Cwd => cmd_cwd(ctx).await,
         MetaCommand::Lcd { dir } => cmd_lcd(ctx, dir.as_deref())?,
@@ -542,11 +551,6 @@ async fn execute_transfer(
             let fut = files::ls(&conn, &ctx.console, &args, remote.as_deref());
             ("ls", cancellable(term, fut).await?.is_some())
         }
-        MetaCommand::Stat { path } => {
-            let remote = mru_cwd(ctx).await;
-            let fut = files::stat_cmd(&conn, &ctx.console, &path, remote.as_deref());
-            ("stat", cancellable(term, fut).await?.is_some())
-        }
         MetaCommand::Authorize(args) => {
             let line = pubkey_line(
                 &conn,
@@ -557,7 +561,34 @@ async fn execute_transfer(
             let fut = files::authorize(&conn, &ctx.console, &line);
             ("authorize", cancellable(term, fut).await?.is_some())
         }
-        other => bail!("internal: {other:?} is not a transfer command"),
+        other => {
+            let mut cmd = other
+                .into_file_cmd()
+                .map_err(|c| anyhow!("internal: {c:?} is not a transfer command"))?;
+            let remote = mru_cwd(ctx).await;
+            // `tail -f` ends on its own deadline: a plain `--timeout` would
+            // turn its natural end into an error.
+            let limit = if let crate::cli::FileCmd::Tail(tail) = &mut cmd
+                && tail.follow
+            {
+                tail.timeout = tail.timeout.or(limit);
+                None
+            } else {
+                limit
+            };
+            let fut = crate::client::fileops::run(
+                &conn,
+                &ctx.console,
+                &cmd,
+                remote.as_deref(),
+                &ctx.local_cwd,
+                None,
+            );
+            (
+                cmd.name(),
+                cancellable(term, bounded(limit, fut)).await?.is_some(),
+            )
+        }
     };
     if !done {
         ctx.console.println(&format!("{name}: cancelled"));

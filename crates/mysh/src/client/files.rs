@@ -17,12 +17,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use blake2::{Blake2s256, Digest as _};
 use mysh_net::{
     framing::read_msg,
     mux::{OpenError, Stream},
 };
 use mysh_proto::{
-    file::{Attrs, DirEntry, FileKind, FileOp, ListPage, PutDone},
+    file::{Attrs, DirEntry, FileHash, FileKind, FileOp, HashAlgo, ListPage, PutDone},
     open::{ErrorCode, Open},
 };
 use tokio::{
@@ -34,6 +35,7 @@ use tokio::{
 use super::{
     conn::Connection,
     console::{Console, human},
+    fileops::{Input, finish_data},
 };
 use crate::{
     cli::{GetArgs, LsArgs, PutArgs},
@@ -51,13 +53,20 @@ const CHUNK: usize = 64 * 1024;
 const TMP_SUFFIX: &str = ".mysh-tmp";
 
 /// Mode for directories created without `-P`.
-const DEFAULT_DIR_MODE: u32 = 0o755;
+pub(crate) const DEFAULT_DIR_MODE: u32 = 0o755;
+
+/// Mode for files written from stdin without `--mode`.
+pub(crate) const DEFAULT_FILE_MODE: u32 = 0o644;
 
 // ---------------------------------------------------------------------------
 // Low-level file client
 // ---------------------------------------------------------------------------
 
-async fn open_file(conn: &Connection, op: FileOp, cwd: Option<&str>) -> Result<Stream, OpenError> {
+pub(crate) async fn open_file(
+    conn: &Connection,
+    op: FileOp,
+    cwd: Option<&str>,
+) -> Result<Stream, OpenError> {
     conn.open(&Open::File {
         op,
         cwd: cwd.map(str::to_owned),
@@ -66,7 +75,11 @@ async fn open_file(conn: &Connection, op: FileOp, cwd: Option<&str>) -> Result<S
 }
 
 /// `Stat`; `NotFound` → `None`.
-async fn stat(conn: &Connection, path: &str, cwd: Option<&str>) -> Result<Option<Attrs>> {
+pub(crate) async fn stat(
+    conn: &Connection,
+    path: &str,
+    cwd: Option<&str>,
+) -> Result<Option<Attrs>> {
     let op = FileOp::Stat {
         path: path.to_owned(),
     };
@@ -86,7 +99,11 @@ async fn stat(conn: &Connection, path: &str, cwd: Option<&str>) -> Result<Option
 }
 
 /// `List`, all pages concatenated.
-async fn list_all(conn: &Connection, path: &str, cwd: Option<&str>) -> Result<Vec<DirEntry>> {
+pub(crate) async fn list_all(
+    conn: &Connection,
+    path: &str,
+    cwd: Option<&str>,
+) -> Result<Vec<DirEntry>> {
     let op = FileOp::List {
         path: path.to_owned(),
     };
@@ -107,7 +124,7 @@ async fn list_all(conn: &Connection, path: &str, cwd: Option<&str>) -> Result<Ve
 }
 
 /// `Realpath`.
-async fn realpath(conn: &Connection, path: &str, cwd: Option<&str>) -> Result<String> {
+pub(crate) async fn realpath(conn: &Connection, path: &str, cwd: Option<&str>) -> Result<String> {
     let op = FileOp::Realpath {
         path: path.to_owned(),
     };
@@ -121,7 +138,12 @@ async fn realpath(conn: &Connection, path: &str, cwd: Option<&str>) -> Result<St
 
 /// `Mkdir`, ignoring an existing directory (a `Stat` runs first so the
 /// server never has to report "exists").
-async fn mkdir(conn: &Connection, path: &str, mode: u32, cwd: Option<&str>) -> Result<()> {
+pub(crate) async fn mkdir(
+    conn: &Connection,
+    path: &str,
+    mode: u32,
+    cwd: Option<&str>,
+) -> Result<()> {
     match stat(conn, path, cwd).await? {
         Some(Attrs {
             kind: FileKind::Dir,
@@ -141,7 +163,7 @@ async fn mkdir(conn: &Connection, path: &str, mode: u32, cwd: Option<&str>) -> R
 }
 
 /// `SetAttr`.
-async fn set_attr(
+pub(crate) async fn set_attr(
     conn: &Connection,
     path: &str,
     mode: Option<u32>,
@@ -158,11 +180,63 @@ async fn set_attr(
         .map(drop)
         .map_err(|e| anyhow!(e).context(format!("setattr {path}")))
 }
+/// `Hash { Blake2s256 }`: size and digest of a remote regular file.
+pub(crate) async fn hash(conn: &Connection, path: &str, cwd: Option<&str>) -> Result<FileHash> {
+    let op = FileOp::Hash {
+        path: path.to_owned(),
+        algo: HashAlgo::Blake2s256,
+    };
+    let mut stream = open_file(conn, op, cwd)
+        .await
+        .map_err(|e| anyhow!(e).context(format!("hash {path}")))?;
+    read_msg(&mut stream)
+        .await
+        .with_context(|| format!("hash {path}: reading reply"))
+}
+
+/// BLAKE2s-256 of a local file, computed on the blocking pool.
+pub(crate) async fn local_hash(path: &Path) -> Result<[u8; 32]> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<[u8; 32]> {
+        let mut file = std::fs::File::open(&path)
+            .with_context(|| format!("{}: cannot open", path.display()))?;
+        let mut hasher = Blake2s256::new();
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            let n = std::io::Read::read(&mut file, &mut buf)
+                .with_context(|| format!("{}: read", path.display()))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(hasher.finalize().into())
+    })
+    .await
+    .context("hash task failed")?
+}
+
+/// Whether a local regular file and a remote one have the same size and
+/// BLAKE2s digest (`--checksum`). `remote_size` comes from a `Stat`.
+pub(crate) async fn same_content(
+    conn: &Connection,
+    local: &Path,
+    local_size: u64,
+    remote: &str,
+    remote_size: u64,
+    cwd: Option<&str>,
+) -> Result<bool> {
+    if local_size != remote_size {
+        return Ok(false);
+    }
+    let (theirs, ours) = tokio::try_join!(hash(conn, remote, cwd), local_hash(local))?;
+    Ok(theirs.size == local_size && theirs.digest == ours)
+}
 
 /// `Get { offset }`: copies the raw body into `local`; returns the remote
 /// attributes and the number of bytes received. `progress` is called with
 /// `(bytes so far including offset, remote size)`.
-async fn get_to<W: AsyncWrite + Unpin>(
+pub(crate) async fn get_to<W: AsyncWrite + Unpin>(
     conn: &Connection,
     remote: &str,
     offset: u64,
@@ -202,10 +276,50 @@ async fn get_to<W: AsyncWrite + Unpin>(
     Ok((attrs, received))
 }
 
+/// `Get { offset }` straight to the console (`get REMOTE -`, `cat`,
+/// `tail`): the body goes out as session bytes (stdout, or collected in
+/// `--json` mode), with no progress line since stdout is the body.
+pub(crate) async fn get_to_console(
+    conn: &Connection,
+    console: &Console,
+    remote: &str,
+    offset: u64,
+    cwd: Option<&str>,
+) -> Result<(Attrs, u64)> {
+    let op = FileOp::Get {
+        path: remote.to_owned(),
+        offset,
+        follow: false,
+    };
+    let mut stream = open_file(conn, op, cwd)
+        .await
+        .map_err(|e| anyhow!(e).context(format!("get {remote}")))?;
+    let attrs: Attrs = read_msg(&mut stream)
+        .await
+        .with_context(|| format!("get {remote}: reading attributes"))?;
+    if attrs.kind == FileKind::Dir {
+        bail!("{remote}: is a directory");
+    }
+    let mut buf = vec![0u8; CHUNK];
+    let mut received = 0u64;
+    loop {
+        let n = stream
+            .read(&mut buf)
+            .await
+            .with_context(|| format!("get {remote}: reading body"))?;
+        if n == 0 {
+            break;
+        }
+        console.write_bytes(&buf[..n]);
+        received += n as u64;
+    }
+    Ok((attrs, received))
+}
+
 /// `Put`: streams `local` as the raw body, half-closes, and returns the
 /// server's `PutDone.written`. `progress` is called with `(bytes so far
 /// including the op's offset, total)`.
-async fn put_from<R: AsyncRead + Unpin>(
+pub(crate) async fn put_from<R: AsyncRead + Unpin>(
     conn: &Connection,
     op: FileOp,
     cwd: Option<&str>,
@@ -250,7 +364,7 @@ async fn put_from<R: AsyncRead + Unpin>(
 
 /// Last non-empty component of a slash-separated path; `None` when there is
 /// no usable name (`""`, `"/"`, `"."`, `".."`, `"~"`).
-fn basename(path: &str) -> Option<&str> {
+pub(crate) fn basename(path: &str) -> Option<&str> {
     let name = path.trim_end_matches('/').rsplit('/').next()?;
     match name {
         "" | "." | ".." | "~" => None,
@@ -259,7 +373,7 @@ fn basename(path: &str) -> Option<&str> {
 }
 
 /// `base/name` without doubling the separator.
-fn join_path(base: &str, name: &str) -> String {
+pub(crate) fn join_path(base: &str, name: &str) -> String {
     if base.is_empty() || base.ends_with('/') {
         format!("{base}{name}")
     } else {
@@ -324,7 +438,7 @@ fn plan_get(
 }
 
 /// `~` expansion and `local_cwd` for relative paths.
-fn expand_local(path: &str, local_cwd: &Path) -> PathBuf {
+pub(crate) fn expand_local(path: &str, local_cwd: &Path) -> PathBuf {
     let p = expand_tilde(path, &mysh_pty::process::home_dir());
     if p.is_absolute() {
         p
@@ -347,7 +461,7 @@ fn local_tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn mtime_to_system_time(mtime: i64) -> Option<SystemTime> {
+pub(crate) fn mtime_to_system_time(mtime: i64) -> Option<SystemTime> {
     let secs = u64::try_from(mtime).ok()?;
     SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs))
 }
@@ -356,41 +470,83 @@ fn mtime_to_system_time(mtime: i64) -> Option<SystemTime> {
 // Transfer bookkeeping
 // ---------------------------------------------------------------------------
 
+/// What one file's transfer amounted to: bytes moved, or skipped (`-c` on
+/// a complete file, `--checksum` on an identical one).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Tally {
+    pub(crate) bytes: u64,
+    pub(crate) skipped: u64,
+}
+
+impl Tally {
+    pub(crate) fn sent(bytes: u64) -> Self {
+        Self { bytes, skipped: 0 }
+    }
+
+    pub(crate) fn skipped() -> Self {
+        Self {
+            bytes: 0,
+            skipped: 1,
+        }
+    }
+}
+
+impl std::ops::AddAssign for Tally {
+    fn add_assign(&mut self, rhs: Self) {
+        self.bytes += rhs.bytes;
+        self.skipped += rhs.skipped;
+    }
+}
+
 #[derive(Debug, Default)]
-struct Totals {
+pub(crate) struct Totals {
+    /// Files transferred (skipped ones are not counted here).
     files: u64,
+    skipped: u64,
     bytes: u64,
     started: Option<Instant>,
 }
 
 impl Totals {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             started: Some(Instant::now()),
             ..Self::default()
         }
     }
 
-    fn add(&mut self, bytes: u64) {
-        self.files += 1;
-        self.bytes += bytes;
+    /// One file's outcome.
+    pub(crate) fn add(&mut self, tally: Tally) {
+        self.add_many(1, tally);
     }
 
-    fn add_many(&mut self, files: u64, bytes: u64) {
-        self.files += files;
-        self.bytes += bytes;
+    /// `files` files' combined outcome.
+    pub(crate) fn add_many(&mut self, files: u64, tally: Tally) {
+        self.files += files.saturating_sub(tally.skipped);
+        self.skipped += tally.skipped;
+        self.bytes += tally.bytes;
     }
 
     fn summary(&self) -> String {
         let secs = self.started.map_or(0.0, |t| t.elapsed().as_secs_f64());
         let files = if self.files == 1 { "file" } else { "files" };
-        format!("{} {files}, {}, {secs:.1} s", self.files, human(self.bytes))
+        let skipped = if self.skipped > 0 {
+            format!(", {} skipped", self.skipped)
+        } else {
+            String::new()
+        };
+        format!(
+            "{} {files}{skipped}, {}, {secs:.1} s",
+            self.files,
+            human(self.bytes)
+        )
     }
 
     /// The final line (`--json`: a [`TransferOut`]).
-    fn report(&self, console: &Console) {
+    pub(crate) fn report(&self, console: &Console) {
         let out = TransferOut {
             files: self.files,
+            skipped: self.skipped,
             bytes: self.bytes,
             duration_ms: u64::try_from(self.started.map_or(0, |t| t.elapsed().as_millis()))
                 .unwrap_or(u64::MAX),
@@ -399,7 +555,7 @@ impl Totals {
     }
 }
 
-fn label_of(path: &Path) -> String {
+pub(crate) fn label_of(path: &Path) -> String {
     path.file_name().map_or_else(
         || path.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
@@ -407,7 +563,7 @@ fn label_of(path: &Path) -> String {
 }
 
 /// One progress line for a whole tree: `NAME: N/M files  X/Y  P%`.
-struct Aggregate {
+pub(crate) struct Aggregate {
     console: Console,
     label: String,
     files_total: usize,
@@ -417,7 +573,12 @@ struct Aggregate {
 }
 
 impl Aggregate {
-    fn new(console: &Console, label: String, files_total: usize, bytes_total: u64) -> Arc<Self> {
+    pub(crate) fn new(
+        console: &Console,
+        label: String,
+        files_total: usize,
+        bytes_total: u64,
+    ) -> Arc<Self> {
         Arc::new(Self {
             console: console.clone(),
             label,
@@ -428,7 +589,7 @@ impl Aggregate {
         })
     }
 
-    fn report(&self) {
+    pub(crate) fn report(&self) {
         let label = format!(
             "{}: {}/{} files",
             self.label,
@@ -443,7 +604,7 @@ impl Aggregate {
     }
 
     /// A file reports `done` bytes so far; `last` is its previous report.
-    fn advance(&self, last: &mut u64, done: u64) {
+    pub(crate) fn advance(&self, last: &mut u64, done: u64) {
         let delta = done.saturating_sub(*last);
         *last = done;
         self.bytes_done.fetch_add(delta, Ordering::Relaxed);
@@ -451,7 +612,7 @@ impl Aggregate {
     }
 
     /// A file is complete (also when skipped): count its full size.
-    fn file_done(&self, last: u64, size: u64) {
+    pub(crate) fn file_done(&self, last: u64, size: u64) {
         self.bytes_done
             .fetch_add(size.saturating_sub(last), Ordering::Relaxed);
         self.files_done.fetch_add(1, Ordering::Relaxed);
@@ -462,14 +623,14 @@ impl Aggregate {
 /// Run `tasks` with at most `jobs` in flight (`JoinSet` behind a
 /// semaphore). Returns the sum of their results; the first error aborts the
 /// rest and is returned.
-async fn run_parallel<F>(jobs: usize, tasks: Vec<F>) -> Result<u64>
+pub(crate) async fn run_parallel<F>(jobs: usize, tasks: Vec<F>) -> Result<Tally>
 where
-    F: Future<Output = Result<u64>> + Send + 'static,
+    F: Future<Output = Result<Tally>> + Send + 'static,
 {
     let sem = Arc::new(Semaphore::new(jobs.max(1)));
-    let mut set: JoinSet<Result<u64>> = JoinSet::new();
+    let mut set: JoinSet<Result<Tally>> = JoinSet::new();
     let mut pending = tasks.into_iter().peekable();
-    let mut total = 0u64;
+    let mut total = Tally::default();
     loop {
         tokio::select! {
             permit = Arc::clone(&sem).acquire_owned(), if pending.peek().is_some() => {
@@ -505,14 +666,15 @@ where
 // ---------------------------------------------------------------------------
 
 /// Everything a `put` task needs; shared by the files of one tree.
-struct PutCtx {
-    conn: Connection,
-    console: Console,
-    args: PutArgs,
-    cwd: Option<String>,
+pub(crate) struct PutCtx {
+    pub(crate) conn: Connection,
+    pub(crate) console: Console,
+    pub(crate) args: PutArgs,
+    pub(crate) cwd: Option<String>,
 }
 
-/// `put [-r] [-c] [-P] [-F] [-j N] LOCAL... [REMOTE]`.
+/// `put [-r] [-c] [-P] [-F] [-j N] [--checksum] LOCAL... [REMOTE]` without
+/// standard input (`put -` is refused: the prompt owns stdin).
 pub async fn put(
     conn: &Connection,
     console: &Console,
@@ -520,9 +682,34 @@ pub async fn put(
     default_remote: Option<&str>,
     local_cwd: &Path,
 ) -> Result<()> {
+    put_with_input(conn, console, args, default_remote, local_cwd, None).await
+}
+
+/// [`put`] with a source for `put - REMOTE`: this process's stdin, the
+/// bytes of a control-socket request, or `None` when there is none.
+pub async fn put_with_input(
+    conn: &Connection,
+    console: &Console,
+    args: &PutArgs,
+    default_remote: Option<&str>,
+    local_cwd: &Path,
+    input: Option<Input<'_>>,
+) -> Result<()> {
     let (locals, remote_arg) = split_last(&args.paths);
     if locals.is_empty() {
         bail!("put: no local path given");
+    }
+    if locals.iter().any(|l| l == "-") {
+        let [_] = locals else {
+            bail!("put -: standard input cannot be combined with other sources");
+        };
+        let Some(input) = input else {
+            bail!("put -: standard input is not available here (use `mysh put HOST - REMOTE`)");
+        };
+        let Some(remote) = remote_arg else {
+            bail!("put -: REMOTE is required");
+        };
+        return put_stdin(conn, console, args, remote, default_remote, input).await;
     }
 
     // Resolve locals up front so that `.`/`..`/trailing-slash arguments get a
@@ -613,17 +800,63 @@ pub async fn put(
     Ok(())
 }
 
-/// Upload one regular file; returns the bytes written (0 when skipped as
-/// already complete). `allow_atomic` is false when the destination is known
-/// to be a device or FIFO.
-async fn put_file(
+/// `put - REMOTE`: stream `input` to EOF into one remote file (`--mode`,
+/// `--mtime`); atomic unless the destination is a device or FIFO.
+async fn put_stdin(
+    conn: &Connection,
+    console: &Console,
+    args: &PutArgs,
+    remote: &str,
+    cwd: Option<&str>,
+    input: Input<'_>,
+) -> Result<()> {
+    let atomic = match stat(conn, remote, cwd).await? {
+        Some(Attrs {
+            kind: FileKind::Dir,
+            ..
+        }) => bail!("{remote}: is a directory (put - needs a file name)"),
+        Some(Attrs {
+            kind: FileKind::Other,
+            ..
+        }) => false,
+        _ => true,
+    };
+    let op = FileOp::Put {
+        path: remote.to_owned(),
+        mode: args.mode.unwrap_or(DEFAULT_FILE_MODE),
+        mtime: args.mtime,
+        offset: 0,
+        truncate: true,
+        atomic,
+    };
+    let mut totals = Totals::new();
+    let c = console.clone();
+    let mut progress = move |done: u64, _total: u64| c.progress("stdin", done, None);
+    let result = match input {
+        Input::Process => {
+            let mut stdin = tokio::io::stdin();
+            put_from(conn, op, cwd, 0, &mut stdin, &mut progress).await
+        }
+        Input::Bytes(mut bytes) => put_from(conn, op, cwd, 0, &mut bytes, &mut progress).await,
+    };
+    console.progress_done();
+    totals.add(Tally::sent(result?));
+    totals.report(console);
+    Ok(())
+}
+
+/// Upload one regular file; returns the bytes written, or a skip when the
+/// remote is already complete (`-c`) or identical (`--checksum`).
+/// `allow_atomic` is false when the destination is known to be a device or
+/// FIFO.
+pub(crate) async fn put_file(
     ctx: &PutCtx,
     local: &Path,
     meta: &std::fs::Metadata,
     remote: &str,
     allow_atomic: bool,
     progress: ProgressFn<'_>,
-) -> Result<u64> {
+) -> Result<Tally> {
     let size = meta.len();
     let mode = meta.mode() & 0o7777;
     let mtime = ctx.args.preserve.then(|| meta.mtime());
@@ -632,8 +865,25 @@ async fn put_file(
     let mut offset = 0u64;
     let mut truncate = true;
     let mut atomic = allow_atomic;
+    let existing = if ctx.args.continue_ || ctx.args.checksum {
+        stat(&ctx.conn, remote, cwd).await?
+    } else {
+        None
+    };
+    if ctx.args.checksum
+        && let Some(Attrs {
+            kind: FileKind::File,
+            size: have,
+            ..
+        }) = &existing
+        && same_content(&ctx.conn, local, size, remote, *have, cwd).await?
+    {
+        ctx.console
+            .notice(&format!("{remote}: unchanged (checksum), skipped"));
+        return Ok(Tally::skipped());
+    }
     if ctx.args.continue_ {
-        match stat(&ctx.conn, remote, cwd).await? {
+        match existing {
             Some(Attrs {
                 kind: FileKind::File,
                 size: have,
@@ -650,7 +900,7 @@ async fn put_file(
             }) if have == size => {
                 ctx.console
                     .notice(&format!("{remote}: already complete, skipped"));
-                return Ok(0);
+                return Ok(Tally::skipped());
             }
             Some(Attrs {
                 kind: FileKind::Dir,
@@ -682,7 +932,9 @@ async fn put_file(
         atomic,
     };
     progress(offset, size);
-    put_from(&ctx.conn, op, cwd, size, &mut file, progress).await
+    put_from(&ctx.conn, op, cwd, size, &mut file, progress)
+        .await
+        .map(Tally::sent)
 }
 
 /// A regular file found by the walk of a `put -r` tree.
@@ -835,14 +1087,15 @@ async fn put_tree(
 // ---------------------------------------------------------------------------
 
 /// Everything a `get` task needs; shared by the files of one tree.
-struct GetCtx {
-    conn: Connection,
-    console: Console,
-    args: GetArgs,
-    cwd: Option<String>,
+pub(crate) struct GetCtx {
+    pub(crate) conn: Connection,
+    pub(crate) console: Console,
+    pub(crate) args: GetArgs,
+    pub(crate) cwd: Option<String>,
 }
 
-/// `get [-r] [-c] [-P] [-j N] REMOTE... [LOCAL]`.
+/// `get [-r] [-c] [-P] [-j N] [--checksum] REMOTE... [LOCAL]`; `LOCAL` of
+/// `-` writes the bodies to stdout in order (`cat`).
 pub async fn get(
     conn: &Connection,
     console: &Console,
@@ -853,6 +1106,9 @@ pub async fn get(
     let (remotes, local_arg) = split_last(&args.paths);
     if remotes.is_empty() {
         bail!("get: no remote path given");
+    }
+    if local_arg == Some("-") {
+        return cat(conn, console, remotes, default_remote).await;
     }
 
     // Remotes without a usable basename (`~`, `.`) are resolved server-side.
@@ -919,14 +1175,46 @@ pub async fn get(
     Ok(())
 }
 
+/// `cat REMOTE…` / `get REMOTE… -`: every body to stdout, in order; in
+/// `--json` mode one [`crate::output::DataOut`] with everything.
+pub async fn cat(
+    conn: &Connection,
+    console: &Console,
+    remotes: &[String],
+    cwd: Option<&str>,
+) -> Result<()> {
+    let mut total = 0u64;
+    for remote in remotes {
+        let (_, received) = get_to_console(conn, console, remote, 0, cwd).await?;
+        total += received;
+    }
+    finish_data(console, total);
+    Ok(())
+}
+
 /// Download one regular file to `local` (temp file + rename, or append when
-/// resuming with `-c`); returns the bytes received.
-async fn get_file(
+/// resuming with `-c`); returns the bytes received, or a skip when the
+/// local copy is identical (`--checksum`).
+pub(crate) async fn get_file(
     ctx: &GetCtx,
     remote: &str,
     local: &Path,
     progress: ProgressFn<'_>,
-) -> Result<u64> {
+) -> Result<Tally> {
+    let cwd = ctx.cwd.as_deref();
+    if ctx.args.checksum
+        && let Ok(md) = tokio::fs::metadata(local).await
+        && md.is_file()
+    {
+        let theirs = hash(&ctx.conn, remote, cwd).await?;
+        if theirs.size == md.len() && local_hash(local).await? == theirs.digest {
+            ctx.console.notice(&format!(
+                "{}: unchanged (checksum), skipped",
+                local.display()
+            ));
+            return Ok(Tally::skipped());
+        }
+    }
     let existing = if ctx.args.continue_ {
         tokio::fs::metadata(local)
             .await
@@ -951,15 +1239,7 @@ async fn get_file(
     }
     .with_context(|| format!("{}: cannot open for writing", path.display()))?;
 
-    let result = get_to(
-        &ctx.conn,
-        remote,
-        offset,
-        ctx.cwd.as_deref(),
-        &mut file,
-        progress,
-    )
-    .await;
+    let result = get_to(&ctx.conn, remote, offset, cwd, &mut file, progress).await;
     let (attrs, received) = match result {
         Ok(v) => v,
         Err(e) => {
@@ -1000,7 +1280,7 @@ async fn get_file(
             .await
             .with_context(|| format!("{}: cannot rename into place", path.display()))?;
     }
-    Ok(received)
+    Ok(Tally::sent(received))
 }
 
 /// A regular file found by the walk of a `get -r` tree.
@@ -1269,21 +1549,57 @@ pub async fn ls(
     Ok(())
 }
 
-/// `stat REMOTE`: the attributes of one path (`--json`: a [`StatOut`]).
+/// `stat REMOTE…`: the attributes of each path (`--json`: one [`StatOut`]
+/// for a single path, an array for several).
 pub async fn stat_cmd(
     conn: &Connection,
     console: &Console,
-    path: &str,
+    paths: &[String],
     default_remote: Option<&str>,
 ) -> Result<()> {
-    let attrs = stat(conn, path, default_remote).await?.ok_or_else(|| {
-        crate::output::coded(
-            crate::output::codes::NOT_FOUND,
-            anyhow!("stat {path}: not found"),
-        )
-    })?;
+    let mut rows = Vec::with_capacity(paths.len());
+    for path in paths {
+        let attrs = stat(conn, path, default_remote).await?.ok_or_else(|| {
+            crate::output::coded(
+                crate::output::codes::NOT_FOUND,
+                anyhow!("stat {path}: not found"),
+            )
+        })?;
+        rows.push((path.as_str(), attrs));
+    }
+    let outs: Vec<StatOut> = rows.iter().map(|(p, a)| stat_out(p, a)).collect();
+    let human = || {
+        rows.iter()
+            .zip(&outs)
+            .map(|((path, attrs), out)| {
+                let mut text = format!(
+                    "{} {:>10} {} {} {}",
+                    format_mode(mode_bits(&attrs.kind, attrs.mode)),
+                    attrs.size,
+                    format_mtime(attrs.mtime),
+                    out.kind,
+                    path
+                );
+                if let Some(t) = &out.target {
+                    text.push_str(" -> ");
+                    text.push_str(t);
+                }
+                text.push('\n');
+                text
+            })
+            .collect()
+    };
+    match outs.as_slice() {
+        [one] => console.report(one, human),
+        _ => console.report(&outs, human),
+    }
+    Ok(())
+}
+
+/// The `stat --json` row of one path.
+pub(crate) fn stat_out(path: &str, attrs: &Attrs) -> StatOut {
     let (kind, target) = kind_name(&attrs.kind);
-    let out = StatOut {
+    StatOut {
         path: path.to_owned(),
         kind: kind.to_owned(),
         size: attrs.size,
@@ -1292,24 +1608,7 @@ pub async fn stat_cmd(
         uid: attrs.uid,
         gid: attrs.gid,
         target,
-    };
-    console.report(&out, || {
-        let mut text = format!(
-            "{} {:>10} {} {} {}",
-            format_mode(mode_bits(&attrs.kind, attrs.mode)),
-            attrs.size,
-            format_mtime(attrs.mtime),
-            out.kind,
-            path
-        );
-        if let Some(t) = &out.target {
-            text.push_str(" -> ");
-            text.push_str(t);
-        }
-        text.push('\n');
-        text
-    });
-    Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

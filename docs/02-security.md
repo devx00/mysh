@@ -232,16 +232,127 @@ A **mismatch** against any known entry is a hard failure with a loud message
 naming the file and line. There is no bypass flag; the user edits the file.
 On failure the client closes the connection without sending message 3.
 
+## Pairing
+
+First contact without copying key files by hand: a one-time code typed on
+both sides establishes mutual trust. `mysh serve --pair [DURATION]`
+(default 5 min) prints
+
+```
+pairing code: apple-bread-cat-dog-eagle-fish (valid 5m, single use)
+```
+
+to stderr and the log; `SIGUSR1` opens a fresh window on a running server
+(replacing any). Codes are 6 words from the BIP-39 English list
+(`mysh::wordlist`, 2048 words, 66 bits), drawn with `OsRng`; typing them
+with spaces or in any case is fine (`normalize_code`).
+
+Flow (`mysh pair HOST CODE`, wire details in 03-protocol.md §10quinquies):
+
+1. The client connects with its normal identity (key file or agent key),
+   **accepts the server static unverified** (no `known_hosts` write yet)
+   and sets `caps::PAIR_REQUEST` in its `ClientHello`.
+2. If a window is open (not used, not expired) the server skips
+   authorization and answers `Verdict::Pairing`: the connection is
+   pairing-only, `Open::Control` and one `Open::Pair` stream and nothing
+   else. Without an open window the bit is ignored and the client is
+   treated like any other (an unknown key is `Denied`; the client reports
+   "server has no pairing window open").
+3. On the `Pair` stream both run **SPAKE2** (`spake2` crate, Ed25519
+   group) with password = the normalized code and identities = the two
+   Noise static keys of this very connection, then confirm the derived key
+   with HMAC-SHA256 tags over `client_static ‖ server_static ‖ A ‖ B`,
+   client first, compared in constant time.
+4. Only after the client's tag verifies does the server append the
+   client's public line (`mysh-x25519 … paired <date>` or `ssh-ed25519 …`
+   for an agent key) to `~/.config/mysh/authorized_keys` and send its own
+   tag; only after that tag verifies does the client append the server key
+   to `~/.config/mysh/known_hosts`. The server then reports both installed
+   lines (`Done`); `mysh pair` prints both fingerprints and the lines
+   (`--json`: `{host, server_fingerprint, client_fingerprint,
+   authorized_line, host_line}`).
+
+Properties:
+
+- **single use**: the window closes on the first `Pair` attempt, success
+  or failure; a wrong code therefore gives an attacker exactly one guess
+  per code the operator prints (2048⁶ possibilities), and the operator
+  sees the refusal in the log and the audit log (`denied`, `pair`);
+- **expiry**: checked when the window is used, default 5 min;
+- **channel binding**: the SPAKE2 identities and the confirmation
+  transcript are the connection's static keys, so a man-in-the-middle who
+  relays the exchange between two Noise sessions derives different keys on
+  each side and both confirmations fail — nothing is written anywhere;
+- **no identity leak beyond today's**: the client sends its static (or
+  ed25519 proof) in message 3 to an unverified server exactly as a TOFU
+  `--accept-new` connection does; the server learns the key but trusts it
+  only after the PAKE;
+- **nothing new for normal clients**: an open window changes nothing for a
+  connection without `PAIR_REQUEST`, and a pairing-only connection can run
+  no session, file or forward (`Denied`).
+
+Threat notes: the code is the only secret, so it must travel over a
+channel the attacker cannot read within the window (read it off the
+server's terminal; do not paste it into a chat the attacker can see). A
+server with a window open accepts one PAKE run from *anyone* who can reach
+it; the rate limiter and the single-use rule bound this to one guess per
+window. `--pair` lets `mysh serve` start with an empty `authorized_keys`
+(the usual "no authorized client keys" refusal is waived), which is the
+intended bootstrap on a fresh host.
+
+## Audit log
+
+`mysh serve --audit PATH` records what every client did, one JSON object
+per line, appended to `PATH` (created `0600`, `O_APPEND`, flushed per
+line; `-` writes to stderr). There is no rotation: use `logrotate`-style
+copy-truncate or point the server at a new path on restart. The log is
+written by one task on the server (`server/audit.rs`), independent of
+`tracing` and `-v`, so its schema is stable:
+
+```json
+{"ts":"2026-11-02T10:41:07.512Z","peer":"192.0.2.9:51022","key":"SHA256:…","kind":"x25519",
+ "event":"exec","detail":{"id":1,"pid":4242,"pty":false,"signal":null},
+ "exit":0,"bytes_in":null,"bytes_out":null,"duration_ms":38}
+```
+
+| field         | value                                                                 |
+| ------------- | --------------------------------------------------------------------- |
+| `ts`          | RFC 3339 UTC with milliseconds, stamped when the line is written (so lines are in non-decreasing order) |
+| `peer`        | client `ip:port`                                                      |
+| `key`, `kind` | the client's key fingerprint (`SHA256:…`) and `x25519` / `ssh-ed25519`; `"?"` and `""` when a connection was refused before any key was offered |
+| `event`       | one of the kinds below                                                |
+| `detail`      | event-specific object (always present)                                |
+| `exit`        | exit code of an `exec` (null when killed by a signal — see `detail.signal`) |
+| `bytes_in`, `bytes_out` | bytes from / to the client where known                      |
+| `duration_ms` | how long the thing took where known                                   |
+
+| event        | when                                                 | `detail`                                                                 |
+| ------------ | ---------------------------------------------------- | ------------------------------------------------------------------------ |
+| `connect`    | handshake done, key authorized (or pairing admitted) | `{version, pairing: bool}`                                               |
+| `disconnect` | the connection ended                                 | `{}`; `bytes_in`/`bytes_out` are the whole connection's plaintext counters, `duration_ms` since the handshake |
+| `session`    | a session's child was spawned (PTY shell or exec)    | `{id, pid, pty, program, argv, cwd}`                                     |
+| `exec`       | a session's child exited while its client was attached | `{id, pid, pty, signal}` plus `exit`, `duration_ms` since the spawn. A session that exits while detached (persistence window, no reader) is reported when a client reattaches and sees it end; otherwise not at all |
+| `file`       | a file op finished or failed after authorization     | `{op: stat\|list\|mkdir\|remove\|rename\|setattr\|realpath\|get\|hash\|put, path, to?, error?}`; `get` sets `bytes_out`, `put` `bytes_in` |
+| `forward`    | `direct` (`-L`/`-D`) dial finished or failed, `listen` (`-R`) bound and later `closed: true`, `forwarded` (one accepted connection) relayed or refused | `{kind, host, port}` / `{kind, listener, host, port, closed?}` / `{kind, listener, peer, error?}` with the relayed bytes and duration |
+| `pair`       | a pairing run (see "Pairing")                        | its outcome                                                              |
+| `denied`     | something was refused                                | `{what: handshake\|session\|file\|forward\|pair, why}` — an unknown or address-restricted key, a feature switched off by `--deny` or the key's options, a bad pairing code |
+
+The log is the server's view only: it never contains session output or
+file contents, and the client cannot write to it. Every connection-level
+line carries the authenticated key, so one `jq 'select(.key == "SHA256:…")'`
+reconstructs a client's activity.
+
 ## Threat model
 
 Protects against:
 
 - passive and active network attackers: confidentiality, integrity, replay
   protection (AEAD nonces), forward secrecy per session;
-- server impersonation (pinning / known_hosts / TOFU);
+- server impersonation (pinning / known_hosts / TOFU / pairing);
 - unauthorized clients (authorization on the authenticated static key, or
   on the ed25519 key behind a verified handshake-bound signature);
-- disclosure of client identity to unverified servers.
+- disclosure of client identity to unverified servers;
+- offline guessing of a pairing code (SPAKE2: one online guess per window).
 
 Does not protect against:
 

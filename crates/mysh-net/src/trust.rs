@@ -427,6 +427,13 @@ impl AuthorizedKeys {
         append_line_to(path, &key.to_line(comment))?;
         Ok(true)
     }
+
+    /// Appends a complete public key line as given (`mysh-x25519 …` or
+    /// `ssh-ed25519 …`, for pairing); no duplicate check. Creates the file
+    /// 0600 and its parent 0700.
+    pub fn append_raw_line(path: &Path, line: &str) -> std::io::Result<()> {
+        append_line_to(path, line)
+    }
 }
 
 impl<'a> IntoIterator for &'a AuthorizedKeys {

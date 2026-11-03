@@ -106,6 +106,16 @@ impl fmt::Debug for ClientAuth<'_> {
     }
 }
 
+/// What the server's `authorize` callback grants a client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Accept {
+    /// A trusted key: `Verdict::Accepted`, full service.
+    Normal,
+    /// An untrusted key asking to pair while a window is open:
+    /// `Verdict::Pairing`, only `Open::Control` and `Open::Pair`.
+    Pairing,
+}
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, thiserror::Error)]
@@ -347,15 +357,17 @@ fn verify_sig_auth(public_key: &[u8; 32], signature: &[u8], h2: &[u8]) -> bool {
 /// [`limits::HANDSHAKE_DEADLINE`].
 ///
 /// `authorize` is called with who the client proved to be and its
-/// `ClientHello` after message 3. On refusal the verdict is sent and
-/// `HandshakeError::Denied` is returned. An [`AuthProof::Ed25519`] proof is
-/// verified before `authorize` runs; a bad proof, or any proof when `hello`
-/// does not advertise [`caps::SIG_AUTH`], is refused without consulting it.
+/// `ClientHello` after message 3; it answers [`Accept::Normal`] for a
+/// trusted key or [`Accept::Pairing`] for a pairing-only connection. On
+/// refusal the verdict is sent and `HandshakeError::Denied` is returned.
+/// An [`AuthProof::Ed25519`] proof is verified before `authorize` runs; a
+/// bad proof, or any proof when `hello` does not advertise
+/// [`caps::SIG_AUTH`], is refused without consulting it.
 pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
     io: S,
     identity: &SecretKey,
     hello: ServerHello,
-    authorize: impl FnOnce(&Peer, &ClientHello) -> Result<(), (ErrorCode, String)>,
+    authorize: impl FnOnce(&Peer, &ClientHello) -> Result<Accept, (ErrorCode, String)>,
 ) -> Result<Handshaken<S>, HandshakeError> {
     tokio::time::timeout(
         limits::HANDSHAKE_DEADLINE,
@@ -370,7 +382,7 @@ async fn server_handshake_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut io: S,
     identity: &SecretKey,
     hello: ServerHello,
-    authorize: impl FnOnce(&Peer, &ClientHello) -> Result<(), (ErrorCode, String)>,
+    authorize: impl FnOnce(&Peer, &ClientHello) -> Result<Accept, (ErrorCode, String)>,
 ) -> Result<Handshaken<S>, HandshakeError> {
     let mut bytes = [0u8; PREAMBLE_LEN];
     io.read_exact(&mut bytes).await?;
@@ -415,16 +427,23 @@ async fn server_handshake_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
             }
         }
     };
-    let verdict = verdict.and_then(|peer| authorize(&peer, &client_hello).map(|()| peer));
+    let verdict =
+        verdict.and_then(|peer| authorize(&peer, &client_hello).map(|accept| (peer, accept)));
     match verdict {
-        Ok(peer) => {
-            framing::write_msg(&mut stream, &Verdict::Accepted).await?;
+        Ok((peer, accept)) => {
+            let pairing = accept == Accept::Pairing;
+            let verdict = if pairing {
+                Verdict::Pairing
+            } else {
+                Verdict::Accepted
+            };
+            framing::write_msg(&mut stream, &verdict).await?;
             Ok(Handshaken {
                 stream,
                 remote,
                 peer,
                 version,
-                pairing: false,
+                pairing,
             })
         }
         Err((code, message)) => {
@@ -474,7 +493,7 @@ mod tests {
             assert_eq!(*peer, Peer::Static(client_pk));
             assert_eq!(hello.caps, 0);
             assert_eq!(hello.auth, AuthProof::Static);
-            Ok(())
+            Ok(Accept::Normal)
         });
         let (client, server) = tokio::join!(client, server);
         let (mut client, hello) = client.unwrap();
@@ -551,11 +570,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pairing_accept_sets_the_pairing_verdict() {
+        let client_key = SecretKey::generate();
+        let server_key = SecretKey::generate();
+        let (a, b) = tokio::io::duplex(4096);
+
+        let client = client_handshake(
+            a,
+            &client_key,
+            caps::PAIR_REQUEST,
+            |_, _| Ok(()),
+            ClientAuth::Static,
+        );
+        let server = server_handshake(b, &server_key, server_hello(), |_, hello| {
+            assert_eq!(hello.caps & caps::PAIR_REQUEST, caps::PAIR_REQUEST);
+            Ok(Accept::Pairing)
+        });
+        let (client, server) = tokio::join!(client, server);
+        let (client, _) = client.unwrap();
+        let server = server.unwrap();
+        assert!(client.pairing);
+        assert!(server.pairing);
+    }
+
+    #[tokio::test]
     async fn bad_magic_is_rejected() {
         let server_key = SecretKey::generate();
         let (mut a, b) = tokio::io::duplex(64);
         a.write_all(b"SSH-2.0").await.unwrap();
-        let err = server_handshake(b, &server_key, server_hello(), |_, _| Ok(()))
+        let err = server_handshake(b, &server_key, server_hello(), |_, _| Ok(Accept::Normal))
             .await
             .unwrap_err();
         assert!(matches!(err, HandshakeError::BadMagic));
@@ -665,7 +708,7 @@ mod tests {
                 hello.auth,
                 AuthProof::Ed25519 { public_key, .. } if public_key == pk
             ));
-            Ok(())
+            Ok(Accept::Normal)
         });
         let (client, server) = tokio::join!(client, server);
         let (mut client, _) = client.unwrap();
@@ -764,7 +807,7 @@ mod tests {
         let server = server_handshake(b, &server_key, sig_server_hello(), |peer, hello| {
             assert_eq!(*peer, Peer::Static(client_pk));
             assert_eq!(hello.auth, AuthProof::Static);
-            Ok(())
+            Ok(Accept::Normal)
         });
         let (client, server) = tokio::join!(client, server);
         client.unwrap();
@@ -795,7 +838,9 @@ mod tests {
                 sign: &mut signer,
             },
         );
-        let server = server_handshake(b, &server_key, sig_server_hello(), |_, _| Ok(()));
+        let server = server_handshake(b, &server_key, sig_server_hello(), |_, _| {
+            Ok(Accept::Normal)
+        });
         let (client, server) = tokio::join!(client, server);
         client.unwrap();
         server.unwrap();

@@ -49,17 +49,23 @@ with `ed25519-dalek` and checks `verify_strict`; a failure is
 checks the bit first and never sends 3 in that case. The authorized identity
 is then the ed25519 key (`Peer::Ed25519`), not the Noise static.
 
-After 3 the server runs authorization. Then both sides call
+After 3 the server runs authorization. A client whose `ClientHello.caps`
+has `PAIR_REQUEST` set while a pairing window is open (02-security.md
+"Pairing") skips it and receives `Verdict::Pairing` instead of `Accepted`:
+the connection is **pairing-only** and serves `Open::Control` and
+`Open::Pair` only (every other `Open` is `Err { Denied }`). Without an open
+window the bit is ignored and the normal path decides. Then both sides call
 `into_stateless_transport_mode()` and maintain independent send/recv nonce
 counters, which is what lets the read and write halves run concurrently
 without a lock.
 
 `caps` is a bitfield of optional features that need no version bump
 (`mysh_proto::caps`): `SIG_AUTH` (1, server → client: `AuthProof::Ed25519`
-is accepted; set unless `--no-signature-auth`) and `PERSIST` (2, server →
+is accepted; set unless `--no-signature-auth`), `PERSIST` (2, server →
 client: detached PTY sessions are kept, see §10bis; set when
-`--detach-grace` is not 0). Unknown bits are ignored. `name` is the
-server's hostname (informational, shown by `info`).
+`--detach-grace` is not 0) and `PAIR_REQUEST` (4, client → server: this
+connection asks to pair, §10quinquies). Unknown bits are ignored. `name`
+is the server's hostname (informational, shown by `info`).
 
 Timeouts: the server allows 5 s from TCP accept to the end of message 3.
 
@@ -76,7 +82,8 @@ u16-BE ciphertext_len ‖ ciphertext         (ciphertext_len ≤ 65535, includes
 internal buffering. A decryption failure is fatal for the connection.
 
 The first transport-mode message is always `Msg<Verdict>`, server → client:
-`Accepted`, after which yamux frames begin, or `Denied { code, message }`
+`Accepted`, after which yamux frames begin; `Pairing` (same, but the
+connection is pairing-only, §10quinquies); or `Denied { code, message }`
 (`Unauthorized` for an untrusted client static) followed by close. The
 client reads it before starting the mux, so the two are never ambiguous on
 the wire.
@@ -141,6 +148,7 @@ enum Open {
     Read { session: u32, offset: u64, max: u32, wait_ms: u32 }, // client → server; one Msg<ReadReply> then close (§10ter)
     Write { session: u32, eof: bool },         // client → server; raw stdin, then close (§10ter)
     Signal { session: u32, signal: Signal },   // client → server; kill(pid, signal), then close (§10ter)
+    Pair,                                      // client → server; PairMsg exchange, pairing-only connections (§10quinquies)
 }
 
 enum OpenReply {
@@ -151,8 +159,9 @@ enum OpenReply {
 enum ErrorCode { Unauthorized, Denied, NotFound, Unsupported, Io, Limit, Protocol }
 ```
 
-`Denied` is a policy refusal (`--deny …`), `Unsupported` an unknown or
-unimplemented `Open` variant, `Limit` a quota (streams, listeners).
+`Denied` is a policy refusal (`--deny …`, or anything but `Control`/`Pair`
+on a pairing-only connection), `Unsupported` an unknown or unimplemented
+`Open` variant, `Limit` a quota (streams, listeners).
 
 The acceptor must answer within 10 s of accepting the stream or the opener
 resets it.
@@ -302,19 +311,34 @@ enum FileOp {
     Rename { from: String, to: String },                    // → Ok
     SetAttr { path: String, mode: Option<u32>, mtime: Option<i64> },  // → Ok
     Realpath { path: String },                              // → Msg<String>
-    Get { path: String, offset: u64 },                      // → Msg<Attrs>, then raw bytes until server closes
+    Get { path: String, offset: u64, follow: bool },        // → Msg<Attrs>, then raw bytes until server closes (or, with `follow`, until the client closes)
+    Hash { path: String, algo: HashAlgo },                  // → Msg<FileHash { algo, size: u64, digest: [u8; 32] }>
     Put { path: String, mode: u32, mtime: Option<i64>, offset: u64, truncate: bool, atomic: bool },
                                                             // client streams raw bytes, half-closes; → Msg<PutDone { written: u64 }>
 }
 struct Attrs { kind: FileKind, size: u64, mode: u32, mtime: i64, uid: u32, gid: u32 }
 enum FileKind { File, Dir, Symlink { target: String }, Other }
 struct DirEntry { name: String, attrs: Attrs }
+enum HashAlgo { Blake2s256 }
 ```
 
 `Put` with `atomic: true` writes to `<path>.mysh-tmp.<rand>` and renames on
 success; the client sets `atomic` when the destination is absent or a
 regular file, and clears it for devices/FIFOs. Integrity is provided by the
 transport; no per-file checksum in v1.
+
+`Get { follow: true }` (`tail -f`): after the body up to the current end
+of file the server keeps the stream open and polls the open descriptor
+every 100 ms, sending whatever was appended; a file that shrank (truncated)
+is re-sent from offset 0, silently, like `tail -F`. The client never sends
+body bytes on a `Get` stream, so the server treats any read ending (EOF or
+reset) as "the client closed" and stops. A file replaced by rename is not
+re-opened.
+
+`Hash` answers for regular files only (`Io` otherwise) and computes the
+digest on the blocking pool after `Ok`; the size is the file's at open
+time. The client's `--checksum` and `sync --checksum` compare size and
+BLAKE2s-256 of both sides before transferring and skip equal files.
 
 ## 10. Cwd probe
 
@@ -438,6 +462,43 @@ struct Info {
 by `--deny` and the key's options, with the `--deny` spellings (`pty`,
 `exec`, `files`, `forward-local`, `forward-remote`). No `Denied` case: the
 reply is always answered for an authorized client.
+
+## 10quinquies. Pairing
+
+`Open::Pair` (kind 12) is accepted only on a **pairing-only** connection
+(§2, `Verdict::Pairing`); on any other connection it is `Err { Denied }`.
+After `Ok` the stream is message mode, strictly in this order:
+
+```rust
+enum PairMsg {
+    ClientStart   { msg: Vec<u8> },                            // client → server: SPAKE2 message A (33 bytes)
+    ServerStart   { msg: Vec<u8> },                            // server → client: SPAKE2 message B
+    ClientConfirm { mac: [u8; 32] },                           // client → server
+    ServerConfirm { mac: [u8; 32] },                           // server → client, only after ClientConfirm verified
+    Done { authorized_line: String, host_line: String },       // server → client, last message
+    Failed { reason: String },                                 // either side, instead of the next expected message
+}
+```
+
+SPAKE2 (`spake2` 0.4, `Ed25519Group`) with identities `A = client Noise
+static`, `B = server Noise static` (the keys of **this** connection) and
+password `normalize_code(code)` (lowercase, words joined by single
+hyphens). Both sides derive `K` and confirm it explicitly, client first:
+
+```
+T             = client_static ‖ server_static ‖ msg_A ‖ msg_B
+ClientConfirm = HMAC-SHA256(K, "mysh-pair-client-v1" ‖ T)
+ServerConfirm = HMAC-SHA256(K, "mysh-pair-server-v1" ‖ T)
+```
+
+The server verifies `ClientConfirm` in constant time **before** writing
+anything to disk or sending `ServerConfirm`; on a mismatch it answers
+`Failed { "bad code" }`, closes the window and the connection. On success
+it appends the client's public line to `authorized_keys`, sends
+`ServerConfirm` then `Done` and closes. The client verifies `ServerConfirm`
+before it pins the server key in `known_hosts`; a mismatch leaves both
+files untouched. The whole exchange is bounded by the handshake deadline
+(5 s server side, 30 s client side).
 
 ## 11. Versioning and extensibility
 
