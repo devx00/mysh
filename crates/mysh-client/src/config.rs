@@ -1020,19 +1020,19 @@ mod tests {
 
     #[test]
     fn host_spec_forms() {
-        let s: HostSpec = "pi.lan".parse().expect("host");
+        let s: HostSpec = "box.lan".parse().expect("host");
         assert_eq!(
             s,
             HostSpec {
-                host: "pi.lan".into(),
+                host: "box.lan".into(),
                 port: None
             }
         );
-        let s: HostSpec = "pi.lan:7000".parse().expect("host:port");
+        let s: HostSpec = "box.lan:7000".parse().expect("host:port");
         assert_eq!(
             s,
             HostSpec {
-                host: "pi.lan".into(),
+                host: "box.lan".into(),
                 port: Some(7000)
             }
         );
@@ -1186,14 +1186,14 @@ mod tests {
 escape = "^]"          # meta key
 shell = false          # true = behave like `-s` everywhere
 
-[hosts.pi]
-host = "pi.lan"
+[hosts.box]
+host = "box.lan"
 port = 7722
 identity = "~/.ssh/id_ed25519"
 pin = "SHA256:abc"
 forward = ["-L 8080:localhost:80"]
 env = ["LANG"]
-shell = true           # `mysh pi` goes straight to a shell
+shell = true           # `mysh box` goes straight to a shell
 "#;
 
     #[test]
@@ -1202,21 +1202,21 @@ shell = true           # `mysh pi` goes straight to a shell
         assert_eq!(c.defaults.escape.as_deref(), Some("^]"));
         assert_eq!(c.defaults.shell, Some(false));
         assert_eq!(c.defaults.accept_new, None);
-        let pi = c.hosts.get("pi").expect("pi alias");
-        assert_eq!(pi.host.as_deref(), Some("pi.lan"));
-        assert_eq!(pi.port, Some(7722));
-        assert_eq!(pi.identity, Some(PathBuf::from("~/.ssh/id_ed25519")));
-        assert_eq!(pi.pin.as_deref(), Some("SHA256:abc"));
-        assert_eq!(pi.forward, ["-L 8080:localhost:80"]);
-        assert_eq!(pi.env, ["LANG"]);
-        assert_eq!(pi.shell, Some(true));
+        let host = c.hosts.get("box").expect("box alias");
+        assert_eq!(host.host.as_deref(), Some("box.lan"));
+        assert_eq!(host.port, Some(7722));
+        assert_eq!(host.identity, Some(PathBuf::from("~/.ssh/id_ed25519")));
+        assert_eq!(host.pin.as_deref(), Some("SHA256:abc"));
+        assert_eq!(host.forward, ["-L 8080:localhost:80"]);
+        assert_eq!(host.env, ["LANG"]);
+        assert_eq!(host.shell, Some(true));
         assert_eq!(Config::parse("").expect("empty ok"), Config::default());
     }
 
     #[test]
     fn config_rejects_unknown_fields() {
         assert!(Config::parse("[defaults]\nescpae = \"^]\"\n").is_err());
-        assert!(Config::parse("[hosts.pi]\nhots = \"pi.lan\"\n").is_err());
+        assert!(Config::parse("[hosts.box]\nhots = \"box.lan\"\n").is_err());
         assert!(Config::parse("[bogus]\nx = 1\n").is_err());
         assert!(Config::parse("not toml at all [[[").is_err());
     }
@@ -1236,7 +1236,7 @@ shell = true           # `mysh pi` goes straight to a shell
             Config::load(&present)
                 .expect("loads")
                 .hosts
-                .contains_key("pi")
+                .contains_key("box")
         );
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
@@ -1244,9 +1244,9 @@ shell = true           # `mysh pi` goes straight to a shell
     fn fixture() -> Config {
         let mut hosts = BTreeMap::new();
         hosts.insert(
-            "pi".to_owned(),
+            "box".to_owned(),
             HostAlias {
-                host: Some("pi.lan".to_owned()),
+                host: Some("box.lan".to_owned()),
                 port: Some(7000),
                 identity: Some(PathBuf::from("~/.ssh/id_ed25519")),
                 pin: Some("SHA256:alias".to_owned()),
@@ -1339,9 +1339,9 @@ shell = true           # `mysh pi` goes straight to a shell
 
     #[test]
     fn resolve_alias_over_defaults() {
-        let t = resolve_target("pi", &ConnectOpts::default(), &fixture()).expect("resolves");
-        assert_eq!(t.display, "pi");
-        assert_eq!(t.host, "pi.lan");
+        let t = resolve_target("box", &ConnectOpts::default(), &fixture()).expect("resolves");
+        assert_eq!(t.display, "box");
+        assert_eq!(t.host, "box.lan");
         assert_eq!(t.port, 7000);
         assert_eq!(t.identity, Some(PathBuf::from("~/.ssh/id_ed25519")));
         assert_eq!(t.pin.as_deref(), Some("SHA256:alias"));
@@ -1387,7 +1387,7 @@ shell = true           # `mysh pi` goes straight to a shell
             no_pty: true,
             ..ConnectOpts::default()
         };
-        let t = resolve_target("pi", &opts, &fixture()).expect("resolves");
+        let t = resolve_target("box", &opts, &fixture()).expect("resolves");
         assert_eq!(t.port, 1);
         assert_eq!(t.identity, Some(PathBuf::from("/k")));
         assert_eq!(t.pin.as_deref(), Some("SHA256:flag"));
@@ -1403,14 +1403,14 @@ shell = true           # `mysh pi` goes straight to a shell
     #[test]
     fn resolve_port_precedence() {
         // HOST:PORT as typed beats the alias port, -p beats both.
-        let t = resolve_target("pi:7100", &ConnectOpts::default(), &fixture()).expect("resolves");
-        assert_eq!(t.host, "pi.lan");
+        let t = resolve_target("box:7100", &ConnectOpts::default(), &fixture()).expect("resolves");
+        assert_eq!(t.host, "box.lan");
         assert_eq!(t.port, 7100);
         let opts = ConnectOpts {
             port: Some(7200),
             ..ConnectOpts::default()
         };
-        let t = resolve_target("pi:7100", &opts, &fixture()).expect("resolves");
+        let t = resolve_target("box:7100", &opts, &fixture()).expect("resolves");
         assert_eq!(t.port, 7200);
         // A port inside the alias host string counts as the alias port.
         let t = resolve_target("plain", &ConnectOpts::default(), &fixture()).expect("resolves");

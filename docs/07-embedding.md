@@ -127,7 +127,7 @@ use mysh_client::{Client, ExecRequest, NullReporter, RefuseUnknown,
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paths = Paths::from_env();                                   // ~/.config/mysh/…
     let config = Config::load(&paths.config_file)?;
-    let target = resolve_target("pi", &Default::default(), &config)?; // alias or host[:port]
+    let target = resolve_target("box", &Default::default(), &config)?; // alias or host[:port]
     let client = Client::connect(&target, &paths, &Baked::default(),
                                  Arc::new(NullReporter), Arc::new(RefuseUnknown)).await?;
 
@@ -369,8 +369,8 @@ error `-32002` with `data.code = "not_found"`; other remote failures are
 → {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"x","version":"0"}}}
 ← {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{…},"serverInfo":{"name":"mysh","version":"0.1.0"},"instructions":"…"}}
 → {"jsonrpc":"2.0","method":"notifications/initialized"}
-→ {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"exec","arguments":{"host":"pi","command":"uname -sm"}}}
+→ {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"exec","arguments":{"host":"box","command":"uname -sm"}}}
 ← {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"stdout\":\"Linux aarch64\\n\",…}"}],"structuredContent":{"stdout":"Linux aarch64\n","stderr":"","exit":0,"signal":null,"duration_ms":41,"timed_out":false},"isError":false}}
-→ {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"stat","arguments":{"host":"pi","path":"/nope"}}}
+→ {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"stat","arguments":{"host":"box","path":"/nope"}}}
 ← {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"error\":{\"code\":\"not_found\",\"message\":\"/nope: no such file\"}}"}],"structuredContent":{"error":{"code":"not_found","message":"/nope: no such file"}},"isError":true}}
 ```

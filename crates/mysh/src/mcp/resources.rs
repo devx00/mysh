@@ -121,15 +121,18 @@ mod tests {
 
     #[test]
     fn uris() {
-        assert_eq!(parse_uri("mysh://pi/").unwrap(), ("pi".into(), "~".into()));
-        assert_eq!(parse_uri("mysh://pi").unwrap(), ("pi".into(), "~".into()));
         assert_eq!(
-            parse_uri("mysh://pi/etc/hosts").unwrap(),
-            ("pi".into(), "/etc/hosts".into())
+            parse_uri("mysh://box/").unwrap(),
+            ("box".into(), "~".into())
+        );
+        assert_eq!(parse_uri("mysh://box").unwrap(), ("box".into(), "~".into()));
+        assert_eq!(
+            parse_uri("mysh://box/etc/hosts").unwrap(),
+            ("box".into(), "/etc/hosts".into())
         );
         assert_eq!(
-            parse_uri("mysh://pi/~/n.txt").unwrap(),
-            ("pi".into(), "~/n.txt".into())
+            parse_uri("mysh://box/~/n.txt").unwrap(),
+            ("box".into(), "~/n.txt".into())
         );
         assert_eq!(
             parse_uri("mysh://127.0.0.1:7722/tmp").unwrap(),

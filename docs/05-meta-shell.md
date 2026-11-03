@@ -343,18 +343,18 @@ escape = "^]"          # meta key
 shell = false          # true = behave like `-s` everywhere
 master = "never"       # "auto" (or true) starts a background master for socket-less calls; "always" requires one
 
-[hosts.pi]
-host = "pi.lan"
+[hosts.box]
+host = "box.lan"
 port = 7722
 identity = "~/.ssh/id_ed25519"
 pin = "SHA256:…"
 forward = ["-L 8080:localhost:80"]
 env = ["LANG"]
-shell = true           # `mysh pi` goes straight to a shell
+shell = true           # `mysh box` goes straight to a shell
 master = "auto"        # per-host master policy
 
 [groups.lab]           # `--group lab` ("Fleet")
-hosts = ["pi", "nuc", "10.0.0.5:7722"]
+hosts = ["box", "nas", "10.0.0.5:7722"]
 ```
 
 Flags override the alias; the alias overrides `[defaults]`; `[defaults]`

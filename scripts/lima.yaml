@@ -2,8 +2,10 @@ base: template://ubuntu-lts
 cpus: 4
 memory: "6GiB"
 disk: "30GiB"
+# Start it from the repository root so `.` is the checkout:
+#   limactl start --name mysh-ci scripts/lima.yaml
 mounts:
-  - location: "~/Development/mysh"
+  - location: "."
     mountPoint: "/mnt/mysh"
     writable: false
   - location: "/tmp/lima"

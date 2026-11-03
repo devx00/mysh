@@ -247,8 +247,8 @@ mysh run [-j N] (--hosts a,b | --group NAME)... [--json] [--timeout D] [--cwd D]
 
 ```
 $ mysh run --hosts box,nas -- 'echo from $(hostname -s)'
-box: from mbp
-nas: from mbp
+box: from box
+nas: from nas
 host  exit  duration
 box   0     10 ms
 nas   0     8 ms

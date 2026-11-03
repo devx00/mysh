@@ -179,19 +179,19 @@ mod tests {
         let config = Config::parse(
             r#"
 [groups.lab]
-hosts = ["pi", "nuc", "10.0.0.5:7722"]
+hosts = ["box", "nas", "10.0.0.5:7722"]
 [groups.web]
-hosts = ["nuc", "www"]
+hosts = ["nas", "www"]
 "#,
         )
         .expect("config");
         let hosts = expand_hosts(
-            &["nuc,extra".to_owned()],
+            &["nas,extra".to_owned()],
             &["lab".to_owned(), "web".to_owned()],
             &config,
         )
         .expect("hosts");
-        assert_eq!(hosts, vec!["nuc", "extra", "pi", "10.0.0.5:7722", "www"]);
+        assert_eq!(hosts, vec!["nas", "extra", "box", "10.0.0.5:7722", "www"]);
     }
 
     #[test]

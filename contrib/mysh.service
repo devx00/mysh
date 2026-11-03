@@ -11,7 +11,7 @@
 
 [Unit]
 Description=mysh remote shell server
-Documentation=https://github.com/zachhanson94/mysh
+Documentation=https://github.com/OWNER/mysh
 After=network-online.target
 Wants=network-online.target
 

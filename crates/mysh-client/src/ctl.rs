@@ -288,10 +288,10 @@ mod tests {
             PathBuf::from("/run/mysh/fe80__1_7000.sock")
         );
         let t =
-            resolve_target("pi.lan", &ConnectOpts::default(), &Config::default()).expect("target");
+            resolve_target("box.lan", &ConnectOpts::default(), &Config::default()).expect("target");
         assert_eq!(
             socket_path(&paths, &t),
-            PathBuf::from("/run/mysh/pi.lan_7722.sock")
+            PathBuf::from("/run/mysh/box.lan_7722.sock")
         );
     }
 
