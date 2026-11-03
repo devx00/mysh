@@ -9,7 +9,7 @@ operator's version.
 ## Native build
 
 ```sh
-git clone https://github.com/OWNER/mysh && cd mysh
+git clone https://github.com/devx00/mysh && cd mysh
 cargo build --release
 ./target/release/mysh --version
 ```
