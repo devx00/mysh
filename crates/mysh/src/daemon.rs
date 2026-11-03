@@ -238,7 +238,7 @@ mod tests {
         );
         assert_eq!(
             default_log(Path::new("history"), "accept"),
-            PathBuf::from("./accept.log")
+            PathBuf::from("accept.log")
         );
     }
 
