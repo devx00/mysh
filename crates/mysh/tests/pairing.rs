@@ -225,6 +225,16 @@ async fn pairing_only_connections_get_denied_for_everything_else() {
     server.stop().await;
 }
 
+/// Kills and reaps a spawned `mysh serve` however the test ends.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Spawn `mysh serve --listen 127.0.0.1:0` with a throwaway config dir, send
 /// it `SIGUSR1`, read the printed code from stderr, and pair with it.
 #[tokio::test(flavor = "multi_thread")]
@@ -243,22 +253,24 @@ async fn sigusr1_opens_a_new_window_on_a_running_server() {
     // an unrelated key so the window comes from SIGUSR1 alone.
     let dummy = SecretKey::generate().public().to_line(Some("dummy"));
 
-    let mut serve = Command::new(common::mysh_bin())
-        .env_clear()
-        .env("MYSH_CONFIG_DIR", &server_dir)
-        .env("HOME", &home)
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .args(["serve", "-v", "--listen", "127.0.0.1:0", "--authorized-key"])
-        .arg(dummy.trim_end())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn mysh serve");
+    let mut serve = KillOnDrop(
+        Command::new(common::mysh_bin())
+            .env_clear()
+            .env("MYSH_CONFIG_DIR", &server_dir)
+            .env("HOME", &home)
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .args(["serve", "-v", "--listen", "127.0.0.1:0", "--authorized-key"])
+            .arg(dummy.trim_end())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mysh serve"),
+    );
     // A reader thread feeds stderr lines through a channel so every wait is
     // bounded and the pipe never fills up.
     let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let stderr_pipe = serve.stderr.take().expect("stderr");
+    let stderr_pipe = serve.0.stderr.take().expect("stderr");
     std::thread::spawn(move || {
         for line in BufReader::new(stderr_pipe).lines().map_while(Result::ok) {
             if tx.send(line).is_err() {
@@ -281,7 +293,7 @@ async fn sigusr1_opens_a_new_window_on_a_running_server() {
 
     let status = Command::new("kill")
         .arg("-USR1")
-        .arg(serve.id().to_string())
+        .arg(serve.0.id().to_string())
         .status()
         .expect("kill");
     assert!(status.success());
@@ -326,6 +338,5 @@ async fn sigusr1_opens_a_new_window_on_a_running_server() {
     let out = pair(&env, &host, &code, false);
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
 
-    let _ = serve.kill();
-    let _ = serve.wait();
+    drop(serve);
 }
