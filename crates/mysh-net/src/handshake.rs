@@ -69,6 +69,9 @@ pub struct Handshaken<S> {
     pub peer: Peer,
     /// Agreed protocol version.
     pub version: u16,
+    /// The server accepted this connection for pairing only
+    /// (`Verdict::Pairing`); only `Open::Control` and `Open::Pair` work.
+    pub pairing: bool,
 }
 
 /// Produces ed25519 signatures for [`ClientAuth::Ed25519`].
@@ -306,18 +309,23 @@ pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     let mut stream = NoiseStream::new(io, hs.into_stateless_transport_mode()?);
     let verdict: Verdict = framing::read_msg(&mut stream).await?;
-    match verdict {
-        Verdict::Accepted => Ok((
-            Handshaken {
-                stream,
-                remote,
-                peer: Peer::Static(remote),
-                version,
-            },
-            server_hello,
-        )),
-        Verdict::Denied { code, message } => Err(HandshakeError::Denied { code, message }),
-    }
+    let pairing = match verdict {
+        Verdict::Accepted => false,
+        Verdict::Pairing => true,
+        Verdict::Denied { code, message } => {
+            return Err(HandshakeError::Denied { code, message });
+        }
+    };
+    Ok((
+        Handshaken {
+            stream,
+            remote,
+            peer: Peer::Static(remote),
+            version,
+            pairing,
+        },
+        server_hello,
+    ))
 }
 
 /// `SIG_AUTH_LABEL ‖ h2`.
@@ -416,6 +424,7 @@ async fn server_handshake_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 remote,
                 peer,
                 version,
+                pairing: false,
             })
         }
         Err((code, message)) => {

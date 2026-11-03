@@ -208,6 +208,7 @@ pub fn session_request(
     cwd: Option<String>,
 ) -> SessionRequest {
     SessionRequest {
+        persist: false,
         kind,
         env: session_env(target),
         pty: pty.map(|size| PtyRequest {

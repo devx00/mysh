@@ -20,7 +20,9 @@ pub mod file;
 pub mod forward;
 pub mod frame;
 pub mod handshake;
+pub mod info;
 pub mod open;
+pub mod pair;
 pub mod session;
 
 /// Cleartext preamble magic sent by both peers before the Noise handshake.
@@ -89,6 +91,14 @@ pub mod limits {
     pub const DETACHED_RING: usize = 1024 * 1024;
     /// Agent keys tried (one connection each) before giving up.
     pub const MAX_AGENT_KEYS: usize = 5;
+    /// Default pairing window.
+    pub const PAIR_WINDOW: Duration = Duration::from_secs(300);
+    /// Largest `Open::Read` reply body; larger `max` values are clamped.
+    pub const READ_MAX: u32 = 1024 * 1024;
+    /// Longest an `Open::Read` may block waiting for output.
+    pub const READ_WAIT_MAX: Duration = Duration::from_secs(60);
+    /// Default master idle exit.
+    pub const MASTER_IDLE: Duration = Duration::from_secs(600);
 }
 
 /// `ServerHello.caps` / `ClientHello.caps` bits. Zero means none.
@@ -97,4 +107,6 @@ pub mod caps {
     pub const SIG_AUTH: u32 = 1;
     /// Server: keeps detached PTY sessions (`Open::Attach`, `ListSessions`).
     pub const PERSIST: u32 = 2;
+    /// Client: this connection asks to pair (no authorization expected).
+    pub const PAIR_REQUEST: u32 = 4;
 }

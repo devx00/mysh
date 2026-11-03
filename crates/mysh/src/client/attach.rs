@@ -166,6 +166,10 @@ mod tests {
             started: 1_000,
             detached,
             buffered: u64::from(id) * 512,
+            pty: true,
+            next: 0,
+            oldest: 0,
+            exited: None,
         }
     }
 

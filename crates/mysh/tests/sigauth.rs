@@ -442,6 +442,7 @@ async fn open_pty(conn: &Connection, script: &str) -> (Stream, u32) {
             size: size(),
         }),
         cwd: None,
+        persist: false,
     };
     let mut stream = conn
         .open(&Open::Session(req))

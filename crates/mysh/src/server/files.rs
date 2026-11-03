@@ -120,7 +120,7 @@ async fn prepare(op: &FileOp, resolve: impl Fn(&str) -> PathBuf + Sync) -> io::R
             let real = fs::canonicalize(resolve(path)).await?;
             Ok(Body::Path(real.to_string_lossy().into_owned()))
         }
-        FileOp::Get { path, offset } => {
+        FileOp::Get { path, offset, .. } => {
             let path = resolve(path);
             let file = File::open(&path).await?;
             let md = file.metadata().await?;
@@ -143,6 +143,10 @@ async fn prepare(op: &FileOp, resolve: impl Fn(&str) -> PathBuf + Sync) -> io::R
                 open_put(resolve(path), *mode, *mtime, *offset, *truncate, *atomic).await?;
             Ok(Body::Put(target))
         }
+        FileOp::Hash { .. } => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "hash is not implemented on this server",
+        )),
     }
 }
 
@@ -692,6 +696,7 @@ pub(crate) mod tests {
             .file_ok(FileOp::Get {
                 path: "big".into(),
                 offset: 0,
+                follow: false,
             })
             .await;
         let attrs: Attrs = mysh_net::framing::read_msg(&mut stream)
@@ -704,6 +709,7 @@ pub(crate) mod tests {
             .file_ok(FileOp::Get {
                 path: "big".into(),
                 offset: 150_000,
+                follow: false,
             })
             .await;
         let _attrs: Attrs = mysh_net::framing::read_msg(&mut stream)
@@ -867,6 +873,7 @@ pub(crate) mod tests {
             h.file(FileOp::Get {
                 path: "nope".into(),
                 offset: 0,
+                follow: false,
             })
             .await,
         );

@@ -12,6 +12,11 @@ pub struct SessionRequest {
     /// Start directory; `~/` expanded, relative to home; unusable → home
     /// (reported through `Started::cwd_fallback`).
     pub cwd: Option<String>,
+    /// Register the session server-side with an output ring addressable by
+    /// `Open::Read`/`Open::Write` and keep it when this stream closes
+    /// (the `session new` API). PTY sessions persist regardless when the
+    /// server has a detach grace window.
+    pub persist: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,8 +124,8 @@ pub enum SessionOut {
     },
 }
 
-/// One entry of the `Open::ListSessions` reply: a PTY session whose client
-/// went away and that the server is keeping for the detach grace window.
+/// One entry of the `Open::ListSessions` reply: a registered session,
+/// attached (`detached: None`) or kept for the detach grace window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetachedSession {
     pub id: u32,
@@ -133,6 +138,48 @@ pub struct DetachedSession {
     pub detached: Option<i64>,
     /// Output bytes buffered while detached.
     pub buffered: u64,
+    pub pty: bool,
+    /// Absolute offset just past the newest byte in the ring.
+    pub next: u64,
+    /// Absolute offset of the oldest byte still in the ring.
+    pub oldest: u64,
+    /// Set once the process has exited (the entry stays for the grace window).
+    pub exited: Option<ExitStatus>,
+}
+
+/// Which output stream a ring chunk came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutStream {
+    Stdout,
+    Stderr,
+}
+
+/// A run of bytes from one output stream, in arrival order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Chunk {
+    pub stream: OutStream,
+    pub bytes: Vec<u8>,
+}
+
+/// Reply to `Open::Read { session, offset, max, wait_ms }`.
+///
+/// Offsets are absolute byte counts over everything the session ever
+/// produced (stdout and stderr interleaved in arrival order), so a reader
+/// can poll idempotently: the same `offset` returns the same bytes until
+/// they age out of the ring, which `oldest` reveals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadReply {
+    /// Offset of the first byte returned (≥ the requested offset; greater
+    /// when the request fell behind `oldest`).
+    pub offset: u64,
+    /// Offset to pass next.
+    pub next: u64,
+    /// Oldest offset still available.
+    pub oldest: u64,
+    pub chunks: Vec<Chunk>,
+    /// The process has exited; `next` is final once this is set and
+    /// `chunks` is empty.
+    pub exited: Option<ExitStatus>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

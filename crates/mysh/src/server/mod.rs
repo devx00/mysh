@@ -760,6 +760,14 @@ async fn dispatch(mut stream: Stream, ctx: ConnCtx) {
         Open::Cwd { session } => session::handle_cwd(stream, session, ctx).await,
         Open::Attach { session } => session::handle_attach(stream, session, ctx).await,
         Open::ListSessions => session::handle_list_sessions(stream, ctx).await,
+        Open::Info | Open::Read { .. } | Open::Write { .. } | Open::Pair => {
+            files::send_error(
+                &mut stream,
+                ErrorCode::Unsupported,
+                "not implemented on this server",
+            )
+            .await;
+        }
     }
 }
 
@@ -1093,6 +1101,7 @@ mod tests {
             env: Vec::new(),
             pty: None,
             cwd: None,
+            persist: false,
         };
         let mut session = mux.open(&Open::Session(req)).await.unwrap();
 
@@ -1156,6 +1165,7 @@ mod tests {
             env: Vec::new(),
             pty: None,
             cwd: None,
+            persist: false,
         };
         match mux.open(&Open::Session(req)).await {
             Err(mysh_net::mux::OpenError::Rejected { code, .. }) => {

@@ -172,6 +172,7 @@ async fn get_to<W: AsyncWrite + Unpin>(
     let op = FileOp::Get {
         path: remote.to_owned(),
         offset,
+        follow: false,
     };
     let mut stream = open_file(conn, op, cwd)
         .await

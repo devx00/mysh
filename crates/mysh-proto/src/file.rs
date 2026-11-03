@@ -23,8 +23,16 @@ pub enum FileOp {
     },
     /// → `Msg<String>`
     Realpath { path: String },
-    /// → `Msg<Attrs>`, then raw bytes until the server closes
-    Get { path: String, offset: u64 },
+    /// → `Msg<Attrs>`, then raw bytes until the server closes. With
+    /// `follow`, the server keeps the stream open and sends bytes as the
+    /// file grows (`tail -f`) until the client closes it.
+    Get {
+        path: String,
+        offset: u64,
+        follow: bool,
+    },
+    /// → `Msg<FileHash>`
+    Hash { path: String, algo: HashAlgo },
     /// Client streams raw bytes then half-closes → `Msg<PutDone>`
     Put {
         path: String,
@@ -71,4 +79,18 @@ pub struct ListPage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PutDone {
     pub written: u64,
+}
+
+/// Hash algorithms for `FileOp::Hash`. Only BLAKE2s-256 in v1; the enum
+/// exists so a stronger or faster choice can be appended later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HashAlgo {
+    Blake2s256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileHash {
+    pub algo: HashAlgo,
+    pub size: u64,
+    pub digest: [u8; 32],
 }

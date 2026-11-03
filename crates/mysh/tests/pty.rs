@@ -64,6 +64,7 @@ async fn open_pty_session(
             size,
         }),
         cwd,
+        persist: false,
     };
     let mut stream = conn
         .open(&Open::Session(req))
@@ -319,6 +320,7 @@ async fn pty_denied_by_policy() {
             size: SMALL,
         }),
         cwd: None,
+        persist: false,
     };
     match conn.open(&Open::Session(req)).await {
         Err(OpenError::Rejected { code, message }) => {
@@ -336,6 +338,7 @@ async fn pty_denied_by_policy() {
         env: Vec::new(),
         pty: None,
         cwd: None,
+        persist: false,
     };
     let mut stream = conn
         .open(&Open::Session(req))
@@ -373,6 +376,7 @@ async fn session_quota() {
             size: SMALL,
         }),
         cwd: None,
+        persist: false,
     };
     match conn.open(&Open::Session(req)).await {
         Err(OpenError::Rejected { code, message }) => {

@@ -55,6 +55,7 @@ async fn open_pty(conn: &mysh::client::conn::Connection, script: &str) -> (Strea
             size: size(),
         }),
         cwd: None,
+        persist: false,
     };
     let mut stream = conn
         .open(&Open::Session(req))

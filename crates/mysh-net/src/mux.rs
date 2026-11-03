@@ -451,6 +451,7 @@ mod tests {
             env: vec![],
             pty: None,
             cwd: None,
+            persist: false,
         });
         match client.open(&session).await {
             Err(OpenError::Rejected { code, message }) => {

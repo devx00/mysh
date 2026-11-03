@@ -46,5 +46,12 @@ pub enum AuthProof {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
     Accepted,
-    Denied { code: ErrorCode, message: String },
+    Denied {
+        code: ErrorCode,
+        message: String,
+    },
+    /// Accepted for pairing only (the client set `caps::PAIR_REQUEST` and a
+    /// pairing window is open): the server accepts `Open::Control` and one
+    /// `Open::Pair` stream, nothing else.
+    Pairing,
 }

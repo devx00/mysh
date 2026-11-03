@@ -670,6 +670,7 @@ async fn establish(
         remote,
         peer: _,
         version,
+        pairing: _,
     } = handshaken;
     let peer_addr = stream.get_ref().peer_addr().context("peer address")?;
     info!(

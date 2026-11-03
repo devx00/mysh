@@ -50,6 +50,7 @@ fn exec(argv: &[&str]) -> SessionRequest {
         env: Vec::new(),
         pty: None,
         cwd: None,
+        persist: false,
     }
 }
 
@@ -62,6 +63,7 @@ fn pty_shell() -> SessionRequest {
             size: WinSize::default(),
         }),
         cwd: None,
+        persist: false,
     }
 }
 
@@ -191,6 +193,7 @@ async fn forced_command_replaces_the_request() {
         env: Vec::new(),
         pty: None,
         cwd: None,
+        persist: false,
     };
     let (out, _) = run_exec(&mux, shell).await;
     assert_eq!(out, b"forced\n");
@@ -341,6 +344,7 @@ async fn stream_quota_is_enforced_by_yamux() {
         op: FileOp::Get {
             path: "quota".to_owned(),
             offset: 0,
+            follow: false,
         },
         cwd: None,
     };

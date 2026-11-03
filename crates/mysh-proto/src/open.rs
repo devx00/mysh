@@ -31,6 +31,22 @@ pub enum Open {
     Attach { session: u32 },
     /// Client → server; one `Msg<Vec<DetachedSession>>` then close.
     ListSessions,
+    /// Client → server; one `Msg<Info>` then close.
+    Info,
+    /// Client → server; one `Msg<ReadReply>` then close. Bytes of a
+    /// registered session's output ring from `offset`, at most `max`,
+    /// waiting up to `wait_ms` for new output when none is pending.
+    Read {
+        session: u32,
+        offset: u64,
+        max: u32,
+        wait_ms: u32,
+    },
+    /// Client → server; raw stdin bytes for a registered session until the
+    /// client half-closes (EOF to the child's stdin for non-PTY sessions).
+    Write { session: u32 },
+    /// Client → server on a pairing-only connection; `PairMsg` exchange.
+    Pair,
 }
 
 /// Kind tags for [`Open`].
@@ -46,6 +62,10 @@ pub enum OpenKind {
     Cwd = 6,
     Attach = 7,
     ListSessions = 8,
+    Info = 9,
+    Read = 10,
+    Write = 11,
+    Pair = 12,
 }
 
 impl OpenKind {
@@ -60,6 +80,10 @@ impl OpenKind {
             6 => Self::Cwd,
             7 => Self::Attach,
             8 => Self::ListSessions,
+            9 => Self::Info,
+            10 => Self::Read,
+            11 => Self::Write,
+            12 => Self::Pair,
             _ => return None,
         })
     }
@@ -88,6 +112,10 @@ impl Open {
             Self::Cwd { .. } => OpenKind::Cwd,
             Self::Attach { .. } => OpenKind::Attach,
             Self::ListSessions => OpenKind::ListSessions,
+            Self::Info => OpenKind::Info,
+            Self::Read { .. } => OpenKind::Read,
+            Self::Write { .. } => OpenKind::Write,
+            Self::Pair => OpenKind::Pair,
         }
     }
 
@@ -96,7 +124,7 @@ impl Open {
     pub fn encode_body(&self) -> Result<Vec<u8>, frame::Error> {
         let mut out = vec![self.kind() as u8];
         match self {
-            Self::Control | Self::ListSessions => {}
+            Self::Control | Self::ListSessions | Self::Info | Self::Pair => {}
             Self::Session(req) => {
                 postcard::to_io(req, &mut out)?;
             }
@@ -109,8 +137,16 @@ impl Open {
             Self::File { op, cwd } => {
                 postcard::to_io(&(op, cwd), &mut out)?;
             }
-            Self::Cwd { session } | Self::Attach { session } => {
+            Self::Cwd { session } | Self::Attach { session } | Self::Write { session } => {
                 postcard::to_io(session, &mut out)?;
+            }
+            Self::Read {
+                session,
+                offset,
+                max,
+                wait_ms,
+            } => {
+                postcard::to_io(&(session, offset, max, wait_ms), &mut out)?;
             }
         }
         Ok(out)
@@ -159,6 +195,20 @@ impl Open {
                 session: frame::decode(rest)?,
             },
             OpenKind::ListSessions => Self::ListSessions,
+            OpenKind::Info => Self::Info,
+            OpenKind::Read => {
+                let (session, offset, max, wait_ms) = frame::decode(rest)?;
+                Self::Read {
+                    session,
+                    offset,
+                    max,
+                    wait_ms,
+                }
+            }
+            OpenKind::Write => Self::Write {
+                session: frame::decode(rest)?,
+            },
+            OpenKind::Pair => Self::Pair,
         })
     }
 }
@@ -225,6 +275,7 @@ mod tests {
                     },
                 }),
                 cwd: Some("~/src".into()),
+                persist: false,
             }),
             Open::DirectTcp {
                 host: "localhost".into(),
@@ -247,6 +298,15 @@ mod tests {
             Open::Cwd { session: 9 },
             Open::Attach { session: 4 },
             Open::ListSessions,
+            Open::Info,
+            Open::Read {
+                session: 3,
+                offset: 1 << 40,
+                max: 65536,
+                wait_ms: 1500,
+            },
+            Open::Write { session: 3 },
+            Open::Pair,
         ];
         for open in cases {
             let frame = open.encode_frame().unwrap();

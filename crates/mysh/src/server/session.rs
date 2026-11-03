@@ -240,6 +240,10 @@ impl Registry {
                     started: meta.started,
                     detached,
                     buffered,
+                    pty: true,
+                    next: 0,
+                    oldest: 0,
+                    exited: None,
                 }
             })
             .collect();
@@ -1452,6 +1456,7 @@ mod tests {
                 size: mysh_proto::session::WinSize::default(),
             }),
             cwd: None,
+            persist: false,
         };
         assert!(matches!(
             check_policy(&deny, &pty),
@@ -1464,6 +1469,7 @@ mod tests {
             env: Vec::new(),
             pty: None,
             cwd: None,
+            persist: false,
         };
         assert!(matches!(
             check_policy(&deny, &exec),
@@ -1474,6 +1480,7 @@ mod tests {
             env: Vec::new(),
             pty: None,
             cwd: None,
+            persist: false,
         };
         assert!(check_policy(&deny, &shell).is_ok());
         assert!(check_policy(&policy(), &pty).is_ok());
