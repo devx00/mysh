@@ -24,6 +24,9 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace crates reference each other by path without a version; they are
+# not published.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

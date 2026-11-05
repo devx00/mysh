@@ -31,7 +31,7 @@ futures = "0.3"
 # HMAC-SHA1 for OpenSSH `|1|salt|hash` hashed known_hosts entries (mysh-net::trust).
 hmac = "0.12"
 libc = "0.2"
-postcard = { version = "1", features = ["use-std"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 # `AtomicU64` on targets without native 64-bit atomics (armv5te, mips32):
 # `fallback` emulates them with a global lock; elsewhere it is the std type.
 portable-atomic = { version = "1", features = ["fallback"] }

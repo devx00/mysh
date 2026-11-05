@@ -17,12 +17,12 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      # Reads rust-toolchain.toml.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@v5
+      # Installs the toolchain and targets pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       # `baked` needs key files at build time; use throwaway placeholders.
       - run: |
@@ -51,8 +51,9 @@ jobs:
           - armv7-linux-androideabi
           - x86_64-linux-android
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@v5
+      # Installs the toolchain and targets pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
@@ -81,8 +82,9 @@ jobs:
           - { target: x86_64-unknown-openbsd, tier: 3 }
           - { target: aarch64-unknown-openbsd, tier: 3 }
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@v5
+      # Installs the toolchain and targets pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
       - if: matrix.tier == 3
         run: rustup toolchain install nightly --profile minimal --component rust-src
       - uses: Swatinem/rust-cache@v2
@@ -96,5 +98,5 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
