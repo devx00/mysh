@@ -189,7 +189,8 @@ asks it to open a normal listener for a while (server needs
 ## This skill
 
 `mysh skill show` prints this file; `mysh skill install` (re)installs it for
-the agents on the machine (`~/.agents/skills`, `~/.claude/skills`, …);
+the agents on the machine (`~/.agents/skills`, `~/.claude/skills`,
+`~/.omp/agent/skills`, …);
 `mysh skill list` shows where.
 
 ## Don'ts

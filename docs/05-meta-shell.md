@@ -458,8 +458,8 @@ writes it to `<skills dir>/mysh/SKILL.md` for every coding agent present on
 the machine: always the shared `~/.agents/skills` (read by Codex, Cursor,
 Copilot, Gemini CLI, OpenCode and others), plus `~/.claude/skills`
 (`$CLAUDE_CONFIG_DIR`), `~/.codex/skills` (`$CODEX_HOME`), `~/.cursor/skills`,
-`~/.copilot/skills`, `~/.openclaw/skills` when that agent's directory
-exists; `--to DIR` (repeatable) replaces detection. Each location reports
+`~/.copilot/skills`, `~/.openclaw/skills` and omp's `~/.omp/agent/skills`
+when that agent's directory exists; `--to DIR` (repeatable) replaces detection. Each location reports
 `installed`, `updated`, `unchanged` or `skipped` (`error` with the reason;
 exit 1 if any). `mysh skill list` shows the same locations with `installed`,
 `outdated` (content differs from the embedded skill), `missing` or

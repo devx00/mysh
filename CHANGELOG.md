@@ -27,8 +27,8 @@ server.
   target to build otherwise. New `[assets]` config table.
 - **`mysh skill`**: the agent skill is embedded in the binary; `install`
   writes it for every coding agent present (`~/.agents/skills` always,
-  `~/.claude`, `~/.codex`, `~/.cursor`, `~/.copilot`, `~/.openclaw` when
-  found; `--to DIR`), `list` shows where and whether each copy is current,
+  `~/.claude`, `~/.codex`, `~/.cursor`, `~/.copilot`, `~/.openclaw`,
+  `~/.omp/agent/skills` when found; `--to DIR`), `list` shows where and whether each copy is current,
   `show` prints it. The skill gained the deployment flow (`mysh assets
   --for`, `serve --daemon`), connect-back addressing and its own install.
 - **Transport** (`mysh-proto`, `mysh-net`): versioned preamble bound into the
@@ -230,6 +230,15 @@ server.
   `--pid-file`) and exit 0 only once the child is listening/accepting — or
   1 with the child's log lines if it failed first. `SIGHUP` is now really
   ignored by both (the docs said so; no handler was installed).
+
+### Fixed
+
+- 32-bit ARM musl builds (`armv7`, `armv6`, `armv5te`) crashed on launch
+  (`SIGSEGV` before any output) on a Linux 4.1.10 vendor kernel whose ARM
+  vDSO is Thumb-2 code with ARM-state symbols: musl's `clock_gettime`
+  entered it in the wrong state. The binary now defines musl's internal
+  `__vdsosym` to return null, so time is always read through the system
+  call on those targets (`crates/mysh/src/linkshim.rs`, decision 74).
 
 ### Changed
 

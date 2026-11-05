@@ -4,6 +4,8 @@
 //! Exit codes: the client returns its own (docs/04-sessions.md "Exit codes");
 //! usage, config, and identity errors are 2; server failures are 1.
 
+mod linkshim;
+
 use std::process::ExitCode;
 
 use anyhow::{Context as _, Result, bail};

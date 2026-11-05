@@ -88,6 +88,11 @@ flags.
   `config.toml`.
 - **Runtime dir** (control sockets): `$XDG_RUNTIME_DIR/mysh`, else
   `$XDG_CACHE_HOME/mysh`, else `~/.cache/mysh`.
+- **32-bit ARM** (`armv7`, `armv6`, `armv5te` artifacts): time is read
+  through the system call, never the vDSO, because some vendor kernels of
+  the 4.1 era ship an ARM vDSO that crashes any Thumb-interworking caller
+  (the symptom was a `SIGSEGV` before the first line of output). Nothing to
+  configure; the cost is a few microseconds per clock read.
 
 Details: [docs/04 "Shell and home resolution"](../../04-sessions.md#shell-and-home-resolution).
 

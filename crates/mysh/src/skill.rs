@@ -72,29 +72,69 @@ pub struct Report {
 
 /// The agents whose personal skills directory is a known path. The shared
 /// `~/.agents/skills` is read by Codex, Cursor, Copilot, Gemini CLI,
-/// `OpenCode` and others, so it is always a target; the rest are used when
-/// their home directory exists. Environment overrides match each agent's
-/// own (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`).
+/// `OpenCode` and others, so it is always a target; the rest (`~/.claude`,
+/// `~/.codex`, `~/.cursor`, `~/.copilot`, `~/.openclaw`, omp's
+/// `~/.omp/agent/skills`) are used when their home directory exists.
+/// Environment overrides match each agent's own (`CLAUDE_CONFIG_DIR`,
+/// `CODEX_HOME`).
 pub fn locations(home: &Path, env: &dyn Fn(&str) -> Option<String>) -> Vec<Location> {
     let dir_of = |var: &str, default: &str| -> PathBuf {
         env(var)
             .filter(|v| !v.is_empty())
             .map_or_else(|| home.join(default), PathBuf::from)
     };
-    let table: [(&str, PathBuf, bool); 6] = [
-        ("agents", home.join(".agents"), true),
-        ("claude", dir_of("CLAUDE_CONFIG_DIR", ".claude"), false),
-        ("codex", dir_of("CODEX_HOME", ".codex"), false),
-        ("cursor", home.join(".cursor"), false),
-        ("copilot", home.join(".copilot"), false),
-        ("openclaw", home.join(".openclaw"), false),
+    // (agent, directory whose presence means "this agent is here", its
+    // skills directory, always a target)
+    let table: [(&str, PathBuf, PathBuf, bool); 7] = [
+        (
+            "agents",
+            home.join(".agents"),
+            home.join(".agents/skills"),
+            true,
+        ),
+        (
+            "claude",
+            dir_of("CLAUDE_CONFIG_DIR", ".claude"),
+            dir_of("CLAUDE_CONFIG_DIR", ".claude").join("skills"),
+            false,
+        ),
+        (
+            "codex",
+            dir_of("CODEX_HOME", ".codex"),
+            dir_of("CODEX_HOME", ".codex").join("skills"),
+            false,
+        ),
+        (
+            "cursor",
+            home.join(".cursor"),
+            home.join(".cursor/skills"),
+            false,
+        ),
+        (
+            "copilot",
+            home.join(".copilot"),
+            home.join(".copilot/skills"),
+            false,
+        ),
+        (
+            "openclaw",
+            home.join(".openclaw"),
+            home.join(".openclaw/skills"),
+            false,
+        ),
+        (
+            "omp",
+            home.join(".omp"),
+            home.join(".omp/agent/skills"),
+            false,
+        ),
     ];
     table
         .into_iter()
-        .map(|(agent, base, always)| Location {
+        .map(|(agent, base, dir, always)| Location {
             agent: agent.to_owned(),
             present: always || base.is_dir(),
-            dir: base.join("skills"),
+            dir,
         })
         .collect()
 }
@@ -263,6 +303,12 @@ mod tests {
         assert!(get("codex").present);
         assert_eq!(get("codex").dir, codex_home.join("skills"));
         assert!(!get("cursor").present);
+        assert!(!get("omp").present);
+        std::fs::create_dir_all(home.join(".omp")).expect("mkdir");
+        let locs = locations(&home, &env);
+        let omp = locs.iter().find(|l| l.agent == "omp").expect("omp");
+        assert!(omp.present);
+        assert_eq!(omp.dir, home.join(".omp").join("agent").join("skills"));
         let _ = std::fs::remove_dir_all(&home);
     }
 

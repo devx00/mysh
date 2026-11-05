@@ -336,7 +336,7 @@ read`, trust and first-contact handling, the deployment flow above, and a
 "don'ts" list. It is built into the binary:
 
 ```
-mysh skill install          # ~/.agents/skills/mysh/SKILL.md plus every agent found (~/.claude, ~/.codex, …)
+mysh skill install          # ~/.agents/skills/mysh/SKILL.md plus every agent found (~/.claude, ~/.codex, ~/.omp, …)
 mysh skill install --to DIR # a skills directory of your choice
 mysh skill list             # where it is, and whether each copy is current
 mysh skill show             # print it

@@ -70,6 +70,16 @@ tier 2 stretch targets by `cargo check-matrix-stretch`.
 - **Linux musl (static)**: no dependencies at all; DNS goes through musl's
   resolver (`/etc/resolv.conf`, no `nsswitch`). Validated end to end under
   qemu for every shipped arch.
+- **32-bit ARM musl** (`armv7`, `armv6`, `armv5te`): the binary never uses
+  the kernel's vDSO; `clock_gettime` is always the system call. A field
+  report (Linux 4.1.10 vendor kernel, armv7l) showed the process dying in
+  the tokio runtime constructor with `SIGSEGV` at an address inside the
+  vDSO page and `sp` thrown ~2 MiB away: that kernel publishes a Thumb-2
+  vDSO whose function symbols lack the Thumb bit, so musl's `blx` entered
+  it in ARM state. `crates/mysh/src/linkshim.rs` defines musl's internal
+  `__vdsosym` to return null, which keeps `vdso.o` out of the link
+  (decision 74). Cost: microseconds per clock read; mysh has no hot loop
+  on it.
 - **Linux glibc** (`s390x` only, because musl is tier 3 there): dynamic
   against the system glibc; built against zig's glibc 2.x stubs, so it runs
   on any distribution newer than the pinned symbol versions.
