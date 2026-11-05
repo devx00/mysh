@@ -27,6 +27,9 @@ host = "[fd00::5]:7722"
 
 [groups.lab]
 hosts = ["box", "nas", "10.0.0.7:7722"]   # for `mysh run --group lab`, `put/get --group lab`
+
+[assets]
+dir = "~/.local/share/mysh"              # where `mysh assets` looks (this is the default)
 ```
 
 Unknown keys are an error (`usage`, exit 2), so a typo never passes silently. Nothing else is supported: no `Match` blocks, no includes, no per-host `serve` settings.
@@ -81,6 +84,12 @@ The port specifically: `-p` > the port in `HOST` as typed (`mysh box:7723`) > th
 
 Subcommand names (`serve`, `put`, `session`, …) cannot be used as a bare `HOST`; use `mysh connect NAME` for a host literally named like one.
 
+### `[assets]`
+
+| key | meaning |
+| --- | --- |
+| `dir` | the directory holding the per-target server binaries (`mysh-<version>-<target>` files and `SHA256SUMS`) that [`mysh assets`](automation.md#deploying-mysh-to-another-machine) lists. `~` expands. Default `$XDG_DATA_HOME/mysh` → `~/.local/share/mysh`; `cargo xtask install` writes this key when you install the assets elsewhere. `MYSH_ASSETS_DIR` overrides it |
+
 ## Environment variables
 
 | variable | read by | meaning |
@@ -89,8 +98,9 @@ Subcommand names (`serve`, `put`, `session`, …) cannot be used as a bare `HOST
 | `MYSH_IDENTITY` | client | identity file; after `-i`, before the baked key and `~/.config/mysh/id` ([resolution order](keys-and-trust.md#resolution-order)) |
 | `MYSH_HOST_KEY` | server | host key file; after `--key`, before the baked key and `~/.config/mysh/host_key` |
 | `SSH_AUTH_SOCK` | client | the `ssh-agent` whose ed25519 keys are tried after the key files (empty = no agent) |
+| `MYSH_ASSETS_DIR` | client | the asset directory for `mysh assets`; beats `[assets] dir` and the `$XDG_DATA_HOME/mysh` default |
 | `XDG_RUNTIME_DIR` | client | where control sockets go (`$XDG_RUNTIME_DIR/mysh/`), falling back to `$XDG_CACHE_HOME/mysh`, then `~/.cache/mysh` |
-| `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME` | both | the usual XDG bases for the config dir, prompt history and sockets |
+| `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME` | both | the usual XDG bases for the config dir, prompt history, sockets and the asset directory |
 | `HOME` | both | base for `~`; on the server also the sessions' home |
 | `RUST_LOG` | both | a `tracing` filter that overrides `-v` entirely (`RUST_LOG=mysh_net=trace`) |
 | `MYSH_BAKED_IDENTITY`, `MYSH_BAKED_PEERS` | `cargo build --features baked` | build-time inputs for [baked keys](keys-and-trust.md#baked-keys); not read at run time |

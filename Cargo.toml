@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "xtask"]
 # `fuzz/` is its own workspace (nightly + cargo-fuzz); see scripts/fuzz-all.sh.
 exclude = ["fuzz"]
 

@@ -1,13 +1,13 @@
 ---
 name: mysh
-description: Run commands, manage long-lived sessions, and move files on remote hosts through the mysh CLI against an already-running mysh server. Use whenever a task needs to execute something on a machine that is reachable over mysh (not ssh); prefer it over `mysh mcp` when you already have a shell.
+description: Run commands, manage long-lived sessions, and move files on remote hosts through the mysh CLI against a running mysh server; deploy the mysh server binary to a new machine (find the right static build with `mysh assets --for`). Use whenever a task needs to execute something on a machine that is reachable over mysh (not ssh), or to install mysh there; prefer it over `mysh mcp` when you already have a shell.
 ---
 
 # mysh from the command line
 
 mysh is an encrypted remote shell. Every command below talks to a server
-that is already running (`mysh serve` on the remote). Nothing here starts
-servers or installs keys except the "First contact" section.
+that is already running (`mysh serve` on the remote), except "Deploying
+mysh to a new machine" and "First contact".
 
 Three rules that make it agent-safe:
 
@@ -128,6 +128,69 @@ printf 'info\nsessions -a\nforward ls\n' | mysh --json box
 
 Each command prints one JSON document; the run stops at the first failing
 command with exit 1.
+
+## Deploying mysh to a new machine
+
+The server is the same binary as the client, built statically for every
+supported platform. The local install keeps those builds in one directory;
+**`mysh assets` tells you where and which one to use** — never guess paths
+or architectures:
+
+```sh
+mysh assets                          # the directory and every installed artifact
+mysh assets --json                   # {"dir","artifacts":[{"target","version","path","size","sha256"}]}
+mysh assets --for "$(ssh newbox uname -sm)"     # one path: the build that runs there
+mysh assets --for "Linux armv7l"                # uname -sm text
+mysh assets --for android/aarch64               # Android's uname says Linux: name it
+mysh assets --for x86_64-unknown-freebsd        # or a target triple
+```
+
+`--for` resolves `uname -sm` output to a target (`Linux aarch64` → static
+musl, `Darwin arm64` → the arm64 slice, falling back to the universal
+binary, `FreeBSD amd64` → `x86_64-unknown-freebsd`, …) and prints the path
+of the newest installed build, preferring the client's own version. Exit 1
+with `not_found` when nothing is installed for it — the message names the
+target to build (`scripts/release.sh TARGET` in a checkout, then
+`cargo xtask install`).
+
+Then copy it and start it however you reach the machine today:
+
+```sh
+bin=$(mysh assets --for "$(ssh newbox uname -sm)")
+scp "$bin" newbox:/tmp/mysh && ssh newbox 'install -m 755 /tmp/mysh ~/.local/bin/mysh'
+ssh newbox "~/.local/bin/mysh serve --daemon --listen 0.0.0.0:7722 --authorized-key '$(cat ~/.config/mysh/id.pub)'"
+mysh --accept-new newbox 'echo deployed'       # trust the new host key once
+```
+
+- `serve --daemon` detaches and exits 0 only once the port is open (1 with
+  the log if it failed); `--pid-file PATH`, `--log PATH`. Where a service
+  manager exists prefer the units in `contrib/` (systemd, launchd,
+  Termux:Boot).
+- A host key is generated on first start; your key must be in the server's
+  `authorized_keys` (`--authorized-key` above, or `mysh authorize HOST`
+  from an already-authorized identity, or pairing).
+- Verify what you deployed: `printf 'info\n' | mysh --json newbox` shows
+  `server.version` and `server.platform`.
+- Android: `adb push "$bin" /data/local/tmp/mysh`, then run it from there
+  (or Termux's `~/.local/bin`).
+
+## Machines that cannot be dialed
+
+A server with no inbound port runs `mysh serve --connect-back
+YOUR-HOST:7722 --connect-period 5m`; on your side `mysh accept --daemon`
+takes those calls (the server's host key must be in
+`~/.config/mysh/callers`, `authorized_keys` line format, comment = name).
+Every command then addresses it as `@NAME` — `mysh --json @name 'cmd'`,
+`mysh put @name …`, `mysh session @name …` — and `@NAME` never dials:
+`connect_failed` means it has not called in. `mysh bind @name ADDR --for 1h`
+asks it to open a normal listener for a while (server needs
+`--allow-bind-request`).
+
+## This skill
+
+`mysh skill show` prints this file; `mysh skill install` (re)installs it for
+the agents on the machine (`~/.agents/skills`, `~/.claude/skills`, …);
+`mysh skill list` shows where.
 
 ## Don'ts
 

@@ -102,6 +102,12 @@ pub enum Command {
     Run(RunArgs),
     /// Serve the Model Context Protocol over stdio (`--hosts`, `--group`).
     Mcp(McpArgs),
+    /// Where the release binaries for other machines are, and which one a
+    /// remote needs (`--for "$(uname -sm)"`).
+    Assets(crate::assets::AssetsArgs),
+    /// The agent skill: install it for the coding agents on this machine,
+    /// list where it is, or print it.
+    Skill(crate::skill::SkillArgs),
     /// Print help for a command, or the whole command tree as JSON.
     Help(HelpArgs),
 }

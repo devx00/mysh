@@ -17,7 +17,21 @@ mysh --version
 mysh 0.1.0
 ```
 
-Or build from source (a Rust toolchain, no C dependencies):
+From a checkout, `cargo xtask install` does the whole client-side setup in one step:
+
+```
+cargo xtask install
+```
+
+```
+client: /home/you/.local/bin/mysh (mysh 0.1.0)
+assets: /home/you/.local/share/mysh (14 server binaries)
+skill:  installed
+```
+
+It builds the client (`cargo build --release -p mysh`) and copies it to `~/.local/bin/mysh` (`--bin-dir DIR`; you are warned when that directory is not on your `PATH`), copies every `mysh-<version>-<target>` file and `SHA256SUMS` from `dist/` into the *assets directory* where `mysh assets` looks for server binaries to ship to other machines (`~/.local/share/mysh` or `$XDG_DATA_HOME/mysh`; `--assets-dir DIR` records a different one as `[assets] dir` in `config.toml`), and installs the agent skill (`mysh skill install`; `--no-skill` skips it). Without a `dist/` it installs only the client and says so: `cargo xtask install --dist` runs `scripts/release.sh` first (`--stretch` adds the stretch targets), or build the one target you need with `scripts/release.sh TARGET`. `--dry-run` prints the plan and changes nothing.
+
+To build just the client by hand (a Rust toolchain, no C dependencies):
 
 ```
 cargo build --release -p mysh

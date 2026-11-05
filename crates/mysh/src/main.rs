@@ -146,6 +146,16 @@ fn output_mode(cli: &Cli) -> Mode {
         Some(Command::Run(args)) => mode_for(&args.opts),
         None => mode_for(&cli.connect.opts),
         Some(Command::Help(args)) if args.json => Mode::Json,
+        Some(Command::Assets(args)) if args.json => Mode::Json,
+        Some(Command::Skill(args))
+            if matches!(
+                args.command,
+                mysh::skill::SkillCommand::Install { json: true, .. }
+                    | mysh::skill::SkillCommand::List { json: true }
+            ) =>
+        {
+            Mode::Json
+        }
         Some(_) => Mode::Human,
     }
 }
@@ -212,6 +222,20 @@ async fn run(cli: Cli) -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, EXIT_USAGE, mode),
         },
+        Some(Command::Assets(args)) => {
+            let console = mysh::client::console::Console::with_mode(mode);
+            match mysh::assets::run(&args, &config, &paths, &console).await {
+                Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(255)),
+                Err(e) => fail(&e, 1, mode),
+            }
+        }
+        Some(Command::Skill(args)) => {
+            let console = mysh::client::console::Console::with_mode(mode);
+            match mysh::skill::run(&args, &console).await {
+                Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(255)),
+                Err(e) => fail(&e, 1, mode),
+            }
+        }
         // `--hosts`/`--group`: HOST's slot holds the first PATH.
         Some(Command::Put(h)) if h.opts.fan_out() => {
             let mut args = h.args;
@@ -344,7 +368,9 @@ fn client_request(command: Option<Command>, bare: ConnectArgs) -> Result<ClientR
             | Command::Pair(_)
             | Command::Run(_)
             | Command::Accept(_)
-            | Command::Mcp(_),
+            | Command::Mcp(_)
+            | Command::Assets(_)
+            | Command::Skill(_),
         ) => {
             bail!("internal error: non-client command reached client dispatch")
         }

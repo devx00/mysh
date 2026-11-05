@@ -23,6 +23,24 @@ to build it rather than failing halfway. The result is one binary,
 `mysh-client` library crate builds as part of it
 ([library](../library.md)).
 
+### Installing: `cargo xtask install`
+
+```sh
+cargo xtask install            # client -> ~/.local/bin, dist/ -> ~/.local/share/mysh, agent skill
+cargo xtask install --dist     # run scripts/release.sh first (--stretch passes through)
+cargo xtask install --dry-run  # print the plan only
+```
+
+`xtask` is a small workspace crate behind the `cargo xtask` alias in
+`.cargo/config.toml`. It builds the client with `--release --locked`,
+replaces `<bin-dir>/mysh` atomically (`--bin-dir`), copies every
+`mysh-<version>-<target>` file and `SHA256SUMS` from `dist/` (`--dist-dir`)
+into the assets directory `mysh assets` reads (`--assets-dir`; a
+non-default directory is recorded as `[assets] dir` in `config.toml`,
+unless that table already exists, in which case the line to set is
+printed), and runs `mysh skill install` (`--no-skill`). A missing or empty
+`dist/` is not an error: only the client is installed.
+
 ## Cross builds: `scripts/release.sh`
 
 ```sh

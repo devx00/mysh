@@ -300,13 +300,50 @@ absolute byte offsets so reads are idempotent and a crashed reader resumes
 exactly where it stopped. It is documented in
 [sessions](sessions.md#the-session-api-for-programs).
 
+## Deploying mysh to another machine
+
+A program that sets up a new host needs the server binary for *that* host's
+platform. `cargo xtask install` puts every cross-built artifact in one
+directory (`~/.local/share/mysh` by default; `[assets] dir` in
+[config](config.md#assets) or `MYSH_ASSETS_DIR` to move it), and
+`mysh assets` answers the two questions without guessing:
+
+```
+$ mysh assets
+/home/me/.local/share/mysh
+TARGET                          VERSION        SIZE  SHA256
+aarch64-unknown-linux-musl      0.1.0       6400272  f570eed13ffd
+universal-apple-darwin          0.1.0      13576624  cf7bfc74099f
+x86_64-unknown-linux-musl       0.1.0       7476504  723d54b4dae7
+…
+$ mysh assets --for "$(ssh newbox uname -sm)"
+/home/me/.local/share/mysh/mysh-0.1.0-aarch64-unknown-linux-musl
+```
+
+`--for` takes `uname -sm` output, `OS/ARCH` (`android/aarch64` — Android
+reports itself as Linux), or a target triple, and prints one path; `--json`
+gives `{"target","version","path","size","sha256"}`. Exit 1 with
+`not_found` when nothing is installed for it, naming the target to build.
+From there it is `scp`/`adb push` plus `mysh serve --daemon` on the far
+side; the [skill](../../skills/mysh/SKILL.md) spells out the sequence.
+
 ## The agent skill
 
-`skills/mysh/SKILL.md` in this repository is a ready-made skill file for
-LLM agents: the three rules (always `--json`, always bound long operations,
-reuse one master), a quick-reference table of command-to-shape, the polling
-loop for `session read`, trust and first-contact handling, and a "don'ts"
-list. Point an agent at it, or read it as a condensed version of this page.
+`skills/mysh/SKILL.md` is a ready-made skill file for LLM agents: the three
+rules (always `--json`, always bound long operations, reuse one master), a
+quick-reference table of command-to-shape, the polling loop for `session
+read`, trust and first-contact handling, the deployment flow above, and a
+"don'ts" list. It is built into the binary:
+
+```
+mysh skill install          # ~/.agents/skills/mysh/SKILL.md plus every agent found (~/.claude, ~/.codex, …)
+mysh skill install --to DIR # a skills directory of your choice
+mysh skill list             # where it is, and whether each copy is current
+mysh skill show             # print it
+```
+
+`cargo xtask install` runs `mysh skill install` for you (`--no-skill` to
+skip).
 
 For an MCP-native integration instead of a CLI one, see [mcp](mcp.md). The
 full catalogue of flags is [cli-reference](cli-reference.md); the design

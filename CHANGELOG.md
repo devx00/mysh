@@ -14,6 +14,23 @@ server.
 
 ### Added
 
+- **`cargo xtask install`**: builds the client and installs it to
+  `~/.local/bin`, copies the `dist/` artifacts (`mysh-<version>-<target>`,
+  `SHA256SUMS`) into the assets directory `mysh assets` reads
+  (`~/.local/share/mysh`, or `--assets-dir` recorded as `[assets] dir` in
+  `config.toml`), and runs `mysh skill install`; `--dist` runs
+  `scripts/release.sh` first, `--dry-run` prints the plan.
+- **`mysh assets`**: lists the installed per-target server binaries
+  (`$MYSH_ASSETS_DIR` → `[assets] dir` → `~/.local/share/mysh`) with
+  version, size and checksum; `--for "$(uname -sm)"` (or `OS/ARCH`, or a
+  triple) prints the one a remote machine needs, `not_found` naming the
+  target to build otherwise. New `[assets]` config table.
+- **`mysh skill`**: the agent skill is embedded in the binary; `install`
+  writes it for every coding agent present (`~/.agents/skills` always,
+  `~/.claude`, `~/.codex`, `~/.cursor`, `~/.copilot`, `~/.openclaw` when
+  found; `--to DIR`), `list` shows where and whether each copy is current,
+  `show` prints it. The skill gained the deployment flow (`mysh assets
+  --for`, `serve --daemon`), connect-back addressing and its own install.
 - **Transport** (`mysh-proto`, `mysh-net`): versioned preamble bound into the
   Noise prologue, `Noise_XX_25519_ChaChaPoly_BLAKE2s` handshake with the
   server verified before the client reveals its identity, a `Verdict`

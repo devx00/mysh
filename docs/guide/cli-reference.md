@@ -476,6 +476,62 @@ Serve the Model Context Protocol over stdio (`--hosts`, `--group`)
 | `--allow-local-paths` | Let the `put` and `get` tools read and write local files |
 | `-v, --verbose` | Increase log verbosity; `-vv` includes handshake and stream events |
 
+## `mysh assets`
+
+Where the release binaries for other machines are, and which one a remote needs (`--for "$(uname -sm)"`)
+
+`mysh assets [OPTIONS]`
+
+| option | meaning |
+| --- | --- |
+| `--for <SPEC>` | Pick the artifact for a remote machine: its `uname -sm` output (`"Linux aarch64"`, `"Darwin arm64"`, `"FreeBSD amd64"`), `OS/ARCH` (`android/aarch64` — Android's `uname` says `Linux`), or a full target triple. Prints its path |
+| `--dir <DIR>` | Look in DIR instead of the configured directory |
+| `--json` | One JSON document on stdout |
+| `-v, --verbose` | Increase log verbosity; `-vv` includes handshake and stream events |
+
+## `mysh skill`
+
+The agent skill: install it for the coding agents on this machine, list where it is, or print it
+
+`mysh skill [OPTIONS]`
+
+| option | meaning |
+| --- | --- |
+| `-v, --verbose` | Increase log verbosity; `-vv` includes handshake and stream events |
+
+### `mysh skill install`
+
+Write the skill into every detected agent's skills directory (and the shared `~/.agents/skills`), or into `--to` directories only
+
+`mysh skill install [OPTIONS]`
+
+| option | meaning |
+| --- | --- |
+| `--to <DIR> (repeatable)` | A skills directory to install into (repeatable); the skill lands at `DIR/mysh/SKILL.md`. Replaces agent detection |
+| `--json` | One JSON array on stdout |
+| `-v, --verbose` | Increase log verbosity; `-vv` includes handshake and stream events |
+
+### `mysh skill list`
+
+Show the agents this machine has and whether each has the skill
+
+`mysh skill list [OPTIONS]`
+
+| option | meaning |
+| --- | --- |
+| `--json` | One JSON array on stdout |
+| `-v, --verbose` | Increase log verbosity; `-vv` includes handshake and stream events |
+
+### `mysh skill show`
+
+Print the skill to stdout
+
+`mysh skill show [OPTIONS]`
+
+| option | meaning |
+| --- | --- |
+| `-v, --verbose` | Increase log verbosity; `-vv` includes handshake and stream events |
+
 ## `mysh help`
 
 Print help for a command, or the whole command tree as JSON

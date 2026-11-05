@@ -44,6 +44,7 @@ it executable, put it on your `PATH`. Or build it:
 ```sh
 cargo build --release        # target/release/mysh for the host
 scripts/release.sh           # every supported target into dist/
+cargo xtask install          # client -> ~/.local/bin, dist/ -> ~/.local/share/mysh, agent skill
 ```
 
 Platform notes, service units and what is validated where: [docs/guide/platforms/](docs/guide/platforms/README.md).

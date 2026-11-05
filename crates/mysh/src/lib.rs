@@ -3,6 +3,7 @@
 //!
 //! Module layout per `docs/01-architecture.md`.
 
+pub mod assets;
 pub mod cli;
 pub mod client;
 pub mod config;
@@ -11,6 +12,7 @@ pub mod identity;
 pub mod mcp;
 pub mod output;
 pub mod server;
+pub mod skill;
 pub mod wordlist;
 
 /// Key material compiled in with `--features baked` (docs/02-security.md).

@@ -65,6 +65,15 @@ pub struct Paths {
     /// the client may authenticate with (02-security.md, "Signature
     /// authentication").
     pub agent_socket: Option<PathBuf>,
+    /// Where release artifacts (the per-target server binaries) are kept
+    /// (05-meta-shell.md "Assets"): `$MYSH_ASSETS_DIR`, else `[assets] dir`
+    /// of the config file, else `$XDG_DATA_HOME/mysh` → `~/.local/share/mysh`.
+    /// This field is the environment/XDG part; [`Config::assets_dir`]
+    /// applies the config file.
+    pub assets_dir: PathBuf,
+    /// `true` when `$MYSH_ASSETS_DIR` set `assets_dir` (then the config
+    /// file does not override it).
+    pub assets_dir_from_env: bool,
 }
 
 impl Paths {
@@ -91,9 +100,21 @@ impl Paths {
             .or_else(|| env_path(env, "XDG_CACHE_HOME"))
             .or_else(|| home.as_ref().map(|h| h.join(".cache")))
             .map_or_else(|| config_dir.join("run"), |d| d.join("mysh"));
-        let ssh_dir = home.map(|h| h.join(".ssh"));
+        let ssh_dir = home.as_ref().map(|h| h.join(".ssh"));
         let agent_socket = env_path(env, "SSH_AUTH_SOCK");
-        Self::build(config_dir, history, runtime_dir, ssh_dir, agent_socket)
+        let (assets_dir, assets_dir_from_env) = match env_path(env, "MYSH_ASSETS_DIR") {
+            Some(dir) => (dir, true),
+            None => (
+                env_path(env, "XDG_DATA_HOME")
+                    .or_else(|| home.as_ref().map(|h| h.join(".local").join("share")))
+                    .map_or_else(|| config_dir.join("assets"), |d| d.join("mysh")),
+                false,
+            ),
+        };
+        let mut paths = Self::build(config_dir, history, runtime_dir, ssh_dir, agent_socket);
+        paths.assets_dir = assets_dir;
+        paths.assets_dir_from_env = assets_dir_from_env;
+        paths
     }
 
     /// Use an explicit config directory; history, the runtime dir, `~/.ssh`
@@ -101,13 +122,16 @@ impl Paths {
     #[must_use]
     pub fn with_config_dir(dir: PathBuf) -> Self {
         let env_paths = Self::from_env();
-        Self::build(
+        let mut paths = Self::build(
             dir,
             env_paths.history,
             env_paths.runtime_dir,
             env_paths.ssh_dir,
             env_paths.agent_socket,
-        )
+        );
+        paths.assets_dir = env_paths.assets_dir;
+        paths.assets_dir_from_env = env_paths.assets_dir_from_env;
+        paths
     }
 
     fn build(
@@ -124,6 +148,8 @@ impl Paths {
             known_hosts: config_dir.join("known_hosts"),
             callers: config_dir.join("callers"),
             config_file: config_dir.join("config.toml"),
+            assets_dir: config_dir.join("assets"),
+            assets_dir_from_env: false,
             config_dir,
             history,
             runtime_dir,
@@ -454,6 +480,33 @@ pub struct Config {
     /// `[groups.NAME]` host lists for `--group` (docs/05-meta-shell.md
     /// "Fleet").
     pub groups: BTreeMap<String, Group>,
+    /// `[assets]` (05-meta-shell.md "Assets").
+    pub assets: Assets,
+}
+
+/// `[assets]` table: where the release artifacts live on this machine.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Assets {
+    /// Directory holding `mysh-<version>-<target>` files and `SHA256SUMS`
+    /// (`~` expands to the home directory).
+    pub dir: Option<PathBuf>,
+}
+
+impl Config {
+    /// The asset directory after precedence: `$MYSH_ASSETS_DIR` beats the
+    /// file, the file beats the XDG default.
+    #[must_use]
+    pub fn assets_dir(&self, paths: &Paths) -> PathBuf {
+        if paths.assets_dir_from_env {
+            return paths.assets_dir.clone();
+        }
+        match (&self.assets.dir, home_dir(&process_env)) {
+            (Some(dir), Some(home)) => expand_tilde(&dir.to_string_lossy(), &home),
+            (Some(dir), None) => dir.clone(),
+            (None, _) => paths.assets_dir.clone(),
+        }
+    }
 }
 
 /// `[groups.NAME]` table.
@@ -1277,6 +1330,7 @@ shell = true           # `mysh box` goes straight to a shell
             },
             hosts,
             groups: BTreeMap::new(),
+            assets: Assets::default(),
         }
     }
 

@@ -264,6 +264,8 @@ mysh master [OPTIONS] HOST [--idle D] [--daemon]   hold the connection open for 
 mysh run [OPTIONS] [-j N] (--hosts a,b | --group NAME)... -- CMD ...   the same command on several hosts ("Fleet")
 mysh put/get [OPTIONS] (--hosts a,b | --group NAME)... PATH...        the same transfer to/from several hosts ("Fleet")
 mysh mcp (--hosts a,b | --group NAME)... [--accept-new] [-i PATH] [--allow-local-paths]   MCP server over stdio for agents (07-embedding.md "MCP server")
+mysh assets [--json] [--for SPEC] [--dir DIR]   the installed release binaries; `--for "$(uname -sm)"` picks one ("Assets")
+mysh skill <install [--to DIR]... | list | show> [--json]   the agent skill: install for the agents on this machine, list, print ("Skill")
 ```
 
 Subcommand names are reserved words that cannot be used as bare `HOST`; use
@@ -376,6 +378,9 @@ master = "auto"        # per-host master policy
 
 [groups.lab]           # `--group lab` ("Fleet")
 hosts = ["box", "nas", "10.0.0.5:7722"]
+
+[assets]               # where the release binaries live ("Assets")
+dir = "~/.local/share/mysh"
 ```
 
 Flags override the alias; the alias overrides `[defaults]`; `[defaults]`
@@ -419,6 +424,47 @@ mysh get --group lab REMOTE... LOCALDIR          # lands in LOCALDIR/<host>/
 
 `get --hosts` creates `LOCALDIR/<host>/` per host (`LOCALDIR` defaults to
 the current directory; a `/` in a host name becomes `_`).
+
+## Assets
+
+The server is the same binary as the client, cross-built per target by
+`scripts/release.sh` into `dist/` (`mysh-<version>-<target>` plus
+`SHA256SUMS`); `cargo xtask install` copies that directory to the machine's
+**asset directory**, resolved as `$MYSH_ASSETS_DIR` → `[assets] dir` in the
+config file → `$XDG_DATA_HOME/mysh` → `~/.local/share/mysh`. `mysh assets`
+reads it so a person or an agent never has to know the path or guess an
+architecture:
+
+```
+mysh assets [--json] [--dir DIR]       # the directory and every artifact: target, version, size, sha256
+mysh assets --for SPEC [--json]        # the one artifact a remote needs; prints its path
+```
+
+`SPEC` is the remote's `uname -sm` output (`"Linux aarch64"`, `"Darwin
+arm64"`, `"FreeBSD amd64"`, `"Linux armv7l"`), `OS/ARCH` (`android/aarch64`
+— Android's `uname` says `Linux`, so it must be named), or a target triple.
+The mapping prefers the static musl build on Linux, the exact slice on
+macOS with the universal binary as fallback, musl over glibc on s390x; among
+versions the running client's own. JSON: `{"dir","artifacts":[{"target",
+"version","path","size","sha256"}]}` and, with `--for`, one artifact object.
+Exit 1 with `not_found` when the directory is empty or has nothing for the
+spec (the message names the target to build), `usage` when `SPEC` cannot be
+read.
+
+## Skill
+
+`skills/mysh/SKILL.md` is embedded in the binary. `mysh skill install`
+writes it to `<skills dir>/mysh/SKILL.md` for every coding agent present on
+the machine: always the shared `~/.agents/skills` (read by Codex, Cursor,
+Copilot, Gemini CLI, OpenCode and others), plus `~/.claude/skills`
+(`$CLAUDE_CONFIG_DIR`), `~/.codex/skills` (`$CODEX_HOME`), `~/.cursor/skills`,
+`~/.copilot/skills`, `~/.openclaw/skills` when that agent's directory
+exists; `--to DIR` (repeatable) replaces detection. Each location reports
+`installed`, `updated`, `unchanged` or `skipped` (`error` with the reason;
+exit 1 if any). `mysh skill list` shows the same locations with `installed`,
+`outdated` (content differs from the embedded skill), `missing` or
+`skipped`; `mysh skill show` prints the skill. Both `install` and `list`
+take `--json` (an array of `{"agent","path","status"}`).
 
 ## Accepting connections
 
