@@ -106,7 +106,9 @@ pub async fn run(
     let conn = connect(&target, &paths, &baked, &console).await?;
     let forwards = Forwards::new(conn.clone(), Arc::new(console.clone()));
     let result = match add_cli_forwards(&forwards, &target).await {
-        Ok(()) => dispatch(&conn, &console, &target, &paths, &forwards, cmd).await,
+        // One-shot and large (every command's state); boxed like the other
+        // top-level futures so the caller's frame stays small.
+        Ok(()) => Box::pin(dispatch(&conn, &console, &target, &paths, &forwards, cmd)).await,
         Err(e) => Err(e),
     };
     shutdown(&conn, &forwards, &console).await;
